@@ -206,4 +206,125 @@ def calculate_poisson_prediction(home_team, away_team, home_form, away_form):
 
   max_goals = 5
   score_matrix = np.outer(
-      pmf(np.arange(
+      pmf(np.arange(max_goals), home_xg), pmf(np.arange(max_goals), away_xg)
+  )
+  h_score, a_score = np.unravel_index(np.argmax(score_matrix), score_matrix.shape)
+
+  home_win_prob = np.sum(np.tril(score_matrix, -1)) * 100
+  draw_prob = np.sum(np.diag(score_matrix)) * 100
+  away_win_prob = np.sum(np.triu(score_matrix, 1)) * 100
+
+  return {
+      "home_xg": home_xg,
+      "away_xg": away_xg,
+      "predicted_score": f"{h_score} - {a_score}",
+      "home_win_prob": round(home_win_prob, 1),
+      "draw_prob": round(draw_prob, 1),
+      "away_win_prob": round(away_win_prob, 1),
+      "home_elo": home_elo,
+      "away_elo": away_elo,
+  }
+
+
+# ---------------------------------------------------------------------------
+# 4. STREAMLIT UI DISPLAY
+# ---------------------------------------------------------------------------
+str_ui.title("⚽ Real-Time 6 Leagues Match Predictor")
+str_ui.markdown(
+    "football-data.org API ဖြင့် ချိတ်ဆက်ထားပြီး **Elo Ratings**, **Recent"
+    " Forms** နှင့် **Poisson Distribution** တို့ကို အခြေခံ၍ အနီးစပ်ဆုံး"
+    " ခန့်မှန်းပေးသော Dashboard ဖြစ်ပါသည်။"
+)
+
+# Requirement 3: Last Updated Timestamp
+last_updated_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S (%A)")
+str_ui.info(f"🕒 **Last Updated:** {last_updated_time}")
+
+# Fetch Data from API or Fallback
+df_fixtures, api_error = fetch_live_fixtures(api_key_input)
+
+if api_error:
+  str_ui.warning(api_error)
+  str_ui.info(
+      "ℹ️ လက်ရှိတွင် API Key မရှိသေးပါက (သို့မဟုတ် Error ဖြစ်နေလျှင်) စမ်းသပ်ရန်"
+      " Sample Data ဖြင့် ပြသပေးနေပါသည်။"
+  )
+  df_fixtures = get_fallback_fixtures()
+
+# League Filter Selection
+selected_league = str_ui.selectbox(
+    "လိဂ်ပြိုင်ပွဲ ရွေးချယ်ရန်", ["အားလုံး (All Leagues)"] + LEAGUES
+)
+
+if (
+    not df_fixtures.empty
+    and selected_league != "အားလုံး (All Leagues)"
+    and "league" in df_fixtures.columns
+):
+  df_fixtures = df_fixtures[df_fixtures["league"] == selected_league]
+
+str_ui.divider()
+str_ui.subheader(
+    f"📅 လာမည့် တစ်ပတ်အတွင်း ပွဲစဉ်များနှင့် ခန့်မှန်းချက်များ"
+    f" ({selected_league})"
+)
+
+if df_fixtures is None or df_fixtures.empty:
+  str_ui.warning("ရွေးချယ်ထားသော အချက်အလက်များ မရှိပါ။")
+else:
+  for idx, row in df_fixtures.iterrows():
+    league = row["league"]
+    match_date = row["date"]
+    home = row["home"]
+    away = row["away"]
+    h_form = row["home_form"]
+    a_form = row["away_form"]
+
+    # Run Prediction Model
+    pred = calculate_poisson_prediction(home, away, h_form, a_form)
+
+    with str_ui.container():
+      str_ui.markdown(f"### 🏆 **{league}** | ⏰ *{match_date} UTC*")
+
+      col1, col2, col3 = str_ui.columns([3, 2, 3])
+
+      with col1:
+        str_ui.markdown(f"#### 🏠 {home}")
+        str_ui.caption(f"Elo: {pred['home_elo']} | Form: `{h_form}`")
+
+      with col2:
+        str_ui.markdown(
+            f"<h3 style='text-align: center; color:"
+            f" #FF4B4B;'>{pred['predicted_score']}</h3>",
+            unsafe_allow_html=True,
+        )
+        str_ui.caption(
+            f"<p style='text-align: center;'>ခန့်မှန်းဂိုး (xG): H"
+            f" {pred['home_xg']} - A {pred['away_xg']}</p>",
+            unsafe_allow_html=True,
+        )
+
+      with col3:
+        str_ui.markdown(f"#### ✈️ {away}")
+        str_ui.caption(f"Elo: {pred['away_elo']} | Form: `{a_form}`")
+
+      # Detailed Rationale Expandable Box
+      with str_ui.expander("📊 Statistical Model & Match Breakdown"):
+        str_ui.write(
+            f"- **အနိုင်ရရှိနိုင်ခြေ:** {home} နိုင်ခြေ"
+            f" **{pred['home_win_prob']}%** | သရေ **{pred['draw_prob']}%** |"
+            f" {away} နိုင်ခြေ **{pred['away_win_prob']}%**"
+        )
+        str_ui.write(
+            f"- **Elo Rating နှိုင်းယှဉ်ချက်:** {home} (Rating:"
+            f" {pred['home_elo']}) နှင့် {away} (Rating: {pred['away_elo']})"
+            f" တို့၏ အဆင့်ကွာဟချက်နှင့် အိမ်ကွင်းအားသာချက်ကို"
+            f" တွက်ချက်ထားသည်။"
+        )
+        str_ui.write(
+            f"- **Poisson Distribution Model:** မျှော်လင့်ထားသည့် သွင်းဂိုးနှုန်း"
+            f" (xG) အရ {home} တွင် ဂိုးသွင်းရန် {pred['home_xg']} နှင့် {away}"
+            f" တွင် {pred['away_xg']} အသီးသီး ရှိနေပါသည်။"
+        )
+
+      str_ui.markdown("---")
