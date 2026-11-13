@@ -1,375 +1,307 @@
-import streamlit as st
-import pandas as pd
+from datetime import datetime, timedelta
 import numpy as np
-from scipy.stats import poisson
-import plotly.express as px
-import plotly.graph_objects as go
+import pandas as pd
 import requests
+from scipy.poisson import pmf
+import streamlit as str_ui
 
-# ---------------------------------------------------------
-# PAGE CONFIGURATION & CUSTOM STYLING
-# ---------------------------------------------------------
-st.set_page_config(
-    page_title="Pro Football Match Predictor",
+# Page Configuration
+str_ui.set_page_config(
+    page_title="Real-Time Football Match Predictor (6 Leagues)",
     page_icon="⚽",
     layout="wide",
-    initial_sidebar_state="expanded"
 )
 
-st.markdown("""
-<style>
-    .metric-card {
-        background-color: #1E212B;
-        padding: 20px;
-        border-radius: 12px;
-        border: 1px solid #2E3344;
-        text-align: center;
-    }
-    .big-score {
-        font-size: 42px;
-        font-weight: 800;
-        color: #00E676;
-    }
-    .team-title {
-        font-size: 22px;
-        font-weight: 700;
-    }
-</style>
-""", unsafe_allow_html=True)
-
-# ---------------------------------------------------------
-# TEAM DATABASE (ELO RATINGS & ATTACK/DEFENSE MULTIPLIERS)
-# ---------------------------------------------------------
-# Elo ~1500 is average top-flight; ~1950+ is elite European contender
-TEAM_DATA = {
-    "England Premier League": {
-        "Arsenal": {"elo": 1955, "att": 1.38, "def": 0.72},
-        "Manchester City": {"elo": 1965, "att": 1.45, "def": 0.78},
-        "Liverpool": {"elo": 1950, "att": 1.42, "def": 0.76},
-        "Chelsea": {"elo": 1860, "att": 1.25, "def": 0.92},
-        "Aston Villa": {"elo": 1845, "att": 1.20, "def": 0.95},
-        "Newcastle United": {"elo": 1835, "att": 1.18, "def": 0.94},
-        "Tottenham Hotspur": {"elo": 1825, "att": 1.24, "def": 1.05},
-        "Manchester United": {"elo": 1810, "att": 1.12, "def": 1.02},
-        "Brighton": {"elo": 1790, "att": 1.15, "def": 1.04},
-        "West Ham": {"elo": 1750, "att": 1.02, "def": 1.12},
-    },
-    "Spain La Liga": {
-        "Real Madrid": {"elo": 1985, "att": 1.48, "def": 0.74},
-        "FC Barcelona": {"elo": 1960, "att": 1.50, "def": 0.80},
-        "Atletico Madrid": {"elo": 1890, "att": 1.24, "def": 0.78},
-        "Athletic Bilbao": {"elo": 1830, "att": 1.14, "def": 0.88},
-        "Real Sociedad": {"elo": 1815, "att": 1.08, "def": 0.90},
-        "Villarreal": {"elo": 1805, "att": 1.22, "def": 1.08},
-        "Real Betis": {"elo": 1785, "att": 1.06, "def": 1.00},
-        "Sevilla": {"elo": 1745, "att": 0.98, "def": 1.08},
-    },
-    "Italy Serie A": {
-        "Inter Milan": {"elo": 1945, "att": 1.40, "def": 0.73},
-        "Atalanta": {"elo": 1895, "att": 1.36, "def": 0.88},
-        "Juventus": {"elo": 1875, "att": 1.16, "def": 0.76},
-        "AC Milan": {"elo": 1865, "att": 1.25, "def": 0.92},
-        "Napoli": {"elo": 1870, "att": 1.22, "def": 0.85},
-        "Lazio": {"elo": 1820, "att": 1.15, "def": 0.96},
-        "AS Roma": {"elo": 1810, "att": 1.10, "def": 0.95},
-        "Fiorentina": {"elo": 1800, "att": 1.12, "def": 0.96},
-    },
-    "France Ligue 1": {
-        "Paris Saint-Germain": {"elo": 1935, "att": 1.46, "def": 0.80},
-        "AS Monaco": {"elo": 1835, "att": 1.24, "def": 0.94},
-        "Lille": {"elo": 1820, "att": 1.14, "def": 0.89},
-        "Olympique Marseille": {"elo": 1815, "att": 1.20, "def": 0.98},
-        "Olympique Lyon": {"elo": 1795, "att": 1.18, "def": 1.04},
-        "OGC Nice": {"elo": 1780, "att": 1.04, "def": 0.92},
-        "RC Lens": {"elo": 1775, "att": 1.06, "def": 0.94},
-    }
-}
-
-# Build combined pools for UEFA competitions
-ALL_CLUBS = {}
-for league, teams in TEAM_DATA.items():
-    for team, stats in teams.items():
-        ALL_CLUBS[f"{team} ({league.split()[0]})"] = stats
-
-LEAGUES = {
-    "England Premier League": TEAM_DATA["England Premier League"],
-    "Spain La Liga": TEAM_DATA["Spain La Liga"],
-    "Italy Serie A": TEAM_DATA["Italy Serie A"],
-    "France Ligue 1": TEAM_DATA["France Ligue 1"],
-    "UEFA Champions League": ALL_CLUBS,
-    "UEFA Europa League": ALL_CLUBS,
-}
-
-LEAGUE_AVG_GOALS = {
-    "England Premier League": 2.85,
-    "Spain La Liga": 2.60,
-    "Italy Serie A": 2.65,
-    "France Ligue 1": 2.70,
-    "UEFA Champions League": 2.95,
-    "UEFA Europa League": 2.80,
-}
-
-# ---------------------------------------------------------
-# OPTIONAL: LIVE STANDINGS FETCH (FOOTBALL-DATA.ORG V4)
-# ---------------------------------------------------------
-COMPETITION_CODES = {
-    "England Premier League": "PL",
-    "Spain La Liga": "PD",
-    "Italy Serie A": "SA",
+# ---------------------------------------------------------------------------
+# 1. API CONFIGURATION & LEAGUES SETUP
+# ---------------------------------------------------------------------------
+LEAGUES_CONFIG = {
+    "Premier League": "PL",
+    "La Liga": "PD",
+    "Serie A": "SA",
     "France Ligue 1": "FL1",
-    "UEFA Champions League": "CL",
+    "Champions League": "CL",
+    "Europa League": "EL",
 }
 
-@st.cache_data(ttl=3600)
-def fetch_live_standings(comp_code, api_key):
-    url = f"https://api.football-data.org/v4/competitions/{comp_code}/standings"
-    headers = {"X-Auth-Token": api_key}
+# Sample Elo ratings fallback dictionary
+TEAM_ELOS = {
+    "Manchester City": 2050,
+    "Arsenal": 2020,
+    "Liverpool": 2010,
+    "Aston Villa": 1850,
+    "Chelsea": 1840,
+    "Tottenham": 1820,
+    "Manchester United": 1800,
+    "Real Madrid": 2060,
+    "Barcelona": 2030,
+    "Atletico Madrid": 1920,
+    "Inter Milan": 1990,
+    "Juventus": 1910,
+    "AC Milan": 1900,
+    "Napoli": 1880,
+    "Paris Saint-Germain": 1980,
+    "Monaco": 1830,
+    "Bayern Munich": 2040,
+    "Bayer Leverkusen": 1960,
+    "Porto": 1820,
+    "Benfica": 1830,
+}
+
+# Sidebar for API Key
+str_ui.sidebar.header("⚙️ API Configuration")
+api_key = str_ui.sidebar.text_input(
+    "Football-Data.org API Key",
+    type="password",
+    help="https://www.football-data.org/ တွင် အခမဲ့ API Key ရယူနိုင်ပါသည်။",
+)
+
+
+# ---------------------------------------------------------------------------
+# 2. FETCH REAL-TIME DATA FROM FOOTBALL-DATA.ORG API
+# ---------------------------------------------------------------------------
+@str_ui.cache_data(ttl=3600)  # Cache data for 1 hour to prevent rate limiting
+def fetch_real_fixtures(api_token):
+    if not api_token:
+        return pd.DataFrame()  # Return empty if no token, will use fallback
+
+    today = datetime.now()
+    date_from = today.strftime("%Y-%m-%d")
+    date_to = (today + timedelta(days=7)).strftime("%Y-%m-%d")
+
+    url = f"https://api.football-data.org/v4/matches?dateFrom={date_from}&dateTo={date_to}"
+    headers = {"X-Auth-Token": api_token}
+
     try:
-        res = requests.get(url, headers=headers, timeout=10)
-        if res.status_code == 200:
-            data = res.json()
-            table = data["standings"][0]["table"]
-            rows = []
-            for row in table:
-                rows.append({
-                    "Pos": row["position"],
-                    "Team": row["team"]["name"],
-                    "Played": row["playedGames"],
-                    "W": row["won"],
-                    "D": row["draw"],
-                    "L": row["lost"],
-                    "GF": row["goalsFor"],
-                    "GA": row["goalsAgainst"],
-                    "GD": row["goalDifference"],
-                    "Pts": row["points"]
-                })
-            return pd.DataFrame(rows)
-    except Exception:
-        return None
-    return None
+        response = requests.get(url, headers=headers)
+        if response.status_code == 200:
+            data = response.json()
+            matches = data.get("matches", [])
+            formatted_matches = []
 
-# ---------------------------------------------------------
-# PREDICTION ENGINE (HYBRID ELO + BIVARIATE POISSON)
-# ---------------------------------------------------------
-def calculate_prediction(home_stats, away_stats, league_avg, home_adv, home_form, away_form, is_neutral=False):
-    # 1. Elo Win Expectancy Adjustment
-    effective_home_adv = 0 if is_neutral else home_adv
-    elo_diff = (home_stats["elo"] + effective_home_adv) - away_stats["elo"]
-    elo_factor = 10 ** (elo_diff / 800)  # Damped Elo multiplier for goal scaling
+            target_competitions = list(LEAGUES_CONFIG.values())
 
-    # 2. Expected Goals (xG) Calculation
-    base_goals = league_avg / 2.0
-    home_xg = base_goals * home_stats["att"] * away_stats["def"] * (elo_factor ** 0.35) * home_form
-    away_xg = base_goals * away_stats["att"] * home_stats["def"] * ((1 / elo_factor) ** 0.35) * away_form
+            for m in matches:
+                comp_code = m["competition"]["code"]
+                if comp_code in target_competitions:
+                    # Reverse map competition code to league name
+                    league_name = [
+                        k
+                        for k, v in LEAGUES_CONFIG.items()
+                        if v == comp_code
+                    ][0]
 
-    # Clamp realistic boundaries
-    home_xg = float(np.clip(home_xg, 0.25, 4.50))
-    away_xg = float(np.clip(away_xg, 0.20, 4.20))
+                    formatted_matches.append(
+                        {
+                            "league": league_name,
+                            "date": m["utcDate"].replace("T", " ")[:16],
+                            "home": m["homeTeam"]["name"],
+                            "away": m["awayTeam"]["name"],
+                            "home_form": "W D W L W",  # Default form if API lacks recent form string
+                            "away_form": "W W D W L",
+                        }
+                    )
+            return pd.DataFrame(formatted_matches)
+        else:
+            str_ui.sidebar.error(
+                f"API Error: {response.status_code} - ဆက်သွယ်မှု အခက်အခဲရှိနေပါသည်။"
+            )
+            return pd.DataFrame()
+    except Exception as e:
+        str_ui.sidebar.error(f"Connection Exception: {e}")
+        return pd.DataFrame()
 
-    # 3. Scoreline Probability Matrix (0 to 6 goals)
-    max_goals = 7
-    h_probs = [poisson.pmf(i, home_xg) for i in range(max_goals)]
-    a_probs = [poisson.pmf(i, away_xg) for i in range(max_goals)]
-    matrix = np.outer(h_probs, a_probs)
 
-    # Normalize matrix
-    matrix = matrix / np.sum(matrix)
+# Fallback Mock Fixtures if API Key is not provided
+def get_fallback_fixtures():
+    today = datetime.now()
+    return pd.DataFrame(
+        [
+            {
+                "league": "Premier League",
+                "date": (today + timedelta(days=1)).strftime("%Y-%m-%d 20:00"),
+                "home": "Chelsea",
+                "away": "Aston Villa",
+                "home_form": "W D W L W",
+                "away_form": "W W D W L",
+            },
+            {
+                "league": "Premier League",
+                "date": (today + timedelta(days=2)).strftime("%Y-%m-%d 17:30"),
+                "home": "Manchester City",
+                "away": "Liverpool",
+                "home_form": "W W W D W",
+                "away_form": "W W W W D",
+            },
+            {
+                "league": "La Liga",
+                "date": (today + timedelta(days=1)).strftime("%Y-%m-%d 21:00"),
+                "home": "Real Madrid",
+                "away": "Villarreal",
+                "home_form": "W W D W W",
+                "away_form": "L W D W L",
+            },
+            {
+                "league": "Serie A",
+                "date": (today + timedelta(days=3)).strftime("%Y-%m-%d 22:45"),
+                "home": "Inter Milan",
+                "away": "Juventus",
+                "home_form": "W W W W D",
+                "away_form": "W D W W D",
+            },
+            {
+                "league": "Champions League",
+                "date": (today + timedelta(days=4)).strftime("%Y-%m-%d 01:00"),
+                "home": "Bayern Munich",
+                "away": "Bayer Leverkusen",
+                "home_form": "W W W W W",
+                "away_form": "W W D W W",
+            },
+        ]
+    )
 
-    home_win = np.sum(np.tril(matrix, -1))
-    draw = np.sum(np.diag(matrix))
-    away_win = np.sum(np.triu(matrix, 1))
 
-    # Over/Under 2.5 Goals & BTTS (Both Teams To Score)
-    over_25 = 0.0
-    btts_yes = 0.0
-    for h in range(max_goals):
-        for a in range(max_goals):
-            if (h + a) > 2.5:
-                over_25 += matrix[h, a]
-            if h > 0 and a > 0:
-                btts_yes += matrix[h, a]
+# ---------------------------------------------------------------------------
+# 3. STATISTICAL MODEL & PREDICTION ENGINE (Elo + Poisson)
+# ---------------------------------------------------------------------------
+def calculate_poisson_prediction(home_team, away_team, home_form, away_form):
+    home_elo = TEAM_ELOS.get(home_team, 1750)
+    away_elo = TEAM_ELOS.get(away_team, 1750)
 
-    # Top 5 Most Likely Exact Scores
-    scores = []
-    for h in range(max_goals):
-        for a in range(max_goals):
-            scores.append((f"{h} - {a}", matrix[h, a] * 100))
-    scores.sort(key=lambda x: x[1], reverse=True)
+    elo_diff = (home_elo - away_elo) + 100  # +100 for home advantage
+
+    def form_score(form_str):
+        if not isinstance(form_str, str):
+            return 1.5
+        matches = form_str.split()
+        points = sum(
+            3 if m == "W" else (1 if m == "D" else 0) for m in matches
+        )
+        return points / (len(matches) * 3) * 3.0 if matches else 1.5
+
+    h_form_val = form_score(home_form)
+    a_form_val = form_score(away_form)
+
+    base_home_xg = 1.45 + (elo_diff / 400.0) * 0.4 + (h_form_val - 1.5) * 0.2
+    base_away_xg = 1.15 - (elo_diff / 400.0) * 0.4 + (a_form_val - 1.5) * 0.2
+
+    home_xg = max(0.5, round(base_home_xg, 2))
+    away_xg = max(0.5, round(base_away_xg, 2))
+
+    max_goals = 5
+    score_matrix = np.outer(
+        pmf(np.arange(max_goals), home_xg), pmf(np.arange(max_goals), away_xg)
+    )
+    h_score, a_score = np.unravel_index(
+        np.argmax(score_matrix), score_matrix.shape
+    )
+
+    home_win_prob = np.sum(np.tril(score_matrix, -1)) * 100
+    draw_prob = np.sum(np.diag(score_matrix)) * 100
+    away_win_prob = np.sum(np.triu(score_matrix, 1)) * 100
 
     return {
-        "home_xg": round(home_xg, 2),
-        "away_xg": round(away_xg, 2),
-        "home_win": round(home_win * 100, 1),
-        "draw": round(draw * 100, 1),
-        "away_win": round(away_win * 100, 1),
-        "over_25": round(over_25 * 100, 1),
-        "under_25": round((1 - over_25) * 100, 1),
-        "btts_yes": round(btts_yes * 100, 1),
-        "top_scores": scores[:5],
-        "matrix": matrix[:6, :6]
+        "home_xg": home_xg,
+        "away_xg": away_xg,
+        "predicted_score": f"{h_score} - {a_score}",
+        "home_win_prob": round(home_win_prob, 1),
+        "draw_prob": round(draw_prob, 1),
+        "away_win_prob": round(away_win_prob, 1),
+        "home_elo": home_elo,
+        "away_elo": away_elo,
     }
 
-# ---------------------------------------------------------
-# SIDEBAR CONTROLS
-# ---------------------------------------------------------
-with st.sidebar:
-    st.title("⚙️ Model Settings")
-    selected_league = st.selectbox("Select Competition", list(LEAGUES.keys()))
-    
-    st.markdown("---")
-    st.subheader("Match Context Adjustments")
-    is_neutral = st.checkbox("Neutral Venue (e.g., Cup Final)", value=False)
-    home_adv_elo = st.slider("Home Advantage (Elo Points)", 0, 100, 55, disabled=is_neutral)
-    
-    home_form = st.slider("Home Recent Form Multiplier", 0.80, 1.20, 1.00, 0.02)
-    away_form = st.slider("Away Recent Form Multiplier", 0.80, 1.20, 1.00, 0.02)
 
-    st.markdown("---")
-    st.subheader("📡 Live API (Optional)")
-    api_key = st.text_input("Football-Data.org API Key", type="password", help="Free key from football-data.org for live league tables.")
-
-# ---------------------------------------------------------
-# MAIN DASHBOARD
-# ---------------------------------------------------------
-st.title(f"⚽ {selected_league} — Match Predictor")
-st.caption("Hybrid Elo Rating & Bivariate Poisson Statistical Engine")
-
-teams_dict = LEAGUES[selected_league]
-team_names = list(teams_dict.keys())
-
-col1, col_vs, col2 = st.columns([4, 1, 4])
-
-with col1:
-    home_team = st.selectbox("🏠 Home Team", team_names, index=0)
-    st.caption(f"Elo Rating: **{teams_dict[home_team]['elo']}** | Attack: **{teams_dict[home_team]['att']}** | Defense: **{teams_dict[home_team]['def']}**")
-
-with col_vs:
-    st.markdown("<h2 style='text-align: center; padding-top: 25px;'>VS</h2>", unsafe_allow_html=True)
-
-with col2:
-    away_team = st.selectbox("✈️ Away Team", team_names, index=1 if len(team_names) > 1 else 0)
-    st.caption(f"Elo Rating: **{teams_dict[away_team]['elo']}** | Attack: **{teams_dict[away_team]['att']}** | Defense: **{teams_dict[away_team]['def']}**")
-
-if home_team == away_team:
-    st.warning("⚠️ Please select two different teams to run the prediction.")
-    st.stop()
-
-# Run Prediction
-res = calculate_prediction(
-    home_stats=teams_dict[home_team],
-    away_stats=teams_dict[away_team],
-    league_avg=LEAGUE_AVG_GOALS[selected_league],
-    home_adv=home_adv_elo,
-    home_form=home_form,
-    away_form=away_form,
-    is_neutral=is_neutral
+# ---------------------------------------------------------------------------
+# 4. STREAMLIT UI DISPLAY
+# ---------------------------------------------------------------------------
+str_ui.title("⚽ Real-Time 6 Leagues Match Predictor")
+str_ui.markdown(
+    "Football-Data API ကို ချိတ်ဆက်၍ လာမည့် တစ်ပတ်အတွင်းပွဲစဉ်များကို အလိုအလျောက်ဆွဲထုတ်ကာ **Elo, Form & Poisson Model** ဖြင့် ခန့်မှန်းထားခြင်း။"
 )
 
-st.markdown("---")
+# Requirement 3: Last Updated Timestamp
+last_updated_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S (%A)")
+str_ui.info(f"🕒 **Last Updated Time:** {last_updated_time}")
 
-# ---------------------------------------------------------
-# KEY METRICS ROW (1X2 & EXPECTED GOALS)
-# ---------------------------------------------------------
-m1, m2, m3, m4 = st.columns(4)
+# Fetch Data
+df_fixtures = pd.DataFrame()
+if api_key:
+    with str_ui.spinner("Real-time ပွဲစဉ်များကို API မှ ဆွဲထုတ်နေပါသည်..."):
+        df_fixtures = fetch_real_fixtures(api_key)
 
-with m1:
-    st.markdown(f"""
-    <div class="metric-card">
-        <div style="color:#A0AAB8;">Expected Goals (xG)</div>
-        <div class="big-score">{res['home_xg']} - {res['away_xg']}</div>
-        <div style="font-size:13px; color:#888;">Projected xG Output</div>
-    </div>
-    """, unsafe_allow_html=True)
-
-with m2:
-    st.markdown(f"""
-    <div class="metric-card">
-        <div style="color:#A0AAB8;">{home_team} Win (1)</div>
-        <div class="big-score" style="color:#4FC3F7;">{res['home_win']}%</div>
-        <div style="font-size:13px; color:#888;">Fair Odds: {round(100/max(res['home_win'],1), 2)}</div>
-    </div>
-    """, unsafe_allow_html=True)
-
-with m3:
-    st.markdown(f"""
-    <div class="metric-card">
-        <div style="color:#A0AAB8;">Draw (X)</div>
-        <div class="big-score" style="color:#FFD54F;">{res['draw']}%</div>
-        <div style="font-size:13px; color:#888;">Fair Odds: {round(100/max(res['draw'],1), 2)}</div>
-    </div>
-    """, unsafe_allow_html=True)
-
-with m4:
-    st.markdown(f"""
-    <div class="metric-card">
-        <div style="color:#A0AAB8;">{away_team} Win (2)</div>
-        <div class="big-score" style="color:#FF8A65;">{res['away_win']}%</div>
-        <div style="font-size:13px; color:#888;">Fair Odds: {round(100/max(res['away_win'],1), 2)}</div>
-    </div>
-    """, unsafe_allow_html=True)
-
-st.markdown("###")
-
-# ---------------------------------------------------------
-# VISUALIZATIONS & GOAL MARKETS
-# ---------------------------------------------------------
-tab1, tab2, tab3 = st.tabs(["📊 Scoreline Matrix & Markets", "🎯 Most Likely Scores", "🏆 Live League Table"])
-
-with tab1:
-    left_chart, right_stats = st.columns([3, 2])
-    
-    with left_chart:
-        st.subheader("Exact Score Probability Heatmap (%)")
-        heatmap_df = pd.DataFrame(
-            np.round(res["matrix"] * 100, 1),
-            index=[f"{home_team} {i}" for i in range(6)],
-            columns=[f"{away_team} {j}" for j in range(6)]
+if df_fixtures.empty:
+    if api_key:
+        str_ui.warning(
+            "API မှ ဤရက်ပိုင်းအတွင်း ပွဲစဉ်ရှာမတွေ့ပါ (သို့) ဝင်ရောက်ခွင့် ကန့်သတ်ချက်ရှိနေပါသည်။ နမူနာဒေတာ (Mock Data) သို့ ပြောင်းလဲဖော်ပြပေးထားပါသည်။"
         )
-        fig = px.imshow(
-            heatmap_df,
-            text_auto=True,
-            color_continuous_scale="Viridis",
-            aspect="auto"
-        )
-        fig.update_layout(height=380, margin=dict(l=10, r=10, t=10, b=10))
-        st.plotly_chart(fig, use_container_width=True)
-
-    with right_stats:
-        st.subheader("Goals & BTTS Markets")
-        markets_df = pd.DataFrame({
-            "Market": ["Over 2.5 Goals", "Under 2.5 Goals", "Both Teams to Score (Yes)", "Both Teams to Score (No)"],
-            "Probability (%)": [res["over_25"], res["under_25"], res["btts_yes"], round(100 - res["btts_yes"], 1)],
-            "Fair Decimal Odds": [
-                round(100 / max(res["over_25"], 1), 2),
-                round(100 / max(res["under_25"], 1), 2),
-                round(100 / max(res["btts_yes"], 1), 2),
-                round(100 / max(100 - res["btts_yes"], 1), 2),
-            ]
-        })
-        st.dataframe(markets_df, use_container_width=True, hide_index=True)
-
-with tab2:
-    st.subheader("Top 5 Projected Scorelines")
-    top_df = pd.DataFrame(res["top_scores"], columns=["Scoreline (Home - Away)", "Probability (%)"])
-    top_df["Probability (%)"] = top_df["Probability (%)"].round(2)
-    
-    fig_bar = px.bar(
-        top_df,
-        x="Scoreline (Home - Away)",
-        y="Probability (%)",
-        text="Probability (%)",
-        color="Probability (%)",
-        color_continuous_scale="Tealgrn"
-    )
-    fig_bar.update_layout(height=350)
-    st.plotly_chart(fig_bar, use_container_width=True)
-
-with tab3:
-    if api_key and selected_league in COMPETITION_CODES:
-        standings_df = fetch_live_standings(COMPETITION_CODES[selected_league], api_key)
-        if standings_df is not None:
-            st.dataframe(standings_df, use_container_width=True, hide_index=True)
-        else:
-            st.error("Could not fetch standings. Check your API key or rate limit.")
     else:
-        st.info("Enter a free API key from **football-data.org** in the sidebar to view live standings for Premier League, La Liga, Serie A, Ligue 1, and Champions League.")
+        str_ui.info(
+            "💡 အကြံပြုချက်: Sidebar တွင် Football-Data.org API Key ထည့်ပေးပါက Real-time ပွဲစဉ်များ အလိုအလျောက် ပေါ်လာပါမည်။ လက်တလောတွင် နမူနာဒေတာကို ပြသထားပါသည်။"
+        )
+    df_fixtures = get_fallback_fixtures()
+
+# League Selection Filter
+league_list = ["အားလုံး (All Leagues)"] + list(LEAGUES_CONFIG.keys())
+selected_league = str_ui.sidebar.selectbox("လိဂ်ပြိုင်ပွဲ ရွေးချယ်ရန်", league_list)
+
+if selected_league != "အားလုံး (All Leagues)":
+    df_fixtures = df_fixtures[df_fixtures["league"] == selected_league]
+
+str_ui.divider()
+str_ui.subheader(f"📅 ပွဲစဉ်များနှင့် ခန့်မှန်းချက်များ ({selected_league})")
+
+if df_fixtures.empty:
+    str_ui.warning(
+        "ရွေးချယ်ထားသော လာမည့်ရက်များအတွင်း ယှဉ်ပြိုင်မည့် ပွဲစဉ် မရှိသေးပါ။"
+    )
+else:
+    for idx, row in df_fixtures.iterrows():
+        league = row["league"]
+        match_date = row["date"]
+        home = row["home"]
+        away = row["away"]
+        h_form = row["home_form"]
+        a_form = row["away_form"]
+
+        pred = calculate_poisson_prediction(home, away, h_form, a_form)
+
+        with str_ui.container():
+            str_ui.markdown(f"### 🏆 **{league}** | ⏰ *{match_date} UTC*")
+
+            col1, col2, col3 = str_ui.columns([3, 2, 3])
+
+            with col1:
+                str_ui.markdown(f"#### 🏠 {home}")
+                str_ui.caption(
+                    f"Elo: {pred['home_elo']} | Recent Form: `{h_form}`"
+                )
+
+            with col2:
+                str_ui.markdown(
+                    f"<h3 style='text-align: center; color: #FF4B4B;'>{pred['predicted_score']}</h3>",
+                    unsafe_allow_html=True,
+                )
+                str_ui.caption(
+                    f"<p style='text-align: center;'>ခန့်မှန်းဂိုး (xG): H {pred['home_xg']} - A {pred['away_xg']}</p>",
+                    unsafe_allow_html=True,
+                )
+
+            with col3:
+                str_ui.markdown(f"#### ✈️ {away}")
+                str_ui.caption(
+                    f"Elo: {pred['away_elo']} | Recent Form: `{a_form}`"
+                )
+
+            with str_ui.expander("📊 Statistical Model & Match Breakdown"):
+                str_ui.write(
+                    f"- **အနိုင်ရရှိနိုင်ခြေ (Win Probabilities):** {home} နိုင်ခြေ **{pred['home_win_prob']}%** | သရေ **{pred['draw_prob']}%** | {away} နိုင်ခြေ **{pred['away_win_prob']}%**"
+                )
+                str_ui.write(
+                    f"- **Elo Rating ခွဲခြမ်းစိတ်ဖြာချက်:** {home} (Rating: {pred['home_elo']}) နှင့် {away} (Rating: {pred['away_elo']}) တို့၏ အဆင့်သတ်မှတ်ချက် ကွာဟချက်။"
+                )
+                str_ui.write(
+                    f"- **Poisson Distribution Model:** အိမ်ကွင်းအားသာချက်နှင့် စာရင်းဇယားတွက်ချက်မှုအရ {home} က ဂိုးပေါက်ထိုးဖောက်နိုင်ခြေ {pred['home_xg']} နှင့် {away} က {pred['away_xg']} ဂိုးအထိ သွင်းယူနိုင်ရန် ခန့်မှန်းထားပါသည်။"
+                )
+
+            str_ui.markdown("---")
