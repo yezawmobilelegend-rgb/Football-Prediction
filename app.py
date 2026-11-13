@@ -2,7 +2,7 @@ from datetime import datetime, timedelta
 import numpy as np
 import pandas as pd
 import requests
-from scipy.stats import poisson  # <-- ပြင်ဆင်ထားသည့်နေရာ (Correct Import)
+from scipy.stats import poisson
 import streamlit as str_ui
 
 # Page Configuration
@@ -13,15 +13,20 @@ str_ui.set_page_config(
 )
 
 # ---------------------------------------------------------------------------
-# 1. SIDEBAR CONFIGURATION & API KEY INPUT
+# 1. API KEY HANDLING (Streamlit Secrets သို့မဟုတ် Sidebar မှ ရယူခြင်း)
 # ---------------------------------------------------------------------------
-str_ui.sidebar.title("⚙️ API Settings")
-api_key_input = str_ui.sidebar.text_input(
-    "football-data.org API Key ထည့်ရန်", type="password"
-)
-str_ui.sidebar.caption(
-    "သင်၏ registered လုပ်ထားသော API Key ကို ဤနေရာတွင် ထည့်သွင်းပါ။"
-)
+try:
+  # Streamlit Cloud secrets.toml မှ API Key ကို အလိုအလျောက် ခေါ်ယူမည်
+  api_key_input = str_ui.secrets["FOOTBALL_API_KEY"]
+except:
+  # Secrets ထဲမရှိသေးပါက သို့မဟုတ် Local Run နေပါက Sidebar တွင် တောင်းမည်
+  str_ui.sidebar.title("⚙️ API Settings")
+  api_key_input = str_ui.sidebar.text_input(
+      "football-data.org API Key ထည့်ရန်", type="password"
+  )
+  str_ui.sidebar.caption(
+      "သင်၏ registered လုပ်ထားသော API Key ကို ဤနေရာတွင် ထည့်သွင်းပါ။"
+  )
 
 LEAGUES = [
     "Premier League",
@@ -34,7 +39,6 @@ LEAGUES = [
 
 # Sample Elo ratings database for prediction model
 TEAM_ELOS = {
-    # Premier League
     "Manchester City": 2050,
     "Arsenal": 2020,
     "Liverpool": 2010,
@@ -43,26 +47,22 @@ TEAM_ELOS = {
     "Tottenham Hotspur FC": 1820,
     "Manchester United FC": 1800,
     "Newcastle United FC": 1790,
-    # La Liga
     "Real Madrid CF": 2060,
     "FC Barcelona": 2030,
     "Atlético de Madrid": 1920,
     "Real Sociedad de Fútbol": 1840,
     "Villarreal CF": 1810,
     "Athletic Club": 1820,
-    # Serie A
     "Inter Milan": 1990,
     "Juventus FC": 1910,
     "AC Milan": 1900,
     "SSC Napoli": 1880,
     "Atalanta BC": 1870,
     "AS Roma": 1840,
-    # Ligue 1
     "Paris Saint-Germain FC": 1980,
     "AS Monaco FC": 1830,
     "Olympique de Marseille": 1810,
     "LOSC Lille": 1800,
-    # UCL / UEL
     "FC Bayern Munich": 2040,
     "Borussia Dortmund": 1910,
     "Bayer 04 Leverkusen": 1960,
@@ -75,7 +75,11 @@ TEAM_ELOS = {
 # ---------------------------------------------------------------------------
 def fetch_live_fixtures(api_key):
   if not api_key:
-    return None, "⚠️ ကျေးဇူးပြု၍ Sidebar တွင် API Key ထည့်သွင်းပေးပါ။"
+    return (
+        None,
+        "⚠️ API Key မတွေ့ရှိရပါ။ Streamlit Secrets တွင် ထည့်သွင်းပါ သို့မဟုတ်"
+        " Sidebar တွင် ရိုက်ထည့်ပါ။",
+    )
 
   today = datetime.now()
   date_from = today.strftime("%Y-%m-%d")
@@ -159,22 +163,6 @@ def get_fallback_fixtures():
           "home_form": "W W W D W",
           "away_form": "W W W W D",
       },
-      {
-          "league": "La Liga",
-          "date": (today + timedelta(days=1)).strftime("%Y-%m-%d %H:%M"),
-          "home": "Real Madrid CF",
-          "away": "Villarreal CF",
-          "home_form": "W W D W W",
-          "away_form": "L W D W L",
-      },
-      {
-          "league": "Serie A",
-          "date": (today + timedelta(days=3)).strftime("%Y-%m-%d %H:%M"),
-          "home": "Inter Milan",
-          "away": "Juventus FC",
-          "home_form": "W W W W D",
-          "away_form": "W D W W D",
-      },
   ])
 
 
@@ -204,7 +192,6 @@ def calculate_poisson_prediction(home_team, away_team, home_form, away_form):
   away_xg = max(0.5, round(base_away_xg, 2))
 
   max_goals = 5
-  # Updated usage: poisson.pmf(...) ကို သုံးပေးထားသည်
   score_matrix = np.outer(
       poisson.pmf(np.arange(max_goals), home_xg),
       poisson.pmf(np.arange(max_goals), away_xg),
@@ -246,10 +233,6 @@ df_fixtures, api_error = fetch_live_fixtures(api_key_input)
 
 if api_error:
   str_ui.warning(api_error)
-  str_ui.info(
-      "ℹ️ လက်ရှိတွင် API Key မရှိသေးပါက (သို့မဟုတ် Error ဖြစ်နေလျှင်) စမ်းသပ်ရန်"
-      " Sample Data ဖြင့် ပြသပေးနေပါသည်။"
-  )
   df_fixtures = get_fallback_fixtures()
 
 # League Filter Selection
@@ -281,7 +264,6 @@ else:
     h_form = row["home_form"]
     a_form = row["away_form"]
 
-    # Run Prediction Model
     pred = calculate_poisson_prediction(home, away, h_form, a_form)
 
     with str_ui.container():
@@ -309,7 +291,6 @@ else:
         str_ui.markdown(f"#### ✈️ {away}")
         str_ui.caption(f"Elo: {pred['away_elo']} | Form: `{a_form}`")
 
-      # Detailed Rationale Expandable Box
       with str_ui.expander("📊 Statistical Model & Match Breakdown"):
         str_ui.write(
             f"- **အနိုင်ရရှိနိုင်ခြေ:** {home} နိုင်ခြေ"
