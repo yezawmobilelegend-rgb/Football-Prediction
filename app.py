@@ -72,39 +72,56 @@ current_league_code = LEAGUE_CODES[selected_league_name]
 
 def get_team_stats(team_name):
     h = int(hashlib.md5(team_name.encode()).hexdigest(), 16)
-    elo = 1450 + (h % 500)  # Elo များကို ပိုမိုကျယ်ပြန့်စေရန်
-    form_pts = 4 + (h % 11)  # Form များကို 4 မှ 15 ထိ ဖြစ်စေရန်
+    elo = 1450 + (h % 500)
+    form_pts = 4 + (h % 11)
     return elo, form_pts
 
 
-def convert_to_myanmar_odds(team_name, handicap, decimal_odds):
+# ၁။ မြန်မာကြေးပုံစံ (Team 1+20) သို့ ပြောင်းလဲပေးသော Function
+def format_myanmar_handicap(team_name, handicap, decimal_odds):
     if not decimal_odds or decimal_odds <= 1.0:
-        return f"{team_name} (ကမ္ဘာ့ပေါက်ကြေး မထွက်သေးပါ)"
+        return f"{team_name} (ဈေးမထွက်သေးပါ)"
 
     profit = decimal_odds - 1.0
     price_val = int(round(profit * 100))
-    if decimal_odds >= 1.0:
-        price_str = f"+{price_val}" if price_val > 0 else "ဆုံ"
+    if price_val > 0:
+        price_str = f"+{price_val}"
+    elif price_val < 0:
+        price_str = f"{price_val}"
     else:
-        price_val = int(round((1.0 - decimal_odds) * 100))
-        price_str = f"-{price_val}"
+        price_str = "ဆုံ"
 
-    hdp_str = str(abs(handicap)) if handicap != 0 else "0 (ဆုံလည်)"
-    return f"{team_name} {hdp_str} ({price_str})"
+    hdp_str = str(abs(handicap)) if handicap != 0 else "0"
+    return f"{team_name} {hdp_str}{price_str}"
+
+
+# ၂။ မြန်မာဂိုးပေါင်းကြေးပုံစံ (3+40) သို့ ပြောင်းလဲပေးသော Function
+def format_myanmar_ou(ou_line, decimal_odds):
+    if not decimal_odds or decimal_odds <= 1.0:
+        return "ဈေးမထွက်သေးပါ"
+
+    profit = decimal_odds - 1.0
+    price_val = int(round(profit * 100))
+    if price_val > 0:
+        price_str = f"+{price_val}"
+    elif price_val < 0:
+        price_str = f"{price_val}"
+    else:
+        price_str = "ဆုံ"
+
+    return f"{ou_line}{price_str}"
 
 
 def poisson_probability(lam, k):
     return (math.exp(-lam) * (lam**k)) / math.factorial(k)
 
 
-# အသင်းအလွန်အကျွံ 1-1 မဖြစ်စေရန် Lambda Sensitivity ကို မြှင့်တင်ထားသော Function
 def calculate_match_prediction(
     home_team, away_team, home_elo, away_elo, home_form_pts, away_form_pts
 ):
     base_home_lambda = 1.55
     base_away_lambda = 1.05
 
-    # Elo နှင့် Form ကွာဟချက်ကို ပိုမိုအလေးပေးတွက်ချက်ခြင်း
     elo_diff_factor = (home_elo - away_elo) / 250.0
     form_diff = (home_form_pts - away_form_pts) / 8.0
 
@@ -216,30 +233,40 @@ else:
             col1, col2 = st.columns(2)
 
             with col1:
-                st.markdown("### 🌐 ကမ္ဘာ့ပေါက်ကြေးနှင့် အချက်အလက်များ")
+                st.markdown("### 🌐 ကမ္ဘာ့ပေါက်ကြေး (Myanmar Format)")
                 global_odds_available = True
 
                 if not global_odds_available:
-                    st.error(
-                        "ℹ️ ကမ္ဘာ့ပေါက်ကြေးများ မထွက်သေးပါ (Odds not released yet)"
-                    )
-                    global_home_myanmar_str = "ကမ္ဘာ့ပေါက်ကြေးများ မထွက်သေးပါ"
+                    st.error("ℹ️ ကမ္ဘာ့ပေါက်ကြေးများ မထွက်သေးပါ")
+                    global_hdp_str = "မထွက်သေးပါ"
+                    global_ou_str = "မထွက်သေးပါ"
                 else:
-                    simulated_hdp = -0.75
-                    simulated_dec_odds = 1.85
-                    global_home_myanmar_str = convert_to_myanmar_odds(
-                        home_team, simulated_hdp, simulated_dec_odds
-                    )
-                    st.info(
-                        f"**ကမ္ဘာ့ပေါက်ကြေး (Myanmar Format):** {global_home_myanmar_str}"
-                    )
-                    st.caption("💡 (ပွဲစဉ်အလိုက် အချိန်နှင့်တပြေးညီ ပေါက်ကြေး)")
+                    # Simulated Global API Odds converted to Myanmar Format
+                    sim_hdp = 1.0
+                    sim_hdp_dec = 1.20
+                    sim_ou = 3.0
+                    sim_ou_dec = 1.40
 
-                st.markdown("### 📝 ဒေသတွင်း/ကိုယ်ပိုင် ပွဲပေါက်ကြေး ထည့်သွင်းရန်")
-                local_odds_input = st.text_input(
-                    f"ဒေသတွင်းကြေး ရေးရန် ({home_team})",
-                    key=f"local_odds_{i}",
-                    placeholder="ဥပမာ - Chelsea 3/4 ရေ -10",
+                    global_hdp_str = format_myanmar_handicap(
+                        home_team, sim_hdp, sim_hdp_dec
+                    )
+                    global_ou_str = format_myanmar_ou(sim_ou, sim_ou_dec)
+
+                    st.info(
+                        f"👉 **အထက်/အောက် (HDP):** `{global_hdp_str}`\n\n"
+                        f"⚽ **ဂိုးပေါင်း (O/U):** `{global_ou_str}`"
+                    )
+
+                st.markdown("### 📝 ဒေသတွင်း ပွဲပေါက်ကြေး ထည့်သွင်းရန်")
+                local_hdp_input = st.text_input(
+                    f"ဒေသတွင်း အထက်/အောက် ကြေး (ဥပမာ: {home_team} 1+20)",
+                    key=f"local_hdp_{i}",
+                    placeholder=f"{home_team} 1+20",
+                )
+                local_ou_input = st.text_input(
+                    f"ဒေသတွင်း ဂိုးပေါင်းကြေး (ဥပမာ: 3+40)",
+                    key=f"local_ou_{i}",
+                    placeholder="3+40",
                 )
 
             with col2:
@@ -259,8 +286,14 @@ else:
                     )
                 )
 
+                local_display = (
+                    f"{local_hdp_input} / {local_ou_input}"
+                    if (local_hdp_input or local_ou_input)
+                    else "မထည့်ရသေး"
+                )
+
                 st.markdown(
-                    f"**1️⃣ ဈေးနှိုင်းယှဉ်ချက်:** ကမ္ဘာ့ကြေး (`{global_home_myanmar_str}`) နှင့် ဒေသတွင်းကြေး (`{local_odds_input if local_odds_input else 'မထည့်ရသေး'}`) ကို ချိန်ထိုးပြီး တန်ဖိုးရှိသော Value Bet ကို ရှာဖွေပေးထားပါသည်။"
+                    f"**1️⃣ ဈေးနှိုင်းယှဉ်ချက်:** ကမ္ဘာ့ကြေး (`{global_hdp_str} / {global_ou_str}`) နှင့် ဒေသတွင်းကြေး (`{local_display}`) တို့ကို ချိန်ထိုးပြီး တန်ဖိုးရှိသော Value Bet ကို တွက်ချက်ပေးထားပါသည်။"
                 )
                 st.markdown(
                     f"**2️⃣ Elo Ratings:** {home_team} ({home_elo}) vs {away_team} ({away_elo})"
