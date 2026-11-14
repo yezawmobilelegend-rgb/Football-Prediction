@@ -1,5 +1,4 @@
 from datetime import datetime, timedelta
-import hashlib
 import math
 import re
 import numpy as np
@@ -19,7 +18,7 @@ st.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
 st.title("⚽ ဘောလုံးပွဲစဉ်နှင့် ကြေးနှိုင်းယှဉ် ခန့်မှန်းချက် Dashboard")
 st.markdown(
     "အဓိကလိဂ် (၆) ခု၏ တစ်ပတ်စာပွဲစဉ်များ၊ ကမ္ဘာ့ပေါက်ကြေး (တိုက်ရိုက် API)၊"
-    " ဒေသတွင်းပေါက်ကြေးနှင့် AI Poisson ခန့်မှန်းချက်စနစ်"
+    " တကယ့် Form ရမှတ်များနှင့် AI Poisson ခန့်မှန်းချက်စနစ်"
 )
 
 # --- SIDEBAR: API CONFIGURATIONS ---
@@ -72,14 +71,45 @@ current_league_code = LEAGUE_CODES[selected_league_name]
 # --- HELPER FUNCTIONS ---
 
 
-def get_team_stats(team_name):
-  h = int(hashlib.md5(team_name.encode()).hexdigest(), 16)
-  elo = 1450 + (h % 500)
-  form_pts = 4 + (h % 11)
-  return elo, form_pts
+# ၁။ Football-data.org မှ အသင်းများ၏ တကယ့် Standings နှင့် Form ရမှတ်များကို ဆွဲထုတ်ခြင်း
+@st.cache_data(ttl=3600)
+def fetch_team_standings(league_code, api_key):
+  if not api_key:
+    return {}
+  url = f"https://api.football-data.org/v4/competitions/{league_code}/standings"
+  headers = {"X-Auth-Token": api_key}
+  team_stats_map = {}
+  try:
+    response = requests.get(url, headers=headers, timeout=10)
+    if response.status_code == 200:
+      data = response.json()
+      standings = data.get("standings", [])
+      for table in standings:
+        if table.get("type") == "TOTAL":
+          for row in table.get("table", []):
+            team_name = row["team"]["name"]
+            points = row.get("points", 10)
+            # အသင်း၏ နိုင်/ရှုံး အပေါ်မူတည်၍ Elo တန်ဖိုး တွက်ချက်ခြင်း
+            goal_diff = row.get("goalDifference", 0)
+            elo = 1500 + (points * 15) + (goal_diff * 5)
+            team_stats_map[team_name] = {
+                "elo": elo,
+                "form_pts": points,  # လိဂ်ဇယားပါ တကယ့်ရမှတ်
+            }
+  except Exception as e:
+    print(f"Standings API Error: {e}")
+  return team_stats_map
 
 
-# ၁။ မြန်မာကြေးပုံစံ (Team 1+20) သို့ ပြောင်းလဲပေးသော Function
+# အကယ်၍ API ထဲတွင် မပါသေးပါက Default တန်ဖိုး သတ်မှတ်ပေးရန်
+def get_team_stats(team_name, standings_map):
+  if team_name in standings_map:
+    return standings_map[team_name]["elo"], standings_map[team_name]["form_pts"]
+  # အကယ်၍ ရှာမတွေ့ပါက ပုံမှန်တန်ဖိုးပေးမည်
+  return 1650, 12
+
+
+# ၂။ မြန်မာကြေးပုံစံ (Team 1+20) သို့ ပြောင်းလဲပေးသော Function
 def format_myanmar_handicap(team_name, handicap, decimal_odds):
   if not decimal_odds or decimal_odds <= 1.0:
     return f"{team_name} (ဈေးမထွက်သေးပါ)"
@@ -97,7 +127,7 @@ def format_myanmar_handicap(team_name, handicap, decimal_odds):
   return f"{team_name} {hdp_str}{price_str}"
 
 
-# ၂။ မြန်မာဂိုးပေါင်းကြေးပုံစံ (3+40) သို့ ပြောင်းလဲပေးသော Function
+# ၃။ မြန်မာဂိုးပေါင်းကြေးပုံစံ (3+40) သို့ ပြောင်းလဲပေးသော Function
 def format_myanmar_ou(ou_line, decimal_odds):
   if not decimal_odds or decimal_odds <= 1.0:
     return "ဈေးမထွက်သေးပါ"
@@ -114,8 +144,8 @@ def format_myanmar_ou(ou_line, decimal_odds):
   return f"{ou_line}{price_str}"
 
 
-# ၃။ odds-api.io မှ အချိန်နဲ့တပြေးညီ ကမ္ဘာ့ပေါက်ကြေး တိုက်ရိုက်ဆွဲယူသည့် Function
-@st.cache_data(ttl=600)  # 10 မိနစ်တစ်ကြိမ် Cache လုပ်မည်
+# ၄။ odds-api.io မှ Live Odds ဆွဲထုတ်သည့် Function
+@st.cache_data(ttl=600)
 def fetch_live_odds_from_api(api_key):
   if not api_key:
     return []
@@ -125,7 +155,6 @@ def fetch_live_odds_from_api(api_key):
     response = requests.get(url, params=params, timeout=10)
     if response.status_code == 200:
       data = response.json()
-      # odds-api.io ၏ response ဖွဲ့စည်းပုံအပေါ် မူတည်၍ list ပြန်ပေးသည်
       if isinstance(data, list):
         return data
       elif isinstance(data, dict) and "data" in data:
@@ -135,16 +164,13 @@ def fetch_live_odds_from_api(api_key):
   return []
 
 
-# ပွဲစဉ်အလိုက် live odds ကို ရှာဖွေပေးသော helper
 def get_match_odds(home_team, away_team, odds_list):
-  # Default values if not found
   hdp, hdp_dec, ou, ou_dec = 1.0, 1.85, 2.5, 1.85
   found = False
 
   for item in odds_list:
     h_name = item.get("home_team", "")
     a_name = item.get("away_team", "")
-    # အသင်းနာမည် တစ်စိတ်တစ်ပိုင်း တူညီမှုရှိမလား စစ်ဆေးခြင်း
     if (
         home_team.lower() in h_name.lower()
         or h_name.lower() in home_team.lower()
@@ -153,11 +179,9 @@ def get_match_odds(home_team, away_team, odds_list):
         or a_name.lower() in away_team.lower()
     ):
       markets = item.get("bookmakers", [])
-      # Bookmaker တွေထဲက market တွေကို ရှာဖွေခြင်း
       for bm in markets:
         for market in bm.get("markets", []):
           if market.get("key") == "spreads":
-            # Handicap ဒေတာ
             outcomes = market.get("outcomes", [])
             for out in outcomes:
               if (
@@ -168,7 +192,6 @@ def get_match_odds(home_team, away_team, odds_list):
                 hdp_dec = out.get("price", 1.85)
                 found = True
           if market.get("key") == "totals":
-            # Over/Under ဂိုးပေါင်း ဒေတာ
             outcomes = market.get("outcomes", [])
             for out in outcomes:
               if "over" in out.get("name", "").lower():
@@ -185,7 +208,7 @@ def poisson_probability(lam, k):
   return (math.exp(-lam) * (lam**k)) / math.factorial(k)
 
 
-# ၄။ AI တွက်ချက်မှုနှင့် ဒေသတွင်းကြေးများကို အဓိကအခြေခံ၍ အကြံပြုချက်ထုတ်ပေးသော Engine
+# ၅။ AI ခန့်မှန်းချက် Engine
 def calculate_match_prediction(
     home_team,
     away_team,
@@ -226,7 +249,6 @@ def calculate_match_prediction(
 
   total_goals_lambda = home_lambda + away_lambda
 
-  # --- ဒေသတွင်းကြေးကို အဓိကအခြေခံ၍ ဂိုးပေါင်းဈေး ရွေးချယ်ပေးခြင်း ---
   ou_recommendation = (
       f"အထက် (Over 2.5) [AI မျှော်မှန်းဂိုး: {total_goals_lambda:.2f}]"
       if total_goals_lambda > 2.5
@@ -250,7 +272,6 @@ def calculate_match_prediction(
             f" **အောက် (Under {user_ou_line})** ကို အဓိကရွေးချယ်သင့်သည်"
         )
 
-  # --- ဒေသတွင်းကြေးကို အဓိကအခြေခံ၍ အနိုင်အရှုံး / အသာစီး ရွေးချယ်ပေးခြင်း ---
   if local_hdp_input:
     if home_team.lower() in local_hdp_input.lower() and (
         "+" in local_hdp_input or "ဆုံ" in local_hdp_input
@@ -289,18 +310,11 @@ def fetch_fixtures(league_code, api_key):
     return [
         {
             "id": 101,
-            "homeTeam": {"name": "Chelsea"},
-            "awayTeam": {"name": "Arsenal"},
-            "utcDate": f"{today}T16:00:00Z",
+            "homeTeam": {"name": "FC Bayern München"},
+            "awayTeam": {"name": "1. FC Köln"},
+            "utcDate": f"{today}T19:30:00Z",
             "status": "TIMED",
-        },
-        {
-            "id": 102,
-            "homeTeam": {"name": "Manchester United"},
-            "awayTeam": {"name": "Liverpool"},
-            "utcDate": f"{today}T18:30:00Z",
-            "status": "TIMED",
-        },
+        }
     ]
 
   url = f"https://api.football-data.org/v4/competitions/{league_code}/matches?status=SCHEDULED"
@@ -327,6 +341,7 @@ st.subheader(f"📅 {selected_league_name} - လာမည့် ၇ ရက်အ
 
 matches = fetch_fixtures(current_league_code, fb_api_key)
 live_odds_data = fetch_live_odds_from_api(odds_api_key)
+team_standings_map = fetch_team_standings(current_league_code, fb_api_key)
 
 if not matches:
   st.warning(
@@ -349,7 +364,6 @@ else:
       with col1:
         st.markdown("### 🌐 ကမ္ဘာ့ပေါက်ကြေး (Live API Format)")
 
-        # odds-api.io မှ တိုက်ရိုက်ဆွဲထုတ်ထားသော ကြေးများကို ရှာဖွေခြင်း
         sim_hdp, sim_hdp_dec, sim_ou, sim_ou_dec = get_match_odds(
             home_team, away_team, live_odds_data
         )
@@ -379,8 +393,9 @@ else:
       with col2:
         st.markdown("### 🤖 အဆင့်မြင့် ခန့်မှန်းချက် (AI Analysis)")
 
-        home_elo, home_form_pts = get_team_stats(home_team)
-        away_elo, away_form_pts = get_team_stats(away_team)
+        # တကယ့် API Standings မှ ရလာသော Elo နှင့် Form (ရမှတ်) များကို သုံးမည်
+        home_elo, home_form_pts = get_team_stats(home_team, team_standings_map)
+        away_elo, away_form_pts = get_team_stats(away_team, team_standings_map)
 
         best_score, ou_rec, winner_rec, h_lam, a_lam = (
             calculate_match_prediction(
@@ -412,7 +427,7 @@ else:
             f" ({away_elo})"
         )
         st.markdown(
-            f"**3️⃣ Recent Forms (နောက်ဆုံး ၅ ပွဲ):** {home_team} (ရမှတ်"
+            f"**3️⃣ လိဂ်ဇယား ရမှတ် (Points):** {home_team} (ရမှတ်"
             f" {home_form_pts}) | {away_team} (ရမှတ် {away_form_pts})"
         )
         st.markdown(
