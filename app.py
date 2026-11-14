@@ -26,7 +26,6 @@ odds_api_key = st.sidebar.text_input(
     "Odds-api.io API Key", type="password", placeholder="Odds API Key ထည့်ရန်"
 )
 
-# အမှန်ပြင်ဆင်ထားသော selectbox (အစက် (.) ဖယ်ရှားပြီး)
 selected_league_name = st.sidebar.selectbox(
     "လိဂ် ရွေးချယ်ရန်",
     [
@@ -154,68 +153,4 @@ def fetch_fixtures(league_code, api_key):
 
     url = f"https://api.football-data.org/v4/competitions/{league_code}/matches?status=SCHEDULED"
     headers = {"X-Auth-Token": api_key}
-    response = requests.get(url, headers=headers)
-
-    if response.status_code == 200:
-        data = response.json()
-        matches = data.get("matches", [])
-        now = datetime.utcnow()
-        seven_days_later = now + timedelta(days=7)
-        filtered_matches = []
-        for m in matches:
-            match_date = datetime.strptime(
-                m["utcDate"], "%Y-%m-%dT%H:%M:%SZ"
-            )
-            if now <= match_date <= seven_days_later:
-                filtered_matches.append(m)
-        return filtered_matches
-    else:
-        return []
-
-
-# --- MAIN UI DISPLAY ---
-st.subheader(f"📅 {selected_league_name} - လာမည့် ၇ ရက်အတွင်း ပွဲစဉ်ဇယားများ")
-
-matches = fetch_fixtures(current_league_code, fb_api_key)
-
-if not matches:
-    st.warning(
-        "⚠️ လက်တလော (၇) ရက်အတွင်း ကန်မည့် ပွဲစဉ်များ မရှိသေးပါ သို့မဟုတ် API Key မှားယွင်းနေပါသည်။"
-    )
-else:
-    st.success(f"ပွဲစဉ် စုစုပေါင်း ({len(matches)} ပွဲ) တွေ့ရှိရပါသည်။")
-
-    for i, match in enumerate(matches):
-        home_team = match["homeTeam"]["name"]
-        away_team = match["awayTeam"]["name"]
-        match_time = match["utcDate"]
-
-        with st.expander(
-            f"🏟️ {home_team} vs {away_team}  |  🕒 အချိန်: {match_time}"
-        ):
-            col1, col2 = st.columns(2)
-
-            with col1:
-                st.markdown("### 🌐 ကမ္ဘာ့ပေါက်ကြေးနှင့် အချက်အလက်များ")
-                global_odds_available = True
-
-                if not global_odds_available:
-                    st.error(
-                        "ℹ️ ကမ္ဘာ့ပေါက်ကြေးများ မထွက်သေးပါ (Odds not released yet)"
-                    )
-                    global_home_myanmar_str = "ကမ္ဘာ့ပေါက်ကြေးများ မထွက်သေးပါ"
-                else:
-                    simulated_hdp = -0.75
-                    simulated_dec_odds = 1.85
-                    global_home_myanmar_str = convert_to_myanmar_odds(
-                        home_team, simulated_hdp, simulated_dec_odds
-                    )
-                    st.info(
-                        f"**ကမ္ဘာ့ပေါက်ကြေး (Myanmar Format):** {global_home_myanmar_str}"
-                    )
-                    st.caption(
-                        "💡 (ပွဲမစမီ ၁ နာရီ သို့မဟုတ် Lineup ထွက်ပြီး ၁၅ မိနစ်အလို အချိန်နှင့်တပြေးညီ တိုက်ရိုက်ဆွဲယူသည်)"
-                    )
-
-                st.markdown("### 📝 ဒေသတွင်း/ကိုယ်ပိုင် ပွဲပေါက်ကြေး ထည့်သွင်းရန်")
-                local_odds
+    response = requests
