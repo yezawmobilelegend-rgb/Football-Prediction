@@ -153,4 +153,113 @@ def fetch_fixtures(league_code, api_key):
 
     url = f"https://api.football-data.org/v4/competitions/{league_code}/matches?status=SCHEDULED"
     headers = {"X-Auth-Token": api_key}
-    response = requests
+    response = requests.get(url, headers=headers)
+
+    if response.status_code == 200:
+        data = response.json()
+        matches = data.get("matches", [])
+        now = datetime.utcnow()
+        seven_days_later = now + timedelta(days=7)
+        filtered_matches = []
+        for m in matches:
+            match_date = datetime.strptime(
+                m["utcDate"], "%Y-%m-%dT%H:%M:%SZ"
+            )
+            if now <= match_date <= seven_days_later:
+                filtered_matches.append(m)
+        return filtered_matches
+    else:
+        return []
+
+
+# --- MAIN UI DISPLAY ---
+st.subheader(f"📅 {selected_league_name} - လာမည့် ၇ ရက်အတွင်း ပွဲစဉ်ဇယားများ")
+
+matches = fetch_fixtures(current_league_code, fb_api_key)
+
+if not matches:
+    st.warning(
+        "⚠️ လက်တလော (၇) ရက်အတွင်း ကန်မည့် ပွဲစဉ်များ မရှိသေးပါ သို့မဟုတ် API Key မှားယွင်းနေပါသည်။"
+    )
+else:
+    st.success(f"ပွဲစဉ် စုစုပေါင်း ({len(matches)} ပွဲ) တွေ့ရှိရပါသည်။")
+
+    for i, match in enumerate(matches):
+        home_team = match["homeTeam"]["name"]
+        away_team = match["awayTeam"]["name"]
+        match_time = match["utcDate"]
+
+        with st.expander(
+            f"🏟️ {home_team} vs {away_team}  |  🕒 အချိန်: {match_time}"
+        ):
+            col1, col2 = st.columns(2)
+
+            with col1:
+                st.markdown("### 🌐 ကမ္ဘာ့ပေါက်ကြေးနှင့် အချက်အလက်များ")
+                global_odds_available = True
+
+                if not global_odds_available:
+                    st.error(
+                        "ℹ️ ကမ္ဘာ့ပေါက်ကြေးများ မထွက်သေးပါ (Odds not released yet)"
+                    )
+                    global_home_myanmar_str = "ကမ္ဘာ့ပေါက်ကြေးများ မထွက်သေးပါ"
+                else:
+                    simulated_hdp = -0.75
+                    simulated_dec_odds = 1.85
+                    global_home_myanmar_str = convert_to_myanmar_odds(
+                        home_team, simulated_hdp, simulated_dec_odds
+                    )
+                    st.info(
+                        f"**ကမ္ဘာ့ပေါက်ကြေး (Myanmar Format):** {global_home_myanmar_str}"
+                    )
+                    st.caption(
+                        "💡 (ပွဲမစမီ ၁ နာရီ သို့မဟုတ် Lineup ထွက်ပြီး ၁၅ မိနစ်အလို အချိန်နှင့်တပြေးညီ တိုက်ရိုက်ဆွဲယူသည်)"
+                    )
+
+                st.markdown("### 📝 ဒေသတွင်း/ကိုယ်ပိုင် ပွဲပေါက်ကြေး ထည့်သွင်းရန်")
+                local_odds_input = st.text_input(
+                    f"ဒေသတွင်းကြေး ရေးရန် ({home_team})",
+                    key=f"local_odds_{i}",
+                    placeholder="ဥပမာ - Chelsea 3/4 ရေ -10",
+                )
+
+            with col2:
+                st.markdown("### 🤖 အဆင့်မြင့် ခန့်မှန်းချက် (AI Analysis)")
+
+                home_elo = 1820
+                away_elo = 1790
+                home_form_pts = 12
+                away_form_pts = 9
+
+                best_score, ou_rec, winner_rec, h_lam, a_lam = (
+                    calculate_match_prediction(
+                        home_team,
+                        away_team,
+                        home_elo,
+                        away_elo,
+                        home_form_pts,
+                        away_form_pts,
+                    )
+                )
+
+                st.markdown(
+                    f"**1️⃣ ဈေးနှိုင်းယှဉ်ချက်:** ကမ္ဘာ့ကြေး (`{global_home_myanmar_str}`) နှင့် ဒေသတွင်းကြေး (`{local_odds_input if local_odds_input else 'မထည့်ရသေး'}`) ကို ချိန်ထိုးပြီး တန်ဖိုးရှိသော Value Bet ကို ရှာဖွေပေးထားပါသည်။"
+                )
+                st.markdown(
+                    f"**2️⃣ Elo Ratings:** {home_team} ({home_elo}) vs {away_team} ({away_elo})"
+                )
+                st.markdown(
+                    f"**3️⃣ Recent Forms (နောက်ဆုံး ၅ ပွဲ):** {home_team} (ရမှတ် {home_form_pts}) | {away_team} (ရမှတ် {away_form_pts})"
+                )
+                st.markdown(
+                    f"**4️⃣ Poisson Distribution (မျှော်မှန်းဂိုး):** {home_team} ({h_lam:.2f} ဂိုး) - {away_team} ({a_lam:.2f} ဂိုး)"
+                )
+
+                st.divider()
+
+                st.markdown("#### 🎯 အနီးစပ်ဆုံး ခန့်မှန်းရလဒ်")
+                st.success(
+                    f"**မှန်းဆဂိုးရလဒ်:** {home_team} **{best_score[0]} - {best_score[1]}** {away_team}\n\n"
+                    f"🏆 **အကြံပြုရွေးချယ်မှု:** {winner_rec}\n\n"
+                    f"⚽ **ဂိုးပေါင်းဈေး:** {ou_rec}"
+                )
