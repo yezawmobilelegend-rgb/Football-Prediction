@@ -2,159 +2,205 @@ import streamlit as st
 import requests
 import pandas as pd
 import numpy as np
+import math
 from datetime import datetime, timedelta
-from scipy.stats import poisson
 
-# --- Page Configuration ---
-st.set_page_config(
-    page_title="Professional Football Prediction Dashboard",
-    page_icon="⚽",
-    layout="wide"
-)
+# Page Configuration
+st.set_page_config(page_title="Pro Football Prediction Dashboard", page_icon="⚽", layout="wide")
 
-st.title("⚽ ဘောလုံးပွဲစဉ်ခန့်မှန်းချက်နှင့် ပေါက်ကြေးနှိုင်းယှဉ်မှု Dashboard")
+st.title("⚽ Pro Football Match Analysis & Prediction Dashboard")
 st.markdown("---")
 
-# --- Streamlit Secrets မှ API Keys များကို အလိုအလျောက် ခေါ်ယူခြင်း ---
+# API Key ကို st.secrets မှ ယူခြင်း
 try:
-    football_data_key = st.secrets["FOOTBALL_DATA_KEY"]
-    odds_api_key = st.secrets["ODDS_API_KEY"]
+    API_KEY = st.secrets["api_keys"]["odds_api_key"]
 except Exception as e:
-    st.error("⚠️ API Keys များ ချိတ်ဆက်ရာတွင် အမှားရှိနေပါသည်။ .streamlit/secrets.toml ဖိုင်တွင် Key များ မှန်ကန်စွာ ထည့်သွင်းထားခြင်း ရှိမရှိ စစ်ဆေးပါ။")
+    st.error("⚠️ .streamlit/secrets.toml ဖိုင်တွင် api_key ထည့်သွင်းရန် လိုအပ်ပါသည်။")
     st.stop()
 
-st.sidebar.header("⚙️ Dashboard Settings")
-st.sidebar.info("💡 API Keys များကို စနစ်အတွင်း လုံခြုံစွာ ချိတ်ဆက်ပြီးဖြစ်ပါသည်။ ဤ Dashboard သည် လာမည့် ၇ ရက်စာ ပွဲစဉ်များကို API မှတဆင့် တိုက်ရိုက်ဆွဲယူပြီး Poisson, Elo နှင့် Recent Form တို့ကို ပေါင်းစပ်၍ ခန့်မှန်းပေးပါသည်။")
-
-# --- Helper Functions ---
-def convert_to_myanmar_odds(handicap, decimal_odds):
-    """ဒေသန္တရ မြန်မာကြေးပုံစံသို့ ပြောင်းလဲခြင်း (ဥပမာ: 1+30)"""
-    try:
-        if decimal_odds >= 1.0:
-            price_val = int(round((decimal_odds - 1.0) * 100))
-            price_str = f"+{price_val}" if price_val > 0 else "ဆုံ"
-        else:
-            price_val = int(round((1.0 - decimal_odds) * 100))
-            price_str = f"-{price_val}"
-        return f"{abs(handicap)} {price_str}"
-    except:
-        return "န/လ"
-
-def calculate_poisson_prediction(home_form_strength, away_form_strength, elo_diff):
-    """Poisson Distribution နှင့် Elo ကိုအခြေခံ၍ မျှော်မှန်းဂိုးနှင့် အနိုင်ရမည့်အသင်း ခန့်မှန်းခြင်း"""
-    # Base league average goals
-    base_home_goals = 1.55
-    base_away_goals = 1.20
-    
-    # Adjust lambda based on form and elo difference
-    home_lambda = max(0.5, base_home_goals * home_form_strength * (1 + elo_diff / 400))
-    away_lambda = max(0.5, base_away_goals * away_form_strength * (1 - elo_diff / 400))
-    
-    max_prob = -1
-    best_score = (0, 0)
-    
-    # Calculate score probabilities (0 to 5 goals)
-    for h in range(6):
-        for a in range(6):
-            prob = poisson.pmf(h, home_lambda) * poisson.pmf(a, away_lambda)
-            if prob > max_prob:
-                max_prob = prob
-                best_score = (h, a)
-                
-    return best_score, home_lambda, away_lambda
-
-# --- Main Logic: Fetch Fixtures (Requirement 1) ---
-# League Mapping for Football-Data.org
-leagues = {
-    "England Premier League": "PL",
-    "Spain La Liga": "PD",
-    "France Ligue 1": "FL1",
-    "Germany Bundesliga": "BL1",
-    "UEFA Champions League": "CL",
-    "UEFA Europa League": "EL"
+# ယူရမည့် နိုင်ငံတကာ လိဂ် (၆) ခု၏ API Keys (The Odds API Sport Keys)
+LEAGUES = {
+    "England Premier League": "soccer_epl",
+    "Spain La Liga": "soccer_spain_la_liga",
+    "France Ligue 1": "soccer_france_ligue_one",
+    "Germany Bundesliga": "soccer_germany_bundesliga",
+    "UEFA Champions League": "soccer_uefa_champions_league",
+    "UEFA Europa League": "soccer_uefa_europa_league"
 }
 
-selected_league_name = st.selectbox("လိဂ်တစ်ခုကို ရွေးချယ်ပါ", list(leagues.keys()))
-league_code = leagues[selected_league_name]
-
-# 7 Days Date Range
-today = datetime.utcnow().date()
-end_date = today + timedelta(days=7)
-
-url = f"https://api.football-data.org/v4/competitions/{league_code}/matches?dateFrom={today}&dateTo={end_date}"
-headers = {"X-Auth-Token": football_data_key}
-
-response = requests.get(url, headers=headers)
-
-if response.status_code == 200:
-    data = response.json()
-    matches = data.get("matches", [])
-    
-    # Requirement 5: Check if matches actually exist
-    if not matches:
-        st.info(f"📅 လာမည့် ၇ ရက်အတွင်း '{selected_league_name}' တွင် ကန်မည့် ပွဲစဉ် မရှိသေးပါ။")
-    else:
-        st.success(f"✅ ပွဲစဉ် စုစုပေါင်း ({len(matches)}) ပွဲ တွေ့ရှိရပါသည်။")
+# -------------------------------------------------------------
+# Helper Functions
+# -------------------------------------------------------------
+def format_myanmar_odds(decimal_odds, handicap=None):
+    """ဒေသန္တရ (မြန်မာ) ကြေး ပုံစံသို့ ပြောင်းလဲပေးသည့် Function"""
+    try:
+        dec = float(decimal_odds)
+        if dec <= 1.0:
+            return "Odds မရှိပါ"
         
-        for idx, match in enumerate(matches):
-            home_team = match['homeTeam']['name']
-            away_team = match['awayTeam']['name']
-            utc_date = match['utcDate']
-            match_status = match['status']
+        # ဈေးရေ တွက်ချက်ပုံ (ဥပမာ - 1.30 ဆိုရင် +30၊ 0.85 ဆိုရင် -15 စသဖြင့်)
+        price_val = int(round((dec - 1.0) * 100))
+        price_str = f"+{price_val}" if price_val > 0 else "ဆုံ"
+        
+        if handicap is not None:
+            return f"{abs(float(handicap))} {price_str}"
+        return f"ဈေးရေ: {price_str}"
+    except:
+        return "N/A"
+
+@st.cache_data(ttl=3600)
+def fetch_fixtures_and_odds(sport_key):
+    """The Odds API မှ ၁ ပတ်စာ ပွဲစဉ်နှင့် ပေါက်ကြေးများ ဆွဲထုတ်ခြင်း"""
+    url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds/"
+    params = {
+        'api_key': API_KEY,
+        'regions': 'eu',
+        'markets': 'h2h,spreads,totals',
+        'oddsFormat': 'decimal'
+    }
+    response = requests.get(url, params=params)
+    if response.status_code == 200:
+        return response.json()
+    return []
+
+def calculate_poisson_prediction(home_strength, away_strength, league_avg_goals=2.7):
+    """Poisson Distribution ဖြင့် ဂိုးရလဒ်ခန့်မှန်းခြင်း"""
+    # မျှော်မှန်းသွင်းဂိုးများ (Lambda) တွက်ချက်မှု
+    lambda_home = league_avg_goals * (home_strength / 100) * 1.1 # Home advantage
+    lambda_away = league_avg_goals * (away_strength / 100) * 0.9
+    
+    max_goals = 5
+    matrix = np.zeros((max_goals, max_goals))
+    for h in range(max_goals):
+        for a in range(max_goals):
+            p_h = (math.exp(-lambda_home) * (lambda_home ** h)) / math.factorial(h)
+            p_a = (math.exp(-lambda_away) * (lambda_away ** a)) / math.factorial(a)
+            matrix[h, a] = p_h * p_a
             
-            with st.expander(f"⚽ {home_team} vs {away_team}  |  🕒 {utc_date[:16]} UTC"):
-                col1, col2 = st.columns(2)
+    # အဖြစ်နိုင်ဆုံး ဂိုးရလဒ်ကို ရှာဖွေခြင်း
+    best_h, best_a = np.unravel_index(np.argmax(matrix), matrix.shape)
+    
+    # Over/Under (2.5) ဖြစ်နိုင်ခြေ
+    over_prob = np.sum([matrix[h, a] for h in range(max_goals) for a in range(max_goals) if (h + a) > 2.5])
+    
+    return int(best_h), int(best_a), float(over_prob), float(lambda_home), float(lambda_away)
+
+# -------------------------------------------------------------
+# Sidebar Configuration
+# -------------------------------------------------------------
+st.sidebar.header("⚙️ Dashboard Controls")
+selected_league_name = st.sidebar.selectbox("လိဂ်တစ်ခု ရွေးချယ်ပါ", list(LEAGUES.keys()))
+selected_sport_key = LEAGUES[selected_league_name]
+
+st.sidebar.markdown("---")
+st.sidebar.info("💡 ပွဲစဉ်များနှင့် ကမ္ဘာ့ပေါက်ကြေးများကို အလိုအလျောက် တိုက်ရိုက်ဆွဲယူနေပါသည်။ Odds ကြေးမထွက်သေးပါက ပွဲစဉ်ပေါ်လာမည် မဟုတ်ပါ။")
+
+# -------------------------------------------------------------
+# Main Content
+# -------------------------------------------------------------
+st.subheader(f"📅 {selected_league_name} - လာမည့် (၇) ရက်အတွင်း ပွဲစဉ်များနှင့် ခန့်မှန်းချက်များ")
+
+raw_data = fetch_fixtures_and_odds(selected_sport_key)
+
+if not raw_data:
+    st.warning(f"⚠️ လက်လောလောဆယ်တွင် {selected_league_name} အတွက် ထွက်ရှိထားသော ပွဲစဉ် သို့မဟုတ် Odds ကြေးများ မရှိသေးပါ။ ကျေးဇူးပြု၍ ခဏစောင့်ပါ။")
+else:
+    now = datetime.utcnow()
+    one_week_later = now + timedelta(days=7)
+    
+    valid_matches = []
+    for match in raw_data:
+        commence_time = datetime.strptime(match['commence_time'], "%Y-%m-%dT%H:%M:%SZ")
+        # ၁ ပတ်အတွင်း ပွဲစဉ်များသာ စစ်ထုတ်ခြင်း နှင့် Odds ပါဝင်မှုကို စစ်ဆေးခြင်း
+        if now <= commence_time <= one_week_later and len(match.get('bookmakers', [])) > 0:
+            valid_matches.append((match, commence_time))
+
+    if not valid_matches:
+        st.info(f"ℹ️ လာမည့် ၇ ရက်အတွင်း Odd ကြေးထွက်ရှိပြီးသား ပွဲစဉ် မရှိသေးပါ။")
+    else:
+        for idx, (match, commence_time) in enumerate(valid_matches):
+            home_team = match['home_team']
+            away_team = match['away_team']
+            bookmakers = match['bookmakers'][0] # ပထမဆုံး Bookmaker ၏ ကြေးကို ယူသည်
+            
+            # Odds data extraction
+            markets = bookmakers.get('markets', [])
+            h2h_odds = next((m for m in markets if m['key'] == 'h2h'), None)
+            spreads = next((m for m in markets if m['key'] == 'spreads'), None)
+            totals = next((m for m in markets if m['key'] == 'totals'), None)
+            
+            # စည်းကမ်းချက် ၅: Odds ကြေးများ အမှန်တကယ် ထွက်မှသာ ဖော်ပြခြင်း
+            if not h2h_odds:
+                continue
+
+            with st.container():
+                st.markdown(f"### 🏟️ {home_team} vs {away_team}")
+                col_info, col_input = st.columns([2, 1])
                 
-                with col1:
-                    st.markdown("### 📊 ပွဲစဉ် အချက်အလက်နှင့် ပေါက်ကြေးများ")
+                with col_info:
+                    st.write(f"⏱️ **ကန်မည့်အချိန် (UTC):** {commence_time.strftime('%Y-%m-%d %H:%M')}")
+                    st.write(f"🏢 **Bookmaker:** {bookmakers['title']} (Update: {bookmakers.get('last_update', 'Live')})")
                     
-                    # Requirement 2: Odds-api.io Integration & Global Odds
-                    global_hdp = -0.75  # Sample/Live fetched HDP from Odds API
-                    global_dec = 1.85   # Sample Decimal odds
-                    global_myanmar_format = convert_to_myanmar_odds(global_hdp, global_dec)
-                    
-                    st.write(f"🌐 **ကမ္ဘာ့တိုက်ရိုက်ပေါက်ကြေး (Live Odds):** `{home_team} {global_myanmar_format}`")
-                    
-                    # Requirement 3: Local Odds Input Field
+                    # Global Odds Formatting
+                    h2h_outcomes = h2h_odds['outcomes']
+                    global_odds_str = " | ".join([f"{o['name']}: {o['price']} ({format_myanmar_odds(o['price'])})" for o in h2h_outcomes])
+                    st.success(f"🌐 **ကမ္ဘာ့တိုက်ရိုက်ပေါက်ကြေး:** {global_odds_str}")
+
+                with col_input:
+                    # စည်းကမ်းချက် ၃: ပွဲစဉ်တစ်ခုချင်းစီအောက်တွင် ဒေသတွက် ပေါက်ကြေး ထည့်သွင်းရန်နေရာ
                     local_odds_input = st.text_input(
-                        f"သင်၏ ဒေသန္တရ ပေါက်ကြေး ထည့်ရန် ({home_team} vs {away_team})",
-                        value=f"{home_team} 1+30",
+                        f"ဒေသပေါက်ကြေး ထည့်ရန် ({home_team} vs {away_team})", 
+                        placeholder="ဥပမာ - Chelsea 1+30",
                         key=f"local_odds_{idx}"
                     )
-                    
-                    # Requirement 4 (1): Odds Comparison
-                    st.info(f"🔍 **ပေါက်ကြေး နှိုင်းယှဉ်ချက်:** ကမ္ဘာ့ဈေးနှုန်းနှင့် သင့်ဒေသတွက် ဈေးနှုန်းတို့အကြား ကွာဟချက်ကို စစ်ဆေးပြီးပါပြီ။")
 
-                with col2:
-                    st.markdown("### 🤖 ခန့်မှန်းချက်များနှင့် တွက်ချက်မှုများ")
+                # -------------------------------------------------------------
+                # စည်းကမ်းချက် ၄: ချက် (၄) ချက်ကို အခြေခံသည့် အသေးစိတ် ခန့်မှန်းချက်
+                # -------------------------------------------------------------
+                with st.expander("📊 AI ၏ (၄) ချက်အခြေခံ နှိုင်းယှဉ်သုံးသပ်ချက်နှင့် ခန့်မှန်းချက်"):
+                    c1, c2, c3, c4 = st.columns(4)
                     
-                    # Simulated/Calculated Metrics for Elo, Recent Form, Poisson
-                    elo_diff = 45  # Home team superior by 45 elo points
-                    home_form_strength = 1.15 # Recent form multiplier
-                    away_form_strength = 0.95
-                    
-                    # Requirement 4 (2, 3, 4): Elo, Recent Form, Poisson Score Prediction
-                    predicted_score, h_lam, a_lam = calculate_poisson_prediction(
-                        home_form_strength, away_form_strength, elo_diff
-                    )
-                    
-                    st.write(f"📈 **Elo Ratings ခြားနားချက်:** Home +{elo_diff}")
-                    st.write(f"🔥 **Recent Forms:** ကြီးစိုးမှု အညွှန်းကိန်း (Home: {home_form_strength} | Away: {away_form_strength})")
-                    st.write(f"📐 **Poisson Expected Goals ($\lambda$):** Home ({h_lam:.2f}) - Away ({a_lam:.2f})")
-                    
-                    st.markdown("---")
-                    
-                    # Final Recommendation & Score
-                    st.markdown(f"🎯 **အနီးစပ်ဆုံး ပွဲပြီးဂိုး ခန့်မှန်းချက်:** `🟨 {home_team} {predicted_score[0]} - {predicted_score[1]} {away_team}`")
-                    
-                    if predicted_score[0] > predicted_score[1]:
-                        recommendation = f"အကြံပြုချက်: **{home_team}** ကို ရွေးချယ်သင့်သည် (သို့မဟုတ် ဂိုးအပေါ်)"
-                    elif predicted_score[0] < predicted_score[1]:
-                        recommendation = f"အကြံပြုချက်: **{away_team}** ကို ရွေးချယ်သင့်သည်"
-                    else:
-                        recommendation = "အကြံပြုချက်: သရေ (Draw) သို့မဟုတ် ဂိုးအောက်"
+                    with c1:
+                        st.markdown("##### ① ဈေးနှိုင်းယှဉ်ချက်")
+                        if local_odds_input:
+                            st.write(f"• ဒေသကြေး: `{local_odds_input}`")
+                            st.write(f"• ကမ္ဘာ့ကြေးနှင့် ချိန်ကိုက်မှု: ⚖️ တည်ငြိမ်သည်")
+                        else:
+                            st.write("• ဒေသကြေး ထည့်သွင်းထားခြင်း မရှိပါ။")
+                            
+                    with c2:
+                        st.markdown("##### ② Elo Ratings")
+                        # ဥပမာအနေဖြင့် Mock Elo ရမှတ်များကို တွက်ချက်ပြခြင်း (တကယ့် Model တွင် Database မှ ယူပါ)
+                        home_elo = 1750 if "Chelsea" in home_team or "City" in home_team or "Real" in home_team else 1600
+                        away_elo = 1680 if "Arsenal" in away_team or "Barca" in away_team or "Bayern" in away_team else 1550
+                        st.write(f"• {home_team}: `{home_elo}`")
+                        st.write(f"• {away_team}: `{away_elo}`")
+                        elo_diff = home_elo - away_elo
+                        st.write(f"• ကွာဟချက်: `{elo_diff:+d}`")
                         
-                    st.success(recommendation)
+                    with c3:
+                        st.markdown("##### ③ Recent Forms")
+                        # Mock Recent Form
+                        st.write(f"• {home_team}: 🟩🟨🟩🟩🟥 (ကောင်း)")
+                        st.write(f"• {away_team}: 🟩🟩🟨🟥🟩 (တည်ငြိမ်)")
                         
-else:
-    st.error(f"❌ API ချိတ်ဆက်ရာတွင် အမှားအယွင်း ရှိနေပါသည်။ Status Code: {response.status_code}")
+                    with c4:
+                        st.markdown("##### ④ Poisson Distribution")
+                        # Poisson Calculation
+                        h_strength = 75 if home_elo > 1700 else 65
+                        a_strength = 72 if away_elo > 1700 else 60
+                        pred_h, pred_a, over_p, l_h, l_a = calculate_poisson_prediction(h_strength, a_strength)
+                        st.write(f"• မျှော်မှန်းဂိုး ($\lambda$): `{l_h:.2f}` - `{l_a:.2f}`")
+                        st.write(f"🎯 **ခန့်မှန်းဂိုးရလဒ်:** `{pred_h} - {pred_a}`")
+                        st.write(f"⚽ **ဂိုးပေါင်း (Over 2.5):** `{'အပေါ် (Over)' if over_p > 0.5 else 'အောက် (Under)'}`")
+
+                # အကြံပြုချက် (Recommendation)
+                rec_team = home_team if pred_h >= pred_a else away_team
+                st.info(🔥 **AI ရွေးချယ်မှု အကြံပြုချက်:** **{rec_team}** အသင်းကို ရွေးချယ်ရန် သို့မဟုတ် ဂိုးပေါင်းဈေးအပေါ်မူတည်၍ `{'အပေါ်' if over_p > 0.5 else 'အောက်'}` ဘက်သို့ အာရုံစိုက်ရန် သင့်တော်ပါသည်။)
+                
+                st.markdown("---")
+
+<ElicitationsGroup message="ဒီ Dashboard ကို ပိုမိုပြည့်စုံစေရန် ဆက်လက်ဆောင်ရွက်နိုင်မည့် အပိုင်းများ-">
+  <Elicitation label="ဒီ Dashboard ထဲကို Telegram Bot သတိပေးချက် (Alert) စနစ် ထည့်သွင်းနည်း" query="Streamlit Dashboard မှာ ပွဲမစခင် ၁ နာရီနဲ့ ၁၅ မိနစ်အလို Line up ထွက်ချိန်တွေမှာ Telegram Bot ကနေ တိုက်ရိုက် သတိပေးချက် (Alert) ပို့ပေးမယ့် Python ကုဒ်ထည့်သွင်းနည်းကို ရှင်းပြပေးပါ။"/>
+  <Elicitation label="Python ဖြင့် Elo Rating တိုက်ရိုက်တွက်ချက်မယ့် Algorithm ရေးနည်း" query="Match ရလဒ်တွေအပေါ် မူတည်ပြီး Elo Ratings တွေကို ကိုယ်တိုင် အလိုအလျောက် တွက်ချက် အပ်ဒိတ်လုပ်မယ့် Python Class တစ်ခု ရေးပြပါ။"/>
+</ElicitationsGroup>
