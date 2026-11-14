@@ -6,19 +6,21 @@ import requests
 import numpy as np
 import pandas as pd
 import streamlit as st
+from zoneinfo import ZoneInfo  # Python 3.9+ တွင် အသုံးပြုနိုင်သည်
 
 # =========================================================
 # CONFIGURATION
 # =========================================================
 
 st.set_page_config(
-    page_title="Professional Football Predictor V2.1",
+    page_title="Professional Football Predictor V2.2",
     page_icon="⚽",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
 DB_PATH = "football_history.db"
+LOCAL_TZ = ZoneInfo("Asia/Yangon")  # မြန်မာစံတော်ချိန်အတွက်
 
 LEAGUES = {
     "English Premier League (PL)": "PL",
@@ -351,6 +353,9 @@ def extract_match_odds(home, away, odds_data):
         "under_price": None,
     }
 
+    if not odds_data:
+        return result
+
     for event in odds_data:
         if not (
             team_match(home, event.get("home_team", ""))
@@ -513,7 +518,7 @@ def get_team_data(team, standings, form):
 
 
 # =========================================================
-# POISSON MODEL & SENSITIVITY FIX (Point 1)
+# POISSON MODEL & SENSITIVITY FIX
 # =========================================================
 
 def poisson_pmf(lam, k):
@@ -525,13 +530,12 @@ def poisson_pmf(lam, k):
 
 
 def calculate_lambdas(home_data, away_data):
-    # အသင်းကောင်းများအတွက် မျှော်မှန်းဂိုး ပိုမိုထွက်ပေါ်လာစေရန် Sensitivity မြှင့်တင်ထားခြင်း
     base_home = 1.65
     base_away = 1.15
 
     elo_diff = (
         home_data["elo"] - away_data["elo"]
-    ) / 200  # ပိုမို ထိရောက်သော အကွာအဝေး
+    ) / 200
 
     form_diff = (
         home_data["recent_points"]
@@ -661,10 +665,10 @@ def calculate_probabilities(matrix):
 
 
 # =========================================================
-# PREDICTION ENGINE WITH MONTE CARLO SAMPLING (Point 2)
+# PREDICTION ENGINE WITH STABLE MONTE CARLO SAMPLING
 # =========================================================
 
-def predict_match(home_data, away_data):
+def predict_match(home_data, away_data, match_id):
     home_lambda, away_lambda = calculate_lambdas(
         home_data,
         away_data,
@@ -676,13 +680,14 @@ def predict_match(home_data, away_data):
         max_goals=6,
     )
 
-    # 1-0 ကြီးချည်း အမြဲမပြတော့ဘဲ ရာခိုင်နှုန်း Matrix အပေါ်မူတည်၍
-    # Random Sampling (Monte Carlo) ဖြင့် လက်တွေ့ဆန်သော ရလဒ်တစ်ခုကို ထုတ်ယူခြင်း
     flat_matrix = matrix.flatten()
-    flat_matrix /= flat_matrix.sum()  # Probabilities normalize လုပ်ခြင်း
+    flat_matrix /= flat_matrix.sum()
 
-    # အဖြစ်နိုင်ဆုံး ရလဒ်များထဲမှ ရာခိုင်နှုန်းအလေးချိန်အလိုက် ရွေးချယ်ရန်
-    chosen_index = np.random.choice(
+    # Match ID ကို Hash သို့မဟုတ် Int ပြောင်း၍ Seed အဖြစ်သုံးခြင်းဖြင့် Rerun တိုင်း ရလဒ်မပြောင်းလဲစေရန် တည်ငြိမ်စေခြင်း
+    seed_val = abs(hash(str(match_id))) % (2**32)
+    rng = np.random.default_rng(seed_val)
+
+    chosen_index = rng.choice(
         len(flat_matrix),
         p=flat_matrix,
     )
@@ -691,7 +696,6 @@ def predict_match(home_data, away_data):
         matrix.shape,
     )
 
-    # အမြင့်ဆုံး ရလဒ် (Argmax) ကိုပါ အချက်အလက်အတွက် သိမ်းဆည်းထားမည်
     best_score = np.unravel_index(
         np.argmax(matrix),
         matrix.shape,
@@ -703,8 +707,8 @@ def predict_match(home_data, away_data):
         "home_lambda": home_lambda,
         "away_lambda": away_lambda,
         "matrix": matrix,
-        "best_score": sampled_score,  # Monte Carlo ဖြင့် ရွေးချယ်ထားသော Score
-        "argmax_score": best_score,   # သန့်စင်သော Max Score
+        "best_score": sampled_score,
+        "argmax_score": best_score,
         "best_probability": matrix[sampled_score],
         "probabilities": probs,
     }
@@ -714,7 +718,7 @@ def predict_match(home_data, away_data):
 # LOAD DATA
 # =========================================================
 
-st.title("⚽ Professional Football Predictor V2.1")
+st.title("⚽ Professional Football Predictor V2.2")
 
 fixtures = fetch_fixtures(
     league_code,
@@ -762,9 +766,13 @@ for index, match in enumerate(fixtures):
     home = match["homeTeam"]["name"]
     away = match["awayTeam"]["name"]
     match_id = match["id"]
-    match_date = match["utcDate"]
+    
+    # UTC အချိန်မှ မြန်မာစံတော်ချိန် (MMT) သို့ ပြောင်းလဲခြင်း
+    utc_dt = datetime.strptime(match["utcDate"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    local_dt = utc_dt.astimezone(LOCAL_TZ)
+    match_date_str = local_dt.strftime("%Y-%m-%d %H:%M MMT")
 
-    with st.expander(f"🏟️ {home} vs {away} | {match_date}"):
+    with st.expander(f"🏟️ {home} vs {away} | 🕒 {match_date_str}"):
         left, right = st.columns([1, 1.3])
 
         # =================================================
@@ -848,9 +856,11 @@ for index, match in enumerate(fixtures):
                 recent_form,
             )
 
+            # Match ID ထည့်သွင်းပေးခြင်းဖြင့် ရလဒ် တည်ငြိမ်စေသည်
             prediction = predict_match(
                 hd,
                 ad,
+                match_id,
             )
 
             hl = prediction["home_lambda"]
@@ -888,10 +898,6 @@ for index, match in enumerate(fixtures):
                 f"{score_prob * 100:.2f}%"
             )
 
-            # =============================================
-            # O/U SCORE-BASED INDICATOR
-            # =============================================
-
             predicted_total = score[0] + score[1]
 
             st.write(
@@ -902,10 +908,6 @@ for index, match in enumerate(fixtures):
                 st.success("Score-based: Over 2.5")
             else:
                 st.info("Score-based: Under 2.5")
-
-            # =============================================
-            # O/U PROBABILITY
-            # =============================================
 
             st.divider()
             st.markdown("### 📊 Over / Under Probability")
@@ -935,26 +937,14 @@ for index, match in enumerate(fixtures):
                 use_container_width=True,
             )
 
-            # =============================================
-            # BTTS
-            # =============================================
-
             st.markdown("### ⚽ Both Teams To Score")
             st.write(f"BTTS Yes: {probs['btts_yes'] * 100:.2f}%")
             st.write(f"BTTS No: {probs['btts_no'] * 100:.2f}%")
-
-            # =============================================
-            # 1X2 PROBABILITY
-            # =============================================
 
             st.markdown("### 🏆 1X2 Probability")
             st.write(f"Home Win: {probs['home_win'] * 100:.2f}%")
             st.write(f"Draw: {probs['draw'] * 100:.2f}%")
             st.write(f"Away Win: {probs['away_win'] * 100:.2f}%")
-
-            # =============================================
-            # SCORE MATRIX
-            # =============================================
 
             st.divider()
             st.markdown("### 🔢 Score Probability Matrix")
@@ -978,10 +968,6 @@ for index, match in enumerate(fixtures):
                 use_container_width=True,
             )
 
-            # =============================================
-            # LOCAL O/U COMPARISON
-            # =============================================
-
             if local_ou:
                 numbers = re.findall(r"\d+\.?\d*", local_ou)
                 if numbers:
@@ -993,14 +979,10 @@ for index, match in enumerate(fixtures):
                     else:
                         st.info("Score နှင့် O/U Line တူညီနေသည်")
 
-            # =============================================
-            # SAVE HISTORY
-            # =============================================
-
             save_prediction(
                 match_id,
                 league_code,
-                match_date,
+                match_date_str,
                 home,
                 away,
                 score,
@@ -1063,6 +1045,6 @@ else:
 # =========================================================
 
 st.divider()
-st.caption("Professional Football Predictor Dashboard V2.1")
-st.caption("Football-data.org | Odds API | Poisson | SQLite | Monte Carlo")
+st.caption("Professional Football Predictor Dashboard V2.2")
+st.caption("Football-data.org | Odds API | Poisson | SQLite | Stable Monte Carlo")
 st.caption("Predictions are statistical estimates, not guaranteed match outcomes.")
