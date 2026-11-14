@@ -2,62 +2,26 @@
 from datetime import datetime, timedelta, timezone
 import math
 import re
+import sqlite3
 import requests
+import numpy as np
+import pandas as pd
 import streamlit as st
 
-# ============================================================
-# STREAMLIT PAGE CONFIGURATION
-# ============================================================
+# =========================================================
+# CONFIGURATION
+# =========================================================
 
 st.set_page_config(
-    page_title="Professional Football Match Predictor",
+    page_title="Professional Football Predictor V2",
+    page_icon="⚽",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-st.title("⚽ ဘောလုံးပွဲစဉ်နှင့် ကြေးနှိုင်းယှဉ် ခန့်မှန်းချက် Dashboard")
+DB_PATH = "football_history.db"
 
-st.markdown(
-    """
-    အဓိကလိဂ် (၆) ခု၏ ပွဲစဉ်များ၊ Live Odds API၊
-    အသင်း Form၊ Elo Rating နှင့် Poisson Score Prediction
-    """
-)
-
-# ============================================================
-# API CONFIGURATION
-# ============================================================
-
-st.sidebar.header("🔑 API & Settings")
-
-default_fb_key = st.secrets.get("FOOTBALL_API_KEY", "")
-default_odds_key = st.secrets.get("ODDS_API_KEY", "")
-
-fb_api_key = st.sidebar.text_input(
-    "Football-data.org API Key",
-    value=default_fb_key,
-    type="password",
-)
-
-odds_api_key = st.sidebar.text_input(
-    "Odds-api.io API Key",
-    value=default_odds_key,
-    type="password",
-)
-
-selected_league_name = st.sidebar.selectbox(
-    "လိဂ် ရွေးချယ်ရန်",
-    [
-        "English Premier League (PL)",
-        "Spanish La Liga (PD)",
-        "German Bundesliga (BL1)",
-        "French Ligue 1 (FL1)",
-        "UEFA Champions League (CL)",
-        "UEFA Europa League (EL)",
-    ],
-)
-
-LEAGUE_CODES = {
+LEAGUES = {
     "English Premier League (PL)": "PL",
     "Spanish La Liga (PD)": "PD",
     "German Bundesliga (BL1)": "BL1",
@@ -66,116 +30,89 @@ LEAGUE_CODES = {
     "UEFA Europa League (EL)": "EL",
 }
 
-current_league_code = LEAGUE_CODES[selected_league_name]
+# =========================================================
+# DATABASE
+# =========================================================
+
+def db_connection():
+    return sqlite3.connect(DB_PATH)
 
 
-# ============================================================
-# TIME HELPERS
-# ============================================================
+def initialize_database():
 
-def utc_now():
-    return datetime.now(timezone.utc)
+    with db_connection() as conn:
 
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS predictions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                match_id TEXT UNIQUE,
+                league TEXT,
+                match_date TEXT,
+                home_team TEXT,
+                away_team TEXT,
+                predicted_home INTEGER,
+                predicted_away INTEGER,
+                home_lambda REAL,
+                away_lambda REAL,
+                actual_home INTEGER,
+                actual_away INTEGER,
+                prediction_correct INTEGER,
+                created_at TEXT
+            )
+        """)
 
-def format_match_time(utc_date):
-    try:
-        dt = datetime.strptime(
-            utc_date,
-            "%Y-%m-%dT%H:%M:%SZ",
-        ).replace(tzinfo=timezone.utc)
-
-        # Myanmar Time UTC+6:30
-        myanmar_time = dt + timedelta(hours=6, minutes=30)
-
-        return myanmar_time.strftime("%Y-%m-%d %H:%M")
-
-    except Exception:
-        return utc_date
-
-
-# ============================================================
-# FOOTBALL DATA API
-# ============================================================
-
-@st.cache_data(ttl=3600)
-def fetch_team_standings(league_code, api_key):
-
-    if not api_key:
-        return {}
-
-    url = (
-        f"https://api.football-data.org/v4/"
-        f"competitions/{league_code}/standings"
-    )
-
-    headers = {"X-Auth-Token": api_key}
-
-    team_stats_map = {}
-
-    try:
-        response = requests.get(
-            url,
-            headers=headers,
-            timeout=15,
-        )
-
-        if response.status_code == 200:
-
-            data = response.json()
-
-            for table in data.get("standings", []):
-
-                if table.get("type") == "TOTAL":
-
-                    for row in table.get("table", []):
-
-                        team_name = row["team"]["name"]
-
-                        points = row.get("points", 0)
-                        goal_diff = row.get("goalDifference", 0)
-
-                        elo = (
-                            1500
-                            + (points * 15)
-                            + (goal_diff * 5)
-                        )
-
-                        team_stats_map[team_name] = {
-                            "elo": elo,
-                            "form_pts": points,
-                        }
-
-        else:
-            print("Standings API:", response.status_code)
-
-    except requests.RequestException as e:
-        print("Standings Error:", e)
-
-    return team_stats_map
+        conn.commit()
 
 
-def get_team_stats(team_name, standings_map):
+def save_prediction(
+    match_id,
+    league,
+    match_date,
+    home_team,
+    away_team,
+    score,
+    home_lambda,
+    away_lambda,
+):
 
-    if team_name in standings_map:
+    with db_connection() as conn:
 
-        return (
-            standings_map[team_name]["elo"],
-            standings_map[team_name]["form_pts"],
-        )
+        conn.execute("""
+            INSERT INTO predictions (
+                match_id,
+                league,
+                match_date,
+                home_team,
+                away_team,
+                predicted_home,
+                predicted_away,
+                home_lambda,
+                away_lambda,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 
-    # Standings မရရှိသောအသင်း
-    return 1500, 0
+            ON CONFLICT(match_id) DO NOTHING
+        """, (
+            str(match_id),
+            league,
+            match_date,
+            home_team,
+            away_team,
+            score[0],
+            score[1],
+            home_lambda,
+            away_lambda,
+            datetime.now().isoformat(),
+        ))
+
+        conn.commit()
 
 
-# ============================================================
-# FETCH FIXTURES
-# ============================================================
-
-@st.cache_data(ttl=900)
-def fetch_fixtures(league_code, api_key):
+def update_actual_results(league_code, api_key):
 
     if not api_key:
-        return []
+        return
 
     url = (
         f"https://api.football-data.org/v4/"
@@ -184,9 +121,118 @@ def fetch_fixtures(league_code, api_key):
 
     headers = {"X-Auth-Token": api_key}
 
-    params = {
-        "status": "SCHEDULED",
-    }
+    try:
+
+        response = requests.get(
+            url,
+            headers=headers,
+            params={"status": "FINISHED"},
+            timeout=20,
+        )
+
+        if response.status_code != 200:
+            return
+
+        matches = response.json().get("matches", [])
+
+        with db_connection() as conn:
+
+            for match in matches:
+
+                score = match.get("score", {}).get("fullTime", {})
+
+                actual_home = score.get("home")
+                actual_away = score.get("away")
+
+                if actual_home is None or actual_away is None:
+                    continue
+
+                match_id = str(match["id"])
+
+                row = conn.execute("""
+                    SELECT predicted_home, predicted_away
+                    FROM predictions
+                    WHERE match_id = ?
+                """, (match_id,)).fetchone()
+
+                if row is None:
+                    continue
+
+                correct = int(
+                    row[0] == actual_home
+                    and row[1] == actual_away
+                )
+
+                conn.execute("""
+                    UPDATE predictions
+                    SET actual_home = ?,
+                        actual_away = ?,
+                        prediction_correct = ?
+                    WHERE match_id = ?
+                """, (
+                    actual_home,
+                    actual_away,
+                    correct,
+                    match_id,
+                ))
+
+            conn.commit()
+
+    except Exception as e:
+        print("Actual Result Update Error:", e)
+
+
+def load_history():
+
+    with db_connection() as conn:
+
+        return pd.read_sql_query(
+            "SELECT * FROM predictions ORDER BY match_date DESC",
+            conn,
+        )
+
+
+initialize_database()
+
+# =========================================================
+# API SETTINGS
+# =========================================================
+
+st.sidebar.header("🔑 API Settings")
+
+fb_default = st.secrets.get("FOOTBALL_API_KEY", "")
+odds_default = st.secrets.get("ODDS_API_KEY", "")
+
+fb_key = st.sidebar.text_input(
+    "Football-data.org API Key",
+    value=fb_default,
+    type="password",
+)
+
+odds_key = st.sidebar.text_input(
+    "Odds-api.io API Key",
+    value=odds_default,
+    type="password",
+)
+
+selected_league = st.sidebar.selectbox(
+    "League",
+    list(LEAGUES.keys()),
+)
+
+league_code = LEAGUES[selected_league]
+
+st.sidebar.divider()
+
+st.sidebar.caption(
+    "Odds မရရှိပါက Default Odds မထည့်ပါ။"
+)
+
+# =========================================================
+# API HELPERS
+# =========================================================
+
+def api_get(url, headers=None, params=None):
 
     try:
 
@@ -194,835 +240,1034 @@ def fetch_fixtures(league_code, api_key):
             url,
             headers=headers,
             params=params,
-            timeout=15,
-        )
-
-        if response.status_code != 200:
-            return []
-
-        data = response.json()
-
-        matches = data.get("matches", [])
-
-        now = utc_now()
-        seven_days_later = now + timedelta(days=7)
-
-        filtered_matches = []
-
-        for match in matches:
-
-            match_date = datetime.strptime(
-                match["utcDate"],
-                "%Y-%m-%dT%H:%M:%SZ",
-            ).replace(tzinfo=timezone.utc)
-
-            if now <= match_date <= seven_days_later:
-                filtered_matches.append(match)
-
-        return filtered_matches
-
-    except Exception as e:
-
-        print("Fixtures Error:", e)
-        return []
-
-
-# ============================================================
-# LIVE ODDS API
-# ============================================================
-
-@st.cache_data(ttl=300)
-def fetch_live_odds_from_api(api_key):
-
-    if not api_key:
-        return []
-
-    url = "https://api.odds-api.io/v1/odds"
-
-    params = {
-        "apiKey": api_key,
-        "sport": "soccer",
-        "region": "eu",
-    }
-
-    try:
-
-        response = requests.get(
-            url,
-            params=params,
             timeout=20,
         )
 
         if response.status_code == 200:
+            return response.json()
 
-            data = response.json()
+        return None
 
-            if isinstance(data, list):
-                return data
+    except requests.RequestException:
+        return None
 
-            if isinstance(data, dict):
 
-                return data.get("data", [])
+@st.cache_data(ttl=900)
+def fetch_fixtures(league, api_key):
 
-        else:
+    if not api_key:
+        return []
 
-            print("Odds API Status:", response.status_code)
+    data = api_get(
+        f"https://api.football-data.org/v4/"
+        f"competitions/{league}/matches",
+        headers={"X-Auth-Token": api_key},
+        params={"status": "SCHEDULED"},
+    )
 
-    except requests.RequestException as e:
+    if not data:
+        return []
 
-        print("Odds API Error:", e)
+    now = datetime.now(timezone.utc)
+    end = now + timedelta(days=7)
+
+    result = []
+
+    for match in data.get("matches", []):
+
+        match_date = datetime.strptime(
+            match["utcDate"],
+            "%Y-%m-%dT%H:%M:%SZ",
+        ).replace(tzinfo=timezone.utc)
+
+        if now <= match_date <= end:
+            result.append(match)
+
+    return result
+
+
+@st.cache_data(ttl=3600)
+def fetch_standings(league, api_key):
+
+    if not api_key:
+        return {}
+
+    data = api_get(
+        f"https://api.football-data.org/v4/"
+        f"competitions/{league}/standings",
+        headers={"X-Auth-Token": api_key},
+    )
+
+    if not data:
+        return {}
+
+    stats = {}
+
+    for table in data.get("standings", []):
+
+        if table.get("type") != "TOTAL":
+            continue
+
+        for row in table.get("table", []):
+
+            name = row["team"]["name"]
+            points = row.get("points", 0)
+            gd = row.get("goalDifference", 0)
+
+            stats[name] = {
+                "points": points,
+                "gd": gd,
+                "elo": 1500 + points * 15 + gd * 5,
+            }
+
+    return stats
+
+
+@st.cache_data(ttl=300)
+def fetch_odds(api_key):
+
+    if not api_key:
+        return []
+
+    data = api_get(
+        "https://api.odds-api.io/v1/odds",
+        params={
+            "apiKey": api_key,
+            "sport": "soccer",
+            "region": "eu",
+        },
+    )
+
+    if isinstance(data, list):
+        return data
+
+    if isinstance(data, dict):
+        return data.get("data", [])
 
     return []
 
 
-# ============================================================
-# TEAM NAME MATCHING
-# ============================================================
+# =========================================================
+# LIVE REFRESH
+# =========================================================
 
-def normalize_team_name(name):
+if st.sidebar.button(
+    "🔄 Live Odds Refresh",
+    use_container_width=True,
+):
 
-    name = str(name).lower()
+    fetch_odds.clear()
 
-    name = re.sub(
+    st.rerun()
+
+
+# =========================================================
+# TEAM NAME MATCH
+# =========================================================
+
+def normalize_name(name):
+
+    return re.sub(
         r"[^a-z0-9]",
         "",
-        name,
-    )
-
-    return name
-
-
-def team_names_match(team1, team2):
-
-    if not team1 or not team2:
-        return False
-
-    a = normalize_team_name(team1)
-    b = normalize_team_name(team2)
-
-    return (
-        a == b
-        or a in b
-        or b in a
+        str(name).lower(),
     )
 
 
-# ============================================================
-# LIVE ODDS EXTRACTION
-# DEFAULT ODDS မရှိပါ
-# ============================================================
+def team_match(a, b):
 
-def get_match_odds(home_team, away_team, odds_list):
+    a = normalize_name(a)
+    b = normalize_name(b)
 
-    # Default Odds မထည့်ပါ
+    return a == b or a in b or b in a
+
+
+# =========================================================
+# ODDS EXTRACTION
+# =========================================================
+
+def extract_match_odds(home, away, odds_data):
+
     result = {
-        "home_handicap": None,
+        "home_hdp": None,
         "home_price": None,
-        "away_handicap": None,
+        "away_hdp": None,
         "away_price": None,
         "over_line": None,
         "over_price": None,
         "under_line": None,
         "under_price": None,
-        "found": False,
     }
 
-    if not odds_list:
-        return result
-
-    for item in odds_list:
-
-        h_name = item.get("home_team", "")
-        a_name = item.get("away_team", "")
+    for event in odds_data:
 
         if not (
-            team_names_match(home_team, h_name)
-            and team_names_match(away_team, a_name)
+            team_match(home, event.get("home_team", ""))
+            and team_match(away, event.get("away_team", ""))
         ):
             continue
 
-        bookmakers = item.get("bookmakers", [])
+        for bookmaker in event.get("bookmakers", []):
 
-        for bookmaker in bookmakers:
+            for market in bookmaker.get("markets", []):
 
-            markets = bookmaker.get("markets", [])
+                key = market.get("key", "")
 
-            for market in markets:
+                for outcome in market.get("outcomes", []):
 
-                market_key = market.get("key", "")
+                    name = str(outcome.get("name", "")).lower()
+                    point = outcome.get("point")
+                    price = outcome.get("price")
 
-                outcomes = market.get("outcomes", [])
+                    if key == "spreads":
 
-                # --------------------------------------------
-                # HANDICAP / SPREADS
-                # --------------------------------------------
-
-                if market_key == "spreads":
-
-                    for outcome in outcomes:
-
-                        outcome_name = outcome.get("name", "")
-
-                        point = outcome.get("point")
-                        price = outcome.get("price")
-
-                        if (
-                            team_names_match(
-                                home_team,
-                                outcome_name,
-                            )
-                        ):
-
-                            result["home_handicap"] = point
+                        if team_match(home, name):
+                            result["home_hdp"] = point
                             result["home_price"] = price
 
-                        elif (
-                            team_names_match(
-                                away_team,
-                                outcome_name,
-                            )
-                        ):
-
-                            result["away_handicap"] = point
+                        elif team_match(away, name):
+                            result["away_hdp"] = point
                             result["away_price"] = price
 
-                # --------------------------------------------
-                # TOTALS / OVER UNDER
-                # --------------------------------------------
+                    elif key == "totals":
 
-                elif market_key == "totals":
-
-                    for outcome in outcomes:
-
-                        outcome_name = str(
-                            outcome.get("name", "")
-                        ).lower()
-
-                        point = outcome.get("point")
-                        price = outcome.get("price")
-
-                        if "over" in outcome_name:
-
+                        if "over" in name:
                             result["over_line"] = point
                             result["over_price"] = price
 
-                        elif "under" in outcome_name:
-
+                        elif "under" in name:
                             result["under_line"] = point
                             result["under_price"] = price
 
-        if (
-            result["home_price"] is not None
-            or result["over_price"] is not None
-        ):
-
-            result["found"] = True
-
-            return result
+        return result
 
     return result
 
 
-# ============================================================
-# MYANMAR ODDS FORMATTING
-# ============================================================
+def odds_price(price):
 
-def format_myanmar_price(decimal_odds):
-
-    if decimal_odds is None:
+    if price is None:
         return None
 
     try:
 
-        decimal_odds = float(decimal_odds)
+        price = float(price)
 
-        if decimal_odds <= 1:
+        if price <= 1:
             return None
 
-        profit = decimal_odds - 1
+        profit = round((price - 1) * 100)
 
-        price_val = int(round(profit * 100))
+        if profit > 0:
+            return f"+{profit}"
 
-        if price_val > 0:
-            return f"+{price_val}"
-
-        elif price_val < 0:
-            return str(price_val)
+        if profit < 0:
+            return str(profit)
 
         return "ဆုံ"
 
-    except (TypeError, ValueError):
-
+    except (ValueError, TypeError):
         return None
 
 
-def format_myanmar_handicap(
-    team_name,
-    handicap,
-    decimal_odds,
-):
+def format_handicap(team, line, price):
 
-    if handicap is None or decimal_odds is None:
-
+    if line is None or price is None:
         return None
 
-    price_str = format_myanmar_price(decimal_odds)
+    p = odds_price(price)
 
-    if price_str is None:
+    if p is None:
         return None
 
-    try:
+    return f"{team} {abs(line)}{p}"
 
-        handicap = float(handicap)
 
-        if handicap == 0:
-            hdp_str = "0"
+def format_ou(line, price):
 
-        else:
-            hdp_str = str(abs(handicap))
-
-        return (
-            f"{team_name} "
-            f"{hdp_str}{price_str}"
-        )
-
-    except (TypeError, ValueError):
-
+    if line is None or price is None:
         return None
 
+    p = odds_price(price)
 
-def format_myanmar_ou(line, decimal_odds):
-
-    if line is None or decimal_odds is None:
+    if p is None:
         return None
 
-    price_str = format_myanmar_price(decimal_odds)
-
-    if price_str is None:
-        return None
-
-    return f"{line}{price_str}"
+    return f"{line}{p}"
 
 
-# ============================================================
-# POISSON DISTRIBUTION
-# ============================================================
+# =========================================================
+# RECENT FORM: LAST 5 MATCHES
+# =========================================================
 
-def poisson_probability(lam, k):
+@st.cache_data(ttl=1800)
+def fetch_recent_form(league, api_key):
+
+    if not api_key:
+        return {}
+
+    data = api_get(
+        f"https://api.football-data.org/v4/"
+        f"competitions/{league}/matches",
+        headers={"X-Auth-Token": api_key},
+        params={"status": "FINISHED"},
+    )
+
+    if not data:
+        return {}
+
+    team_matches = {}
+
+    for match in data.get("matches", []):
+
+        score = match.get("score", {}).get("fullTime", {})
+
+        h = score.get("home")
+        a = score.get("away")
+
+        if h is None or a is None:
+            continue
+
+        home = match["homeTeam"]["name"]
+        away = match["awayTeam"]["name"]
+
+        date = match["utcDate"]
+
+        team_matches.setdefault(home, []).append({
+            "date": date,
+            "points": 3 if h > a else 1 if h == a else 0,
+            "gf": h,
+            "ga": a,
+        })
+
+        team_matches.setdefault(away, []).append({
+            "date": date,
+            "points": 3 if a > h else 1 if a == h else 0,
+            "gf": a,
+            "ga": h,
+        })
+
+    form = {}
+
+    for team, games in team_matches.items():
+
+        games = sorted(
+            games,
+            key=lambda x: x["date"],
+            reverse=True,
+        )[:5]
+
+        form[team] = {
+            "points": sum(g["points"] for g in games),
+            "gf": sum(g["gf"] for g in games),
+            "ga": sum(g["ga"] for g in games),
+            "played": len(games),
+            "form": "".join(
+                "W" if g["points"] == 3
+                else "D" if g["points"] == 1
+                else "L"
+                for g in games
+            ),
+        }
+
+    return form
+
+
+def get_team_data(team, standings, form):
+
+    s = standings.get(team, {})
+
+    f = form.get(team, {
+        "points": 0,
+        "gf": 0,
+        "ga": 0,
+        "played": 0,
+        "form": "N/A",
+    })
+
+    return {
+        "elo": s.get("elo", 1500),
+        "league_points": s.get("points", 0),
+        "recent_points": f["points"],
+        "recent_gf": f["gf"],
+        "recent_ga": f["ga"],
+        "recent_form": f["form"],
+        "recent_played": f["played"],
+    }
+
+
+# =========================================================
+# POISSON MODEL
+# =========================================================
+
+def poisson_pmf(lam, k):
 
     return (
         math.exp(-lam)
-        * (lam ** k)
+        * lam**k
         / math.factorial(k)
     )
 
 
-# ============================================================
-# AI MATCH PREDICTION
-# ============================================================
+def calculate_lambdas(home_data, away_data):
 
-def calculate_match_prediction(
-    home_team,
-    away_team,
-    home_elo,
-    away_elo,
-    home_form_pts,
-    away_form_pts,
-    local_hdp_input,
-    local_ou_input,
-):
+    base_home = 1.55
+    base_away = 1.05
 
-    # --------------------------------------------
-    # EXPECTED GOALS
-    # --------------------------------------------
-
-    base_home_lambda = 1.55
-    base_away_lambda = 1.05
-
-    elo_diff_factor = (
-        home_elo - away_elo
-    ) / 250.0
+    elo_diff = (
+        home_data["elo"] - away_data["elo"]
+    ) / 250
 
     form_diff = (
-        home_form_pts - away_form_pts
-    ) / 8.0
+        home_data["recent_points"]
+        - away_data["recent_points"]
+    ) / 10
 
     home_lambda = max(
-        0.4,
-        base_home_lambda
-        + (elo_diff_factor * 0.45)
-        + (form_diff * 0.25),
+        0.20,
+        base_home
+        + elo_diff * 0.35
+        + form_diff * 0.15,
     )
 
     away_lambda = max(
-        0.3,
-        base_away_lambda
-        - (elo_diff_factor * 0.45)
-        - (form_diff * 0.25),
+        0.20,
+        base_away
+        - elo_diff * 0.35
+        - form_diff * 0.15,
     )
 
-    # --------------------------------------------
-    # BEST EXACT SCORE
-    # --------------------------------------------
+    # Recent scoring adjustment
+    if home_data["recent_played"] > 0:
 
-    max_goals = 6
+        home_avg = (
+            home_data["recent_gf"]
+            / home_data["recent_played"]
+        )
 
-    best_score = (0, 0)
-    max_prob = -1.0
+        home_lambda = (
+            home_lambda * 0.70
+            + home_avg * 0.30
+        )
+
+    if away_data["recent_played"] > 0:
+
+        away_avg = (
+            away_data["recent_gf"]
+            / away_data["recent_played"]
+        )
+
+        away_lambda = (
+            away_lambda * 0.70
+            + away_avg * 0.30
+        )
+
+    return (
+        max(0.20, home_lambda),
+        max(0.20, away_lambda),
+    )
+
+
+# =========================================================
+# SCORE PROBABILITY MATRIX
+# =========================================================
+
+def score_matrix(home_lambda, away_lambda, max_goals=6):
+
+    matrix = np.zeros(
+        (max_goals + 1, max_goals + 1)
+    )
 
     for h in range(max_goals + 1):
 
         for a in range(max_goals + 1):
 
-            prob = (
-                poisson_probability(home_lambda, h)
-                * poisson_probability(away_lambda, a)
+            matrix[h, a] = (
+                poisson_pmf(home_lambda, h)
+                * poisson_pmf(away_lambda, a)
             )
 
-            if prob > max_prob:
+    return matrix
 
-                max_prob = prob
-                best_score = (h, a)
 
-    # --------------------------------------------
-    # BEST SCORE TOTAL GOALS
-    # --------------------------------------------
+# =========================================================
+# STATISTICAL PROBABILITIES
+# =========================================================
 
-    predicted_total_goals = (
-        best_score[0] + best_score[1]
-    )
+def calculate_probabilities(matrix):
 
-    # --------------------------------------------
-    # OVER / UNDER BASED ON BEST SCORE
-    # --------------------------------------------
+    max_goals = matrix.shape[0] - 1
 
-    default_ou_line = 2.5
+    home_win = 0
+    draw = 0
+    away_win = 0
 
-    if predicted_total_goals > default_ou_line:
+    for h in range(max_goals + 1):
 
-        ou_recommendation = (
-            f"အထက် (Over {default_ou_line}) "
-            f"[မှန်းဆဂိုး: "
-            f"{best_score[0]}-{best_score[1]} | "
-            f"ဂိုးပေါင်း: {predicted_total_goals}]"
-        )
+        for a in range(max_goals + 1):
 
-    else:
+            if h > a:
+                home_win += matrix[h, a]
 
-        ou_recommendation = (
-            f"အောက် (Under {default_ou_line}) "
-            f"[မှန်းဆဂိုး: "
-            f"{best_score[0]}-{best_score[1]} | "
-            f"ဂိုးပေါင်း: {predicted_total_goals}]"
-        )
-
-    # --------------------------------------------
-    # LOCAL O/U INPUT
-    # --------------------------------------------
-
-    if local_ou_input:
-
-        nums = re.findall(
-            r"\d+\.?\d*",
-            local_ou_input,
-        )
-
-        if nums:
-
-            user_ou_line = float(nums[0])
-
-            if predicted_total_goals > user_ou_line:
-
-                ou_recommendation = (
-                    f"ဒေသတွင်း O/U Line "
-                    f"({local_ou_input}) နှင့် "
-                    f"မှန်းဆဂိုး ({predicted_total_goals}) "
-                    f"အရ 👉 Over {user_ou_line}"
-                )
-
-            elif predicted_total_goals < user_ou_line:
-
-                ou_recommendation = (
-                    f"ဒေသတွင်း O/U Line "
-                    f"({local_ou_input}) နှင့် "
-                    f"မှန်းဆဂိုး ({predicted_total_goals}) "
-                    f"အရ 👉 Under {user_ou_line}"
-                )
+            elif h == a:
+                draw += matrix[h, a]
 
             else:
+                away_win += matrix[h, a]
 
-                ou_recommendation = (
-                    f"မှန်းဆဂိုးပေါင်း ({predicted_total_goals}) "
-                    f"နှင့် Line ({user_ou_line}) "
-                    f"တူညီနေသည်"
-                )
+    # Probability distributions of total goals
+    total_probs = {}
 
-    # --------------------------------------------
-    # HOME / AWAY PREDICTION
-    # --------------------------------------------
+    for total in range(2 * max_goals + 1):
 
-    if home_lambda > away_lambda + 0.3:
+        probability = 0
 
-        winner_rec = (
-            f"AI တွက်ချက်မှုအရ {home_team} "
-            f"အသာစီးရှိသည်"
+        for h in range(max_goals + 1):
+
+            a = total - h
+
+            if 0 <= a <= max_goals:
+                probability += matrix[h, a]
+
+        total_probs[total] = probability
+
+    def over_probability(line):
+
+        return sum(
+            p for goals, p in total_probs.items()
+            if goals > line
         )
 
-    elif away_lambda > home_lambda + 0.2:
+    def under_probability(line):
 
-        winner_rec = (
-            f"AI တွက်ချက်မှုအရ {away_team} "
-            f"အသာစီးရှိသည်"
+        return sum(
+            p for goals, p in total_probs.items()
+            if goals < line
         )
 
-    else:
+    # BTTS
+    btts_yes = sum(
+        matrix[h, a]
+        for h in range(1, max_goals + 1)
+        for a in range(1, max_goals + 1)
+    )
 
-        winner_rec = (
-            "နှစ်သင်း အားသာချက်နီးစပ်၍ "
-            "သရေဖြစ်နိုင်ခြေရှိသည်"
-        )
+    btts_no = 1 - btts_yes
 
-    return (
-        best_score,
-        ou_recommendation,
-        winner_rec,
+    return {
+        "home_win": home_win,
+        "draw": draw,
+        "away_win": away_win,
+        "over15": over_probability(1.5),
+        "under15": under_probability(1.5),
+        "over25": over_probability(2.5),
+        "under25": under_probability(2.5),
+        "over35": over_probability(3.5),
+        "under35": under_probability(3.5),
+        "btts_yes": btts_yes,
+        "btts_no": btts_no,
+        "total_probs": total_probs,
+    }
+
+
+# =========================================================
+# PREDICTION ENGINE
+# =========================================================
+
+def predict_match(home_data, away_data):
+
+    home_lambda, away_lambda = calculate_lambdas(
+        home_data,
+        away_data,
+    )
+
+    matrix = score_matrix(
         home_lambda,
         away_lambda,
-        max_prob,
-        predicted_total_goals,
+        max_goals=6,
     )
 
+    best_score = np.unravel_index(
+        np.argmax(matrix),
+        matrix.shape,
+    )
 
-# ============================================================
-# MAIN DASHBOARD
-# ============================================================
+    probs = calculate_probabilities(matrix)
+
+    return {
+        "home_lambda": home_lambda,
+        "away_lambda": away_lambda,
+        "matrix": matrix,
+        "best_score": best_score,
+        "best_probability": matrix[best_score],
+        "probabilities": probs,
+    }
+
+
+# =========================================================
+# LOAD DATA
+# =========================================================
+
+st.title("⚽ Professional Football Predictor V2")
+
+fixtures = fetch_fixtures(
+    league_code,
+    fb_key,
+)
+
+standings = fetch_standings(
+    league_code,
+    fb_key,
+)
+
+recent_form = fetch_recent_form(
+    league_code,
+    fb_key,
+)
+
+odds_data = fetch_odds(
+    odds_key,
+)
+
+# =========================================================
+# MATCH RESULTS UPDATE
+# =========================================================
+
+if st.sidebar.button("📊 Update Actual Results"):
+
+    update_actual_results(
+        league_code,
+        fb_key,
+    )
+
+    st.success("Actual Results Updated")
+    st.rerun()
+
+
+# =========================================================
+# FIXTURES DISPLAY
+# =========================================================
 
 st.subheader(
-    f"📅 {selected_league_name} "
-    f"- လာမည့် ၇ ရက်အတွင်း ပွဲစဉ်များ"
+    f"📅 {selected_league} | Next 7 Days"
 )
 
-matches = fetch_fixtures(
-    current_league_code,
-    fb_api_key,
-)
-
-live_odds_data = fetch_live_odds_from_api(
-    odds_api_key,
-)
-
-team_standings_map = fetch_team_standings(
-    current_league_code,
-    fb_api_key,
-)
-
-
-# ============================================================
-# STATUS DISPLAY
-# ============================================================
-
-if not fb_api_key:
+if not fixtures:
 
     st.warning(
-        "Football-data.org API Key ထည့်သွင်းရန် လိုအပ်ပါသည်။"
-    )
-
-elif not matches:
-
-    st.warning(
-        "လာမည့် (၇) ရက်အတွင်း ပွဲစဉ်မရှိပါ "
-        "သို့မဟုတ် API မှ ပွဲစဉ်မရရှိပါ။"
+        "ပွဲစဉ်မရှိပါ သို့မဟုတ် API Key မရရှိပါ။"
     )
 
 else:
 
     st.success(
-        f"ပွဲစဉ်စုစုပေါင်း "
-        f"({len(matches)} ပွဲ) တွေ့ရှိရပါသည်။"
+        f"{len(fixtures)} matches found"
     )
 
+for index, match in enumerate(fixtures):
 
-# ============================================================
-# MATCH DISPLAY
-# ============================================================
-
-for i, match in enumerate(matches):
-
-    home_team = match["homeTeam"]["name"]
-    away_team = match["awayTeam"]["name"]
-
-    match_time = match["utcDate"]
-
-    myanmar_match_time = format_match_time(
-        match_time
-    )
+    home = match["homeTeam"]["name"]
+    away = match["awayTeam"]["name"]
+    match_id = match["id"]
+    match_date = match["utcDate"]
 
     with st.expander(
-        f"🏟️ {home_team} vs {away_team} "
-        f"| 🕒 {myanmar_match_time} (Myanmar Time)"
+        f"🏟️ {home} vs {away} | "
+        f"{match_date}"
     ):
 
-        col1, col2 = st.columns(2)
+        left, right = st.columns([1, 1.3])
 
-        # ====================================================
-        # GLOBAL ODDS
-        # ====================================================
+        # =================================================
+        # ODDS
+        # =================================================
 
-        with col1:
+        with left:
 
-            st.markdown(
-                "### 🌐 ကမ္ဘာ့ပေါက်ကြေး (Live API)"
+            st.markdown("### 🌐 Live World Odds")
+
+            odds = extract_match_odds(
+                home,
+                away,
+                odds_data,
             )
 
-            odds = get_match_odds(
-                home_team,
-                away_team,
-                live_odds_data,
+            home_hdp = format_handicap(
+                home,
+                odds["home_hdp"],
+                odds["home_price"],
             )
 
-            # --------------------------------------------
-            # NO LIVE ODDS
-            # --------------------------------------------
+            away_hdp = format_handicap(
+                away,
+                odds["away_hdp"],
+                odds["away_price"],
+            )
 
-            if not odds["found"]:
+            over = format_ou(
+                odds["over_line"],
+                odds["over_price"],
+            )
+
+            under = format_ou(
+                odds["under_line"],
+                odds["under_price"],
+            )
+
+            if (
+                home_hdp is None
+                and away_hdp is None
+                and over is None
+                and under is None
+            ):
 
                 st.info(
-                    "🌐 ကမ္ဘာ့ကြေးများ မထွက်သေးပါ"
+                    "ကမ္ဘာ့ကြေးများ မထွက်သေးပါ"
                 )
 
             else:
 
-                # --------------------------------------------
-                # HANDICAP
-                # --------------------------------------------
+                if home_hdp:
+                    st.write("🏠", home_hdp)
 
-                global_home_hdp = format_myanmar_handicap(
-                    home_team,
-                    odds["home_handicap"],
-                    odds["home_price"],
-                )
+                if away_hdp:
+                    st.write("✈️", away_hdp)
 
-                global_away_hdp = format_myanmar_handicap(
-                    away_team,
-                    odds["away_handicap"],
-                    odds["away_price"],
-                )
+                if over:
+                    st.write("Over:", over)
 
-                st.markdown(
-                    "#### ⚽ Handicap"
-                )
-
-                if global_home_hdp:
-
-                    st.success(
-                        f"🏠 {global_home_hdp}"
-                    )
-
-                if global_away_hdp:
-
-                    st.success(
-                        f"✈️ {global_away_hdp}"
-                    )
-
-                if (
-                    global_home_hdp is None
-                    and global_away_hdp is None
-                ):
-
-                    st.info(
-                        "Handicap ကြေး မရရှိသေးပါ"
-                    )
-
-                # --------------------------------------------
-                # OVER / UNDER
-                # --------------------------------------------
-
-                global_over = format_myanmar_ou(
-                    odds["over_line"],
-                    odds["over_price"],
-                )
-
-                global_under = format_myanmar_ou(
-                    odds["under_line"],
-                    odds["under_price"],
-                )
-
-                st.markdown(
-                    "#### ⚽ ဂိုးပေါင်း (O/U)"
-                )
-
-                if global_over:
-
-                    st.success(
-                        f"Over: {global_over}"
-                    )
-
-                if global_under:
-
-                    st.success(
-                        f"Under: {global_under}"
-                    )
-
-                if (
-                    global_over is None
-                    and global_under is None
-                ):
-
-                    st.info(
-                        "ဂိုးပေါင်းကြေး မရရှိသေးပါ"
-                    )
-
-            # --------------------------------------------
-            # LOCAL ODDS INPUT
-            # --------------------------------------------
-
-            st.markdown(
-                "### 📝 ဒေသတွင်းကြေး ထည့်သွင်းရန်"
-            )
-
-            local_hdp_input = st.text_input(
-                "ဒေသတွင်း Handicap",
-                key=f"local_hdp_{i}",
-                placeholder=f"{home_team} 1+20",
-            )
-
-            local_ou_input = st.text_input(
-                "ဒေသတွင်း O/U",
-                key=f"local_ou_{i}",
-                placeholder="2.5",
-            )
-
-        # ====================================================
-        # AI ANALYSIS
-        # ====================================================
-
-        with col2:
-
-            st.markdown(
-                "### 🤖 AI Match Analysis"
-            )
-
-            home_elo, home_form_pts = get_team_stats(
-                home_team,
-                team_standings_map,
-            )
-
-            away_elo, away_form_pts = get_team_stats(
-                away_team,
-                team_standings_map,
-            )
-
-            (
-                best_score,
-                ou_rec,
-                winner_rec,
-                h_lam,
-                a_lam,
-                score_probability,
-                predicted_total_goals,
-            ) = calculate_match_prediction(
-                home_team,
-                away_team,
-                home_elo,
-                away_elo,
-                home_form_pts,
-                away_form_pts,
-                local_hdp_input,
-                local_ou_input,
-            )
-
-            # --------------------------------------------
-            # ELO
-            # --------------------------------------------
-
-            st.markdown(
-                f"**Elo Rating:** "
-                f"{home_team} ({home_elo:.0f}) "
-                f"vs {away_team} ({away_elo:.0f})"
-            )
-
-            # --------------------------------------------
-            # FORM POINTS
-            # --------------------------------------------
-
-            st.markdown(
-                f"**League Points:** "
-                f"{home_team} ({home_form_pts}) "
-                f"| {away_team} ({away_form_pts})"
-            )
-
-            # --------------------------------------------
-            # EXPECTED GOALS
-            # --------------------------------------------
-
-            st.markdown(
-                f"**Expected Goals:** "
-                f"{home_team} ({h_lam:.2f}) "
-                f"- {away_team} ({a_lam:.2f})"
-            )
-
-            st.markdown(
-                f"**Total Expected Goals:** "
-                f"{h_lam + a_lam:.2f}"
-            )
-
-            # --------------------------------------------
-            # BEST SCORE
-            # --------------------------------------------
+                if under:
+                    st.write("Under:", under)
 
             st.divider()
 
+            local_hdp = st.text_input(
+                "ဒေသတွင်း Handicap",
+                key=f"hdp_{match_id}",
+            )
+
+            local_ou = st.text_input(
+                "ဒေသတွင်း O/U",
+                key=f"ou_{match_id}",
+            )
+
+        # =================================================
+        # AI
+        # =================================================
+
+        with right:
+
+            st.markdown("### 🤖 AI Statistical Analysis")
+
+            hd = get_team_data(
+                home,
+                standings,
+                recent_form,
+            )
+
+            ad = get_team_data(
+                away,
+                standings,
+                recent_form,
+            )
+
+            prediction = predict_match(
+                hd,
+                ad,
+            )
+
+            hl = prediction["home_lambda"]
+            al = prediction["away_lambda"]
+
+            score = prediction["best_score"]
+            score_prob = prediction["best_probability"]
+
+            matrix = prediction["matrix"]
+            probs = prediction["probabilities"]
+
             st.markdown(
-                "#### 🎯 အနီးစပ်ဆုံး ခန့်မှန်းရလဒ်"
+                f"**Elo:** {home} {hd['elo']:.0f} "
+                f"| {away} {ad['elo']:.0f}"
+            )
+
+            st.markdown(
+                f"**Recent Form:** {home} "
+                f"`{hd['recent_form']}` "
+                f"| {away} `{ad['recent_form']}`"
+            )
+
+            st.markdown(
+                f"**Expected Goals:** "
+                f"{hl:.2f} - {al:.2f}"
             )
 
             st.success(
-                f"⚽ **{home_team} "
-                f"{best_score[0]} - {best_score[1]} "
-                f"{away_team}**"
+                f"🎯 **Predicted Score: "
+                f"{home} {score[0]} - {score[1]} {away}**"
             )
 
-            st.markdown(
-                f"**မှန်းဆဂိုးပေါင်း:** "
-                f"{predicted_total_goals} ဂိုး"
+            st.write(
+                f"Best Score Probability: "
+                f"{score_prob * 100:.2f}%"
             )
 
-            st.markdown(
-                f"**Best Score Probability:** "
-                f"{score_probability * 100:.2f}%"
+            # =============================================
+            # O/U SCORE-BASED INDICATOR
+            # =============================================
+
+            predicted_total = score[0] + score[1]
+
+            st.write(
+                f"မှန်းဆဂိုးပေါင်း: {predicted_total} ဂိုး"
             )
 
-            st.markdown(
-                f"**ဂိုးပေါင်းအခြေအနေ:** {ou_rec}"
+            if predicted_total > 2.5:
+
+                st.success("Score-based: Over 2.5")
+
+            else:
+
+                st.info("Score-based: Under 2.5")
+
+            # =============================================
+            # O/U PROBABILITY
+            # =============================================
+
+            st.divider()
+
+            st.markdown("### 📊 Over / Under Probability")
+
+            ou_df = pd.DataFrame({
+                "Market": [
+                    "Over 1.5",
+                    "Under 1.5",
+                    "Over 2.5",
+                    "Under 2.5",
+                    "Over 3.5",
+                    "Under 3.5",
+                ],
+                "Probability (%)": [
+                    probs["over15"] * 100,
+                    probs["under15"] * 100,
+                    probs["over25"] * 100,
+                    probs["under25"] * 100,
+                    probs["over35"] * 100,
+                    probs["under35"] * 100,
+                ],
+            })
+
+            st.dataframe(
+                ou_df,
+                hide_index=True,
+                use_container_width=True,
             )
 
-            st.markdown(
-                f"**အသင်းအားသာချက်:** {winner_rec}"
+            # =============================================
+            # BTTS
+            # =============================================
+
+            st.markdown("### ⚽ Both Teams To Score")
+
+            st.write(
+                f"BTTS Yes: "
+                f"{probs['btts_yes'] * 100:.2f}%"
             )
 
-            # --------------------------------------------
-            # SCORE DETAILS
-            # --------------------------------------------
+            st.write(
+                f"BTTS No: "
+                f"{probs['btts_no'] * 100:.2f}%"
+            )
 
-            st.caption(
-                "မှတ်ချက် - Exact Score သည် Poisson "
-                "Distribution အရ အဖြစ်နိုင်ဆုံး "
-                "တစ်ကွက်တည်းကို ဖော်ပြထားခြင်းဖြစ်သည်။"
+            # =============================================
+            # 1X2 PROBABILITY
+            # =============================================
+
+            st.markdown("### 🏆 1X2 Probability")
+
+            st.write(
+                f"Home Win: "
+                f"{probs['home_win'] * 100:.2f}%"
+            )
+
+            st.write(
+                f"Draw: "
+                f"{probs['draw'] * 100:.2f}%"
+            )
+
+            st.write(
+                f"Away Win: "
+                f"{probs['away_win'] * 100:.2f}%"
+            )
+
+            # =============================================
+            # SCORE MATRIX
+            # =============================================
+
+            st.divider()
+
+            st.markdown("### 🔢 Score Probability Matrix")
+
+            matrix_df = pd.DataFrame(
+                matrix * 100,
+                index=[
+                    f"Home {i}"
+                    for i in range(matrix.shape[0])
+                ],
+                columns=[
+                    f"Away {i}"
+                    for i in range(matrix.shape[1])
+                ],
+            )
+
+            st.dataframe(
+                matrix_df.style.format("{:.2f}%").background_gradient(
+                    cmap="RdYlGn"
+                ),
+                use_container_width=True,
+            )
+
+            # =============================================
+            # LOCAL O/U COMPARISON
+            # =============================================
+
+            if local_ou:
+
+                numbers = re.findall(
+                    r"\d+\.?\d*",
+                    local_ou,
+                )
+
+                if numbers:
+
+                    line = float(numbers[0])
+
+                    if predicted_total > line:
+
+                        st.info(
+                            f"Score-based Local O/U: "
+                            f"Over {line}"
+                        )
+
+                    elif predicted_total < line:
+
+                        st.info(
+                            f"Score-based Local O/U: "
+                            f"Under {line}"
+                        )
+
+                    else:
+
+                        st.info(
+                            "Score နှင့် O/U Line တူညီနေသည်"
+                        )
+
+            # =============================================
+            # SAVE HISTORY
+            # =============================================
+
+            save_prediction(
+                match_id,
+                league_code,
+                match_date,
+                home,
+                away,
+                score,
+                hl,
+                al,
             )
 
 
-# ============================================================
+# =========================================================
+# HISTORY & ACCURACY
+# =========================================================
+
+st.divider()
+
+st.header("📚 Match History & Prediction Accuracy")
+
+history = load_history()
+
+if history.empty:
+
+    st.info(
+        "Prediction History မရှိသေးပါ။"
+    )
+
+else:
+
+    completed = history.dropna(
+        subset=[
+            "actual_home",
+            "actual_away",
+        ]
+    )
+
+    total_predictions = len(history)
+    completed_count = len(completed)
+
+    col1, col2, col3 = st.columns(3)
+
+    col1.metric(
+        "Total Predictions",
+        total_predictions,
+    )
+
+    col2.metric(
+        "Completed Matches",
+        completed_count,
+    )
+
+    if completed_count > 0:
+
+        exact_accuracy = (
+            completed["prediction_correct"].sum()
+            / completed_count
+        ) * 100
+
+        col3.metric(
+            "Exact Score Accuracy",
+            f"{exact_accuracy:.2f}%",
+        )
+
+    else:
+
+        col3.metric(
+            "Exact Score Accuracy",
+            "N/A",
+        )
+
+    st.dataframe(
+        history,
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    csv_data = history.to_csv(
+        index=False
+    ).encode("utf-8")
+
+    st.download_button(
+        "📥 Download Match History CSV",
+        data=csv_data,
+        file_name="football_prediction_history.csv",
+        mime="text/csv",
+    )
+
+# =========================================================
 # FOOTER
-# ============================================================
+# =========================================================
 
 st.divider()
 
 st.caption(
-    "Professional Football Match Predictor | "
-    "Football-data.org + Odds API + Poisson Model"
+    "Professional Football Predictor Dashboard V2"
 )
 
 st.caption(
-    "API မှ မရရှိသော Odds များကို Default ကြေးဖြင့် "
-    "အစားထိုးမပြသပါ။"
+    "Football-data.org | Odds API | Poisson | SQLite"
+)
+
+st.caption(
+    "Predictions are statistical estimates, "
+    "not guaranteed match outcomes."
 )
