@@ -12,7 +12,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# မျက်နှာပြင် အပေါ်ဆုံးတွင် Spacing အနည်းငယ်ပေး၍ ခေါင်းစဉ် အလွတ်ပေါ်စေရန်
+# မျက်နှာပြင် အပေါ်ဆုံးတွင် Spacing ပေးခြင်း
 st.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
 
 st.title("⚽ ဘောလုံးပွဲစဉ်နှင့် ကြေးနှိုင်းယှဉ် ခန့်မှန်းချက် Dashboard")
@@ -23,7 +23,6 @@ st.markdown(
 # --- SIDEBAR: API CONFIGURATIONS ---
 st.sidebar.header("🔑 API & Settings")
 
-# st.secrets မှ Key များကို လုံခြုံစွာ ဆွဲထုတ်ခြင်း (Key မရှိပါက Error မတက်ဘဲ အလွတ်ပြရန် st.secrets.get သုံးခြင်း)
 default_fb_key = (
     st.secrets.get("FOOTBALL_API_KEY", "") if hasattr(st, "secrets") else ""
 )
@@ -56,7 +55,6 @@ selected_league_name = st.sidebar.selectbox(
     ],
 )
 
-# League Mapping for Football-data.org
 LEAGUE_CODES = {
     "English Premier League (PL)": "PL",
     "Spanish La Liga (PD)": "PD",
@@ -144,7 +142,7 @@ def calculate_match_prediction(
     else:
         winner_rec = "သရေ (Draw) ဖြစ်နိုင်ခြေ များသည်"
 
-    return best_score, ou_rec, winner_rec, home_lambda, away_lambda
+    return best_score, ou_recommendation, winner_rec, home_lambda, away_lambda
 
 
 # --- FETCH FIXTURES ---
