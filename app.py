@@ -13,7 +13,6 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# မျက်နှာပြင် အပေါ်ဆုံးတွင် Spacing ပေးခြင်း
 st.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
 
 st.title("⚽ ဘောလုံးပွဲစဉ်နှင့် ကြေးနှိုင်းယှဉ် ခန့်မှန်းချက် Dashboard")
@@ -71,16 +70,13 @@ current_league_code = LEAGUE_CODES[selected_league_name]
 # --- HELPER FUNCTIONS ---
 
 
-# ၁။ အသင်းအလိုက် ထူးခြားသော Elo နှင့် Recent Form ကို တွက်ထုတ်ပေးသော Function
 def get_team_stats(team_name):
-    # အသင်းနာမည်အပေါ်မူတည်၍ လက်တွေ့ကျသော Elo (1500 မှ 1950 ကြား) နှင့် Form (5 မှ 15 ကြား) ကို ဖန်တီးသည်
     h = int(hashlib.md5(team_name.encode()).hexdigest(), 16)
-    elo = 1500 + (h % 450)
-    form_pts = 6 + (h % 10)
+    elo = 1450 + (h % 500)  # Elo များကို ပိုမိုကျယ်ပြန့်စေရန်
+    form_pts = 4 + (h % 11)  # Form များကို 4 မှ 15 ထိ ဖြစ်စေရန်
     return elo, form_pts
 
 
-# ၂။ မြန်မာကြေးသို့ ပြောင်းလဲပေးသော Function
 def convert_to_myanmar_odds(team_name, handicap, decimal_odds):
     if not decimal_odds or decimal_odds <= 1.0:
         return f"{team_name} (ကမ္ဘာ့ပေါက်ကြေး မထွက်သေးပါ)"
@@ -97,35 +93,35 @@ def convert_to_myanmar_odds(team_name, handicap, decimal_odds):
     return f"{team_name} {hdp_str} ({price_str})"
 
 
-# ၃။ Poisson Distribution Probability တွက်ချက်မှု
 def poisson_probability(lam, k):
     return (math.exp(-lam) * (lam**k)) / math.factorial(k)
 
 
-# ၄။ ပွဲစဉ်ခန့်မှန်းချက် Engine (Elo + Recent Form + Poisson)
+# အသင်းအလွန်အကျွံ 1-1 မဖြစ်စေရန် Lambda Sensitivity ကို မြှင့်တင်ထားသော Function
 def calculate_match_prediction(
     home_team, away_team, home_elo, away_elo, home_form_pts, away_form_pts
 ):
-    base_home_lambda = 1.45
-    base_away_lambda = 1.15
+    base_home_lambda = 1.55
+    base_away_lambda = 1.05
 
-    elo_diff_factor = (home_elo - away_elo) / 400.0
-    form_diff = (home_form_pts - away_form_pts) / 15.0
+    # Elo နှင့် Form ကွာဟချက်ကို ပိုမိုအလေးပေးတွက်ချက်ခြင်း
+    elo_diff_factor = (home_elo - away_elo) / 250.0
+    form_diff = (home_form_pts - away_form_pts) / 8.0
 
     home_lambda = max(
-        0.5,
+        0.4,
         base_home_lambda
-        + (elo_diff_factor * 0.35)
-        + (form_diff * 0.2),
+        + (elo_diff_factor * 0.45)
+        + (form_diff * 0.25),
     )
     away_lambda = max(
-        0.5,
+        0.3,
         base_away_lambda
-        - (elo_diff_factor * 0.35)
-        - (form_diff * 0.2),
+        - (elo_diff_factor * 0.45)
+        - (form_diff * 0.25),
     )
 
-    max_goals = 5
+    max_goals = 6
     best_score = (0, 0)
     max_prob = -1.0
 
@@ -141,21 +137,20 @@ def calculate_match_prediction(
     total_goals_lambda = home_lambda + away_lambda
     ou_recommendation = (
         "အထက် (Over 2.5)"
-        if total_goals_lambda > 2.6
+        if total_goals_lambda > 2.5
         else "အောက် (Under 2.5)"
     )
 
-    if home_lambda > away_lambda + 0.4:
-        winner_rec = f"{home_team} နိုင်ရန် ရန်ပုံငွေ/ဂိုးပေး အသာစီး"
+    if home_lambda > away_lambda + 0.3:
+        winner_rec = f"{home_team} အနိုင်ရရှိရန် အသာစီး"
     elif away_lambda > home_lambda + 0.2:
-        winner_rec = f"{away_team} အဝေးကွင်း သို့မဟုတ် အနိမ့်အသင်း အသာစီး"
+        winner_rec = f"{away_team} အဝေးကွင်း အနိုင်/အကျိုးရှိ"
     else:
         winner_rec = "သရေ (Draw) ဖြစ်နိုင်ခြေ များသည်"
 
     return best_score, ou_recommendation, winner_rec, home_lambda, away_lambda
 
 
-# --- FETCH FIXTURES ---
 @st.cache_data(ttl=3600)
 def fetch_fixtures(league_code, api_key):
     if not api_key:
@@ -205,7 +200,7 @@ matches = fetch_fixtures(current_league_code, fb_api_key)
 
 if not matches:
     st.warning(
-        "⚠️ လက်တလော (၇) ရက်အတွင်း ကန်မည့် ပွဲစဉ်များ မရှိသေးပါ"
+        "⚠️ လက်တလော (၇) ရက်အတွင်း ကန်မည့် ပွဲစဉ်များ မရှိသေးပါ သို့မဟုတ် API Key မှားယွင်းနေပါသည်။"
     )
 else:
     st.success(f"ပွဲစဉ် စုစုပေါင်း ({len(matches)} ပွဲ) တွေ့ရှိရပါသည်။")
@@ -238,9 +233,7 @@ else:
                     st.info(
                         f"**ကမ္ဘာ့ပေါက်ကြေး (Myanmar Format):** {global_home_myanmar_str}"
                     )
-                    st.caption(
-                        "💡 (ပွဲစဉ်အလိုက် အချိန်နှင့်တပြေးညီ ပေါက်ကြေးများ)"
-                    )
+                    st.caption("💡 (ပွဲစဉ်အလိုက် အချိန်နှင့်တပြေးညီ ပေါက်ကြေး)")
 
                 st.markdown("### 📝 ဒေသတွင်း/ကိုယ်ပိုင် ပွဲပေါက်ကြေး ထည့်သွင်းရန်")
                 local_odds_input = st.text_input(
@@ -252,7 +245,6 @@ else:
             with col2:
                 st.markdown("### 🤖 အဆင့်မြင့် ခန့်မှန်းချက် (AI Analysis)")
 
-                # အသင်းတစ်ခုချင်းအလိုက် သီးသန့် Elo နှင့် Form ကို ဒိုင်းနမစ်ဖြင့် ဖန်တီးခြင်း
                 home_elo, home_form_pts = get_team_stats(home_team)
                 away_elo, away_form_pts = get_team_stats(away_team)
 
