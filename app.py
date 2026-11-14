@@ -18,7 +18,8 @@ st.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
 
 st.title("⚽ ဘောလုံးပွဲစဉ်နှင့် ကြေးနှိုင်းယှဉ် ခန့်မှန်းချက် Dashboard")
 st.markdown(
-    "အဓိကလိဂ် (၆) ခု၏ တစ်ပတ်စာပွဲစဉ်များ၊ ကမ္ဘာ့ပေါက်ကြေး၊ ဒေသတွင်းပေါက်ကြေးနှင့် AI Poisson ခန့်မှန်းချက်စနစ်"
+    "အဓိကလိဂ် (၆) ခု၏ တစ်ပတ်စာပွဲစဉ်များ၊ ကမ္ဘာ့ပေါက်ကြေး (တိုက်ရိုက် API)၊"
+    " ဒေသတွင်းပေါက်ကြေးနှင့် AI Poisson ခန့်မှန်းချက်စနစ်"
 )
 
 # --- SIDEBAR: API CONFIGURATIONS ---
@@ -113,11 +114,78 @@ def format_myanmar_ou(ou_line, decimal_odds):
   return f"{ou_line}{price_str}"
 
 
+# ၃။ odds-api.io မှ အချိန်နဲ့တပြေးညီ ကမ္ဘာ့ပေါက်ကြေး တိုက်ရိုက်ဆွဲယူသည့် Function
+@st.cache_data(ttl=600)  # 10 မိနစ်တစ်ကြိမ် Cache လုပ်မည်
+def fetch_live_odds_from_api(api_key):
+  if not api_key:
+    return []
+  url = "https://api.odds-api.io/v1/odds"
+  params = {"apiKey": api_key, "sport": "soccer", "region": "eu"}
+  try:
+    response = requests.get(url, params=params, timeout=10)
+    if response.status_code == 200:
+      data = response.json()
+      # odds-api.io ၏ response ဖွဲ့စည်းပုံအပေါ် မူတည်၍ list ပြန်ပေးသည်
+      if isinstance(data, list):
+        return data
+      elif isinstance(data, dict) and "data" in data:
+        return data["data"]
+  except Exception as e:
+    print(f"Odds API Error: {e}")
+  return []
+
+
+# ပွဲစဉ်အလိုက် live odds ကို ရှာဖွေပေးသော helper
+def get_match_odds(home_team, away_team, odds_list):
+  # Default values if not found
+  hdp, hdp_dec, ou, ou_dec = 1.0, 1.85, 2.5, 1.85
+  found = False
+
+  for item in odds_list:
+    h_name = item.get("home_team", "")
+    a_name = item.get("away_team", "")
+    # အသင်းနာမည် တစ်စိတ်တစ်ပိုင်း တူညီမှုရှိမလား စစ်ဆေးခြင်း
+    if (
+        home_team.lower() in h_name.lower()
+        or h_name.lower() in home_team.lower()
+    ) and (
+        away_team.lower() in a_name.lower()
+        or a_name.lower() in away_team.lower()
+    ):
+      markets = item.get("bookmakers", [])
+      # Bookmaker တွေထဲက market တွေကို ရှာဖွေခြင်း
+      for bm in markets:
+        for market in bm.get("markets", []):
+          if market.get("key") == "spreads":
+            # Handicap ဒေတာ
+            outcomes = market.get("outcomes", [])
+            for out in outcomes:
+              if (
+                  home_team.lower() in out.get("name", "").lower()
+                  or out.get("name", "").lower() in home_team.lower()
+              ):
+                hdp = out.get("point", 1.0)
+                hdp_dec = out.get("price", 1.85)
+                found = True
+          if market.get("key") == "totals":
+            # Over/Under ဂိုးပေါင်း ဒေတာ
+            outcomes = market.get("outcomes", [])
+            for out in outcomes:
+              if "over" in out.get("name", "").lower():
+                ou = out.get("point", 2.5)
+                ou_dec = out.get("price", 1.85)
+                found = True
+      if found:
+        break
+
+  return hdp, hdp_dec, ou, ou_dec
+
+
 def poisson_probability(lam, k):
   return (math.exp(-lam) * (lam**k)) / math.factorial(k)
 
 
-# ၃။ AI တွက်ချက်မှုနှင့် ဒေသတွင်းကြေးများကို အဓိကအခြေခံ၍ အကြံပြုချက်ထုတ်ပေးသော Engine
+# ၄။ AI တွက်ချက်မှုနှင့် ဒေသတွင်းကြေးများကို အဓိကအခြေခံ၍ အကြံပြုချက်ထုတ်ပေးသော Engine
 def calculate_match_prediction(
     home_team,
     away_team,
@@ -184,7 +252,6 @@ def calculate_match_prediction(
 
   # --- ဒေသတွင်းကြေးကို အဓိကအခြေခံ၍ အနိုင်အရှုံး / အသာစီး ရွေးချယ်ပေးခြင်း ---
   if local_hdp_input:
-    # ဥပမာ - ဒေသတွင်းကြေးတွင် အသင်းနာမည်ပါဝင်မှု သို့မဟုတ် ဈေးအခြေအနေကို အခြေခံခြင်း
     if home_team.lower() in local_hdp_input.lower() and (
         "+" in local_hdp_input or "ဆုံ" in local_hdp_input
     ):
@@ -259,6 +326,7 @@ def fetch_fixtures(league_code, api_key):
 st.subheader(f"📅 {selected_league_name} - လာမည့် ၇ ရက်အတွင်း ပွဲစဉ်ဇယားများ")
 
 matches = fetch_fixtures(current_league_code, fb_api_key)
+live_odds_data = fetch_live_odds_from_api(odds_api_key)
 
 if not matches:
   st.warning(
@@ -279,28 +347,22 @@ else:
       col1, col2 = st.columns(2)
 
       with col1:
-        st.markdown("### 🌐 ကမ္ဘာ့ပေါက်ကြေး (Myanmar Format)")
-        global_odds_available = True
+        st.markdown("### 🌐 ကမ္ဘာ့ပေါက်ကြေး (Live API Format)")
 
-        if not global_odds_available:
-          st.error("ℹ️ ကမ္ဘာ့ပေါက်ကြေးများ မထွက်သေးပါ")
-          global_hdp_str = "မထွက်သေးပါ"
-          global_ou_str = "မထွက်သေးပါ"
-        else:
-          sim_hdp = 1.0
-          sim_hdp_dec = 1.20
-          sim_ou = 3.0
-          sim_ou_dec = 1.40
+        # odds-api.io မှ တိုက်ရိုက်ဆွဲထုတ်ထားသော ကြေးများကို ရှာဖွေခြင်း
+        sim_hdp, sim_hdp_dec, sim_ou, sim_ou_dec = get_match_odds(
+            home_team, away_team, live_odds_data
+        )
 
-          global_hdp_str = format_myanmar_handicap(
-              home_team, sim_hdp, sim_hdp_dec
-          )
-          global_ou_str = format_myanmar_ou(sim_ou, sim_ou_dec)
+        global_hdp_str = format_myanmar_handicap(
+            home_team, sim_hdp, sim_hdp_dec
+        )
+        global_ou_str = format_myanmar_ou(sim_ou, sim_ou_dec)
 
-          st.info(
-              f"👉 **အထက်/အောက် (HDP):** `{global_hdp_str}`\n\n"
-              f"⚽ **ဂိုးပေါင်း (O/U):** `{global_ou_str}`"
-          )
+        st.info(
+            f"👉 **အထက်/အောက် (HDP):** `{global_hdp_str}`\n\n"
+            f"⚽ **ဂိုးပေါင်း (O/U):** `{global_ou_str}`"
+        )
 
         st.markdown("### 📝 ဒေသတွင်း ပွဲပေါက်ကြေး ထည့်သွင်းရန်")
         local_hdp_input = st.text_input(
