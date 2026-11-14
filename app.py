@@ -12,6 +12,9 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+# မျက်နှာပြင် အပေါ်ဆုံးတွင် Spacing အနည်းငယ်ပေး၍ ခေါင်းစဉ် အလွတ်ပေါ်စေရန်
+st.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
+
 st.title("⚽ ဘောလုံးပွဲစဉ်နှင့် ကြေးနှိုင်းယှဉ် ခန့်မှန်းချက် Dashboard")
 st.markdown(
     "အဓိကလိဂ် (၆) ခု၏ တစ်ပတ်စာပွဲစဉ်များ၊ ကမ္ဘာ့ပေါက်ကြေး၊ ဒေသတွင်းပေါက်ကြေးနှင့် AI Poisson ခန့်မှန်းချက်စနစ်"
@@ -19,11 +22,26 @@ st.markdown(
 
 # --- SIDEBAR: API CONFIGURATIONS ---
 st.sidebar.header("🔑 API & Settings")
+
+# st.secrets မှ Key များကို လုံခြုံစွာ ဆွဲထုတ်ခြင်း (Key မရှိပါက Error မတက်ဘဲ အလွတ်ပြရန် st.secrets.get သုံးခြင်း)
+default_fb_key = (
+    st.secrets.get("FOOTBALL_API_KEY", "") if hasattr(st, "secrets") else ""
+)
+default_odds_key = (
+    st.secrets.get("ODDS_API_KEY", "") if hasattr(st, "secrets") else ""
+)
+
 fb_api_key = st.sidebar.text_input(
-    "Football-data.org API Key", type="password", placeholder="API Key ထည့်ရန်"
+    "Football-data.org API Key",
+    value=default_fb_key,
+    type="password",
+    placeholder="API Key ထည့်ရန်",
 )
 odds_api_key = st.sidebar.text_input(
-    "Odds-api.io API Key", type="password", placeholder="Odds API Key ထည့်ရန်"
+    "Odds-api.io API Key",
+    value=default_odds_key,
+    type="password",
+    placeholder="Odds API Key ထည့်ရန်",
 )
 
 selected_league_name = st.sidebar.selectbox(
@@ -126,7 +144,7 @@ def calculate_match_prediction(
     else:
         winner_rec = "သရေ (Draw) ဖြစ်နိုင်ခြေ များသည်"
 
-    return best_score, ou_recommendation, winner_rec, home_lambda, away_lambda
+    return best_score, ou_rec, winner_rec, home_lambda, away_lambda
 
 
 # --- FETCH FIXTURES ---
