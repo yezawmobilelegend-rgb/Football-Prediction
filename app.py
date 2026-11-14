@@ -6,21 +6,21 @@ import requests
 import numpy as np
 import pandas as pd
 import streamlit as st
-from zoneinfo import ZoneInfo  # Python 3.9+ တွင် အသုံးပြုနိုင်သည်
+from zoneinfo import ZoneInfo
 
 # =========================================================
 # CONFIGURATION
 # =========================================================
 
 st.set_page_config(
-    page_title="Professional Football Predictor V2.2",
+    page_title="Professional Football Predictor V2.3",
     page_icon="⚽",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
 DB_PATH = "football_history.db"
-LOCAL_TZ = ZoneInfo("Asia/Yangon")  # မြန်မာစံတော်ချိန်အတွက်
+LOCAL_TZ = ZoneInfo("Asia/Yangon")  # မြန်မာစံတော်ချိန်
 
 LEAGUES = {
     "English Premier League (PL)": "PL",
@@ -338,7 +338,7 @@ def team_match(a, b):
 
 
 # =========================================================
-# ODDS EXTRACTION
+# ODDS EXTRACTION (Updated to include H2H / 1X2 market)
 # =========================================================
 
 def extract_match_odds(home, away, odds_data):
@@ -351,6 +351,9 @@ def extract_match_odds(home, away, odds_data):
         "over_price": None,
         "under_line": None,
         "under_price": None,
+        "home_win_price": None,
+        "draw_price": None,
+        "away_win_price": None,
     }
 
     if not odds_data:
@@ -385,6 +388,13 @@ def extract_match_odds(home, away, odds_data):
                         elif "under" in name:
                             result["under_line"] = point
                             result["under_price"] = price
+                    elif key == "h2h":
+                        if team_match(home, name):
+                            result["home_win_price"] = price
+                        elif team_match(away, name):
+                            result["away_win_price"] = price
+                        elif "draw" in name or "tie" in name:
+                            result["draw_price"] = price
         return result
 
     return result
@@ -518,7 +528,7 @@ def get_team_data(team, standings, form):
 
 
 # =========================================================
-# POISSON MODEL & SENSITIVITY FIX
+# POISSON MODEL & SENSITIVITY
 # =========================================================
 
 def poisson_pmf(lam, k):
@@ -582,10 +592,6 @@ def calculate_lambdas(home_data, away_data):
     )
 
 
-# =========================================================
-# SCORE PROBABILITY MATRIX
-# =========================================================
-
 def score_matrix(home_lambda, away_lambda, max_goals=6):
     matrix = np.zeros(
         (max_goals + 1, max_goals + 1)
@@ -600,10 +606,6 @@ def score_matrix(home_lambda, away_lambda, max_goals=6):
 
     return matrix
 
-
-# =========================================================
-# STATISTICAL PROBABILITIES
-# =========================================================
 
 def calculate_probabilities(matrix):
     max_goals = matrix.shape[0] - 1
@@ -664,10 +666,6 @@ def calculate_probabilities(matrix):
     }
 
 
-# =========================================================
-# PREDICTION ENGINE WITH STABLE MONTE CARLO SAMPLING
-# =========================================================
-
 def predict_match(home_data, away_data, match_id):
     home_lambda, away_lambda = calculate_lambdas(
         home_data,
@@ -683,7 +681,6 @@ def predict_match(home_data, away_data, match_id):
     flat_matrix = matrix.flatten()
     flat_matrix /= flat_matrix.sum()
 
-    # Match ID ကို Hash သို့မဟုတ် Int ပြောင်း၍ Seed အဖြစ်သုံးခြင်းဖြင့် Rerun တိုင်း ရလဒ်မပြောင်းလဲစေရန် တည်ငြိမ်စေခြင်း
     seed_val = abs(hash(str(match_id))) % (2**32)
     rng = np.random.default_rng(seed_val)
 
@@ -718,7 +715,8 @@ def predict_match(home_data, away_data, match_id):
 # LOAD DATA
 # =========================================================
 
-st.title("⚽ Professional Football Predictor V2.2")
+st.title("⚽ Professional Football Predictor V2.3")
+st.markdown("အဆင့်မြင့် Poisson AI မော်ဒယ်၊ ကမ္ဘာ့ Live Odds နှင့် မြန်မာကြေးပုံစံ **Value Bet Finder** စနစ်")
 
 fixtures = fetch_fixtures(
     league_code,
@@ -739,10 +737,6 @@ odds_data = fetch_odds(
     odds_key,
 )
 
-# =========================================================
-# MATCH RESULTS UPDATE
-# =========================================================
-
 if st.sidebar.button("📊 Update Actual Results"):
     update_actual_results(
         league_code,
@@ -750,10 +744,6 @@ if st.sidebar.button("📊 Update Actual Results"):
     )
     st.success("Actual Results Updated")
     st.rerun()
-
-# =========================================================
-# FIXTURES DISPLAY
-# =========================================================
 
 st.subheader(f"📅 {selected_league} | Next 7 Days")
 
@@ -767,7 +757,6 @@ for index, match in enumerate(fixtures):
     away = match["awayTeam"]["name"]
     match_id = match["id"]
     
-    # UTC အချိန်မှ မြန်မာစံတော်ချိန် (MMT) သို့ ပြောင်းလဲခြင်း
     utc_dt = datetime.strptime(match["utcDate"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
     local_dt = utc_dt.astimezone(LOCAL_TZ)
     match_date_str = local_dt.strftime("%Y-%m-%d %H:%M MMT")
@@ -776,7 +765,7 @@ for index, match in enumerate(fixtures):
         left, right = st.columns([1, 1.3])
 
         # =================================================
-        # ODDS
+        # ODDS DISPLAY
         # =================================================
         with left:
             st.markdown("### 🌐 Live World Odds")
@@ -839,10 +828,10 @@ for index, match in enumerate(fixtures):
             )
 
         # =================================================
-        # AI
+        # AI & VALUE BET FINDER (V2.3 Feature)
         # =================================================
         with right:
-            st.markdown("### 🤖 AI Statistical Analysis")
+            st.markdown("### 🤖 AI Statistical & Value Analysis")
 
             hd = get_team_data(
                 home,
@@ -856,7 +845,6 @@ for index, match in enumerate(fixtures):
                 recent_form,
             )
 
-            # Match ID ထည့်သွင်းပေးခြင်းဖြင့် ရလဒ် တည်ငြိမ်စေသည်
             prediction = predict_match(
                 hd,
                 ad,
@@ -893,16 +881,56 @@ for index, match in enumerate(fixtures):
                 f"{home} {score[0]} - {score[1]} {away}**"
             )
 
-            st.write(
-                f"Sampled Score Probability: "
-                f"{score_prob * 100:.2f}%"
-            )
+            # --- VALUE BET FINDER LOGIC (V2.3) ---
+            st.divider()
+            st.markdown("### 💎 Value Bet Finder (Myanmar Format)")
 
+            h_price = odds.get("home_win_price")
+            a_price = odds.get("away_win_price")
+            draw_price = odds.get("draw_price")
+
+            value_found = False
+
+            # Home Win Value Check
+            if h_price and h_price > 1.0:
+                market_prob_home = 1.0 / h_price
+                ai_prob_home = probs["home_win"]
+                edge_home = (ai_prob_home - market_prob_home) * 100
+                myanmar_price_str = odds_price(h_price)
+
+                if (ai_prob_home * h_price) > 1.03:  # 3% margin edge threshold
+                    value_found = True
+                    st.success(
+                        f"🔥 **Value Bet Detected ({home} အနိုင်):**\n"
+                        f"- AI ခန့်မှန်းရာခိုင်နှုန်း: **{ai_prob_home * 100:.1f}%**\n"
+                        f"- ဈေးကွက်မှန်းဆချက်: **{market_prob_home * 100:.1f}%** (ဈေး: {myanmar_price_str})\n"
+                        f"- တန်ဖိုးအသာစီး (Edge): **+{edge_home:.1f}%** 👉 **{home} ဘက်တွင် ရင်းနှီးမြှုပ်နှံရန် တန်ဖိုးရှိသည်**"
+                    )
+
+            # Away Win Value Check
+            if a_price and a_price > 1.0:
+                market_prob_away = 1.0 / a_price
+                ai_prob_away = probs["away_win"]
+                edge_away = (ai_prob_away - market_prob_away) * 100
+                myanmar_price_str = odds_price(a_price)
+
+                if (ai_prob_away * a_price) > 1.03:
+                    value_found = True
+                    st.success(
+                        f"🔥 **Value Bet Detected ({away} အဝေးကွင်းအနိုင်):**\n"
+                        f"- AI ခန့်မှန်းရာခိုင်နှုန်း: **{ai_prob_away * 100:.1f}%**\n"
+                        f"- ဈေးကွက်မှန်းဆချက်: **{market_prob_away * 100:.1f}%** (ဈေး: {myanmar_price_str})\n"
+                        f"- တန်ဖိုးအသာစီး (Edge): **+{edge_away:.1f}%** 👉 **{away} ဘက်တွင် ရင်းနှီးမြှုပ်နှံရန် တန်ဖိုးရှိသည်**"
+                    )
+
+            if not value_found:
+                st.info("ℹ️ လက်တလော ပေါက်ကြေးများနှင့် AI ရာခိုင်နှုန်းအရ သိသာထင်ရှားသော Value Bet မတွေ့ရသေးပါ။ (ဈေးကွက် တည်ငြိမ်နေသည်)")
+
+            # =============================================
+            # O/U & PROBABILITIES
+            # =============================================
             predicted_total = score[0] + score[1]
-
-            st.write(
-                f"မှန်းဆဂိုးပေါင်း: {predicted_total} ဂိုး"
-            )
+            st.write(f"မှန်းဆဂိုးပေါင်း: {predicted_total} ဂိုး")
 
             if predicted_total > 2.5:
                 st.success("Score-based: Over 2.5")
@@ -914,70 +942,21 @@ for index, match in enumerate(fixtures):
 
             ou_df = pd.DataFrame({
                 "Market": [
-                    "Over 1.5",
-                    "Under 1.5",
-                    "Over 2.5",
-                    "Under 2.5",
-                    "Over 3.5",
-                    "Under 3.5",
+                    "Over 1.5", "Under 1.5",
+                    "Over 2.5", "Under 2.5",
+                    "Over 3.5", "Under 3.5",
                 ],
                 "Probability (%)": [
-                    probs["over15"] * 100,
-                    probs["under15"] * 100,
-                    probs["over25"] * 100,
-                    probs["under25"] * 100,
-                    probs["over35"] * 100,
-                    probs["under35"] * 100,
+                    probs["over15"] * 100, probs["under15"] * 100,
+                    probs["over25"] * 100, probs["under25"] * 100,
+                    probs["over35"] * 100, probs["under35"] * 100,
                 ],
             })
 
-            st.dataframe(
-                ou_df,
-                hide_index=True,
-                use_container_width=True,
-            )
-
-            st.markdown("### ⚽ Both Teams To Score")
-            st.write(f"BTTS Yes: {probs['btts_yes'] * 100:.2f}%")
-            st.write(f"BTTS No: {probs['btts_no'] * 100:.2f}%")
+            st.dataframe(ou_df, hide_index=True, use_container_width=True)
 
             st.markdown("### 🏆 1X2 Probability")
-            st.write(f"Home Win: {probs['home_win'] * 100:.2f}%")
-            st.write(f"Draw: {probs['draw'] * 100:.2f}%")
-            st.write(f"Away Win: {probs['away_win'] * 100:.2f}%")
-
-            st.divider()
-            st.markdown("### 🔢 Score Probability Matrix")
-
-            matrix_df = pd.DataFrame(
-                matrix * 100,
-                index=[
-                    f"Home {i}"
-                    for i in range(matrix.shape[0])
-                ],
-                columns=[
-                    f"Away {i}"
-                    for i in range(matrix.shape[1])
-                ],
-            )
-
-            st.dataframe(
-                matrix_df.style.format("{:.2f}%").background_gradient(
-                    cmap="RdYlGn"
-                ),
-                use_container_width=True,
-            )
-
-            if local_ou:
-                numbers = re.findall(r"\d+\.?\d*", local_ou)
-                if numbers:
-                    line = float(numbers[0])
-                    if predicted_total > line:
-                        st.info(f"Score-based Local O/U: Over {line}")
-                    elif predicted_total < line:
-                        st.info(f"Score-based Local O/U: Under {line}")
-                    else:
-                        st.info("Score နှင့် O/U Line တူညီနေသည်")
+            st.write(f"Home Win: {probs['home_win'] * 100:.2f}% | Draw: {probs['draw'] * 100:.2f}% | Away Win: {probs['away_win'] * 100:.2f}%")
 
             save_prediction(
                 match_id,
@@ -989,7 +968,6 @@ for index, match in enumerate(fixtures):
                 hl,
                 al,
             )
-
 
 # =========================================================
 # HISTORY & ACCURACY
@@ -1003,13 +981,7 @@ history = load_history()
 if history.empty:
     st.info("Prediction History မရှိသေးပါ။")
 else:
-    completed = history.dropna(
-        subset=[
-            "actual_home",
-            "actual_away",
-        ]
-    )
-
+    completed = history.dropna(subset=["actual_home", "actual_away"])
     total_predictions = len(history)
     completed_count = len(completed)
 
@@ -1018,33 +990,21 @@ else:
     col2.metric("Completed Matches", completed_count)
 
     if completed_count > 0:
-        exact_accuracy = (
-            completed["prediction_correct"].sum()
-            / completed_count
-        ) * 100
+        exact_accuracy = (completed["prediction_correct"].sum() / completed_count) * 100
         col3.metric("Exact Score Accuracy", f"{exact_accuracy:.2f}%")
     else:
         col3.metric("Exact Score Accuracy", "N/A")
 
-    st.dataframe(
-        history,
-        use_container_width=True,
-        hide_index=True,
-    )
+    st.dataframe(history, use_container_width=True, hide_index=True)
 
     csv_data = history.to_csv(index=False).encode("utf-8")
     st.download_button(
         "📥 Download Match History CSV",
         data=csv_data,
         file_name="football_prediction_history.csv",
-        mime="text/csv",
+        mime="text/css" if False else "text/csv",
     )
 
-# =========================================================
-# FOOTER
-# =========================================================
-
 st.divider()
-st.caption("Professional Football Predictor Dashboard V2.2")
-st.caption("Football-data.org | Odds API | Poisson | SQLite | Stable Monte Carlo")
-st.caption("Predictions are statistical estimates, not guaranteed match outcomes.")
+st.caption("Professional Football Predictor Dashboard V2.3 (Value Bet Finder Edition)")
+st.caption("Football-data.org | Odds API | Poisson | SQLite | Value Bet Analytics")
