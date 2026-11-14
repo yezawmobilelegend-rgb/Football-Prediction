@@ -14,6 +14,17 @@ st.set_page_config(
 
 st.title("⚽ ဘောလုံးပွဲစဉ်ခန့်မှန်းချက်နှင့် ပေါက်ကြေးနှိုင်းယှဉ်မှု Dashboard")
 st.markdown("---")
+# --- Streamlit Secrets မှ API Keys များကို အလိုအလျောက် ခေါ်ယူခြင်း ---
+try:
+    football_data_key = st.secrets["FOOTBALL_DATA_KEY"]
+    odds_api_key = st.secrets["ODDS_API_KEY"]
+except Exception as e:
+    st.error("⚠️ API Keys များ ချိတ်ဆက်ရာတွင် အမှားရှိနေပါသည်။ .streamlit/secrets.toml ဖိုင်ကို စစ်ဆေးပါ။")
+    st.stop()
+
+st.sidebar.header("⚙️ Dashboard Settings")
+st.sidebar.info("💡 API Keys များကို စနစ်အတွင်း လုံခြုံစွာ ချိတ်ဆက်ပြီးဖြစ်ပါသည်။")
+
 
 # --- Sidebar: API Configuration ---
 st.sidebar.header("🔑 API Settings")
