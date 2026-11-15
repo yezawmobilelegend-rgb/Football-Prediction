@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 # =========================================================
 
 st.set_page_config(
-    page_title="Professional Football Predictor V2.5",
+    page_title="Professional Football Predictor V2.4",
     page_icon="⚽",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -24,7 +24,7 @@ LOCAL_TZ = ZoneInfo("Asia/Yangon")  # မြန်မာစံတော်ချ
 
 LEAGUES = {
     "English Premier League (PL)": "PL",
-    "Italian Serie A (SA)": "SA",
+    "Italian Serie A (SA)": "SA",          # Added Serie A
     "Spanish La Liga (PD)": "PD",
     "German Bundesliga (BL1)": "BL1",
     "French Ligue 1 (FL1)": "FL1",
@@ -202,8 +202,9 @@ odds_key = st.sidebar.text_input(
     type="password",
 )
 
+# App Navigation Mode
 nav_mode = st.sidebar.radio(
-    "Navigation Mode",
+    "navigation Mode",
     ["🏟️ Selected League View", "🔥 Top 10 Best Matches of the Day", "📚 Match History & Accuracy"]
 )
 
@@ -282,29 +283,18 @@ def fetch_standings(league, api_key):
         return {}
 
     stats = {}
-    total_teams = 0
-    
-    # First pass to count total teams for relegation calculations
-    for table in data.get("standings", []):
-        if table.get("type") == "TOTAL":
-            total_teams = len(table.get("table", []))
-
     for table in data.get("standings", []):
         if table.get("type") != "TOTAL":
             continue
 
-        table_rows = table.get("table", [])
-        for idx, row in enumerate(table_rows):
+        for row in table.get("table", []):
             name = row["team"]["name"]
             points = row.get("points", 0)
             gd = row.get("goalDifference", 0)
-            position = idx + 1
 
             stats[name] = {
-                "position": position,
                 "points": points,
                 "gd": gd,
-                "total_teams": total_teams,
                 "elo": 1500 + points * 15 + gd * 5,
             }
 
@@ -332,10 +322,17 @@ def fetch_odds(api_key):
     return []
 
 
+# =========================================================
+# LIVE REFRESH
+# =========================================================
+
 if st.sidebar.button("🔄 Live Odds Refresh", use_container_width=True):
     fetch_odds.clear()
     st.rerun()
 
+# =========================================================
+# TEAM NAME MATCH
+# =========================================================
 
 def normalize_name(name):
     return re.sub(r"[^a-z0-9]", "", str(name).lower())
@@ -346,6 +343,10 @@ def team_match(a, b):
     b = normalize_name(b)
     return a == b or a in b or b in a
 
+
+# =========================================================
+# ODDS EXTRACTION
+# =========================================================
 
 def extract_match_odds(home, away, odds_data):
     result = {
@@ -441,6 +442,10 @@ def format_ou(line, price):
     return f"{line}{p}"
 
 
+# =========================================================
+# RECENT FORM: LAST 5 MATCHES
+# =========================================================
+
 @st.cache_data(ttl=1800)
 def fetch_recent_form(league, api_key):
     if not api_key:
@@ -519,8 +524,6 @@ def get_team_data(team, standings, form):
     })
 
     return {
-        "position": s.get("position", 10),
-        "total_teams": s.get("total_teams", 20),
         "elo": s.get("elo", 1500),
         "league_points": s.get("points", 0),
         "recent_points": f["points"],
@@ -532,7 +535,7 @@ def get_team_data(team, standings, form):
 
 
 # =========================================================
-# POISSON MODEL WITH MOTIVATION & INJURY ADJUSTMENTS (V2.5)
+# POISSON MODEL
 # =========================================================
 
 def poisson_pmf(lam, k):
@@ -543,7 +546,7 @@ def poisson_pmf(lam, k):
     )
 
 
-def calculate_lambdas(home_data, away_data, home_injuries=0, away_injuries=0):
+def calculate_lambdas(home_data, away_data):
     base_home = 1.65
     base_away = 1.15
 
@@ -556,30 +559,18 @@ def calculate_lambdas(home_data, away_data, home_injuries=0, away_injuries=0):
         - away_data["recent_points"]
     ) / 8
 
-    # --- MOTIVATION & PRESSURE MULTIPLIER ---
-    # Relegation zone pressure (bottom 3 teams) -> extra fight/motivation
-    home_motivation = 1.0
-    away_motivation = 1.0
-    
-    total_t = home_data["total_teams"]
-    if home_data["position"] >= total_t - 2:  # Relegation zone
-        home_motivation = 1.12
-    elif home_data["position"] <= 4:          # Top 4 / Title race
-        home_motivation = 1.08
-
-    if away_data["position"] >= total_t - 2:  
-        away_motivation = 1.15  # Away relegation fighters often fight hard
-    elif away_data["position"] <= 4:          
-        away_motivation = 1.08
-
     home_lambda = max(
         0.30,
-        (base_home + elo_diff * 0.45 + form_diff * 0.20) * home_motivation,
+        base_home
+        + elo_diff * 0.45
+        + form_diff * 0.20,
     )
 
     away_lambda = max(
         0.30,
-        (base_away - elo_diff * 0.45 - form_diff * 0.20) * away_motivation,
+        base_away
+        - elo_diff * 0.45
+        - form_diff * 0.20,
     )
 
     if home_data["recent_played"] > 0:
@@ -601,11 +592,6 @@ def calculate_lambdas(home_data, away_data, home_injuries=0, away_injuries=0):
             away_lambda * 0.60
             + away_avg * 0.40
         )
-
-    # --- INJURIES & SUSPENSIONS PENALTY ---
-    # Each key injury/suspension reduces goal expectancy by roughly 8-10%
-    home_lambda = home_lambda * (1.0 - (min(home_injuries, 5) * 0.08))
-    away_lambda = away_lambda * (1.0 - (min(away_injuries, 5) * 0.08))
 
     return (
         max(0.30, home_lambda),
@@ -687,12 +673,10 @@ def calculate_probabilities(matrix):
     }
 
 
-def predict_match(home_data, away_data, match_id, home_inj=0, away_inj=0):
+def predict_match(home_data, away_data, match_id):
     home_lambda, away_lambda = calculate_lambdas(
         home_data,
         away_data,
-        home_inj,
-        away_inj,
     )
 
     matrix = score_matrix(
@@ -738,8 +722,8 @@ def predict_match(home_data, away_data, match_id, home_inj=0, away_inj=0):
 # UI RENDERING & ROUTING
 # =========================================================
 
-st.title("⚽ Professional Football Predictor V2.5")
-st.markdown("အဆင့်မြင့် Poisson AI မော်ဒယ်၊ ၇ လိဂ်၊ **Table Motivation & Injury Penalties** ထည့်သွင်းထားသော စနစ်")
+st.title("⚽ Professional Football Predictor V2.4")
+st.markdown("အဆင့်မြင့် Poisson AI မော်ဒယ်၊ ၇ ခုသော ထိပ်တန်းလိဂ်များနှင့် **Top 10 Daily Confidence Matches** စနစ်")
 
 if nav_mode == "🏟️ Selected League View":
     fixtures = fetch_fixtures(league_code, fb_key)
@@ -772,7 +756,7 @@ if nav_mode == "🏟️ Selected League View":
             left, right = st.columns([1, 1.3])
 
             with left:
-                st.markdown("### 🌐 Live World Odds & Match Factors")
+                st.markdown("### 🌐 Live World Odds")
                 odds = extract_match_odds(home, away, odds_data)
 
                 home_hdp = format_handicap(home, odds["home_hdp"], odds["home_price"])
@@ -789,34 +773,23 @@ if nav_mode == "🏟️ Selected League View":
                     if under: st.write("Under:", under)
 
                 st.divider()
-                st.markdown("### 🚑 Key Injuries & Suspensions")
-                home_inj = st.number_input(f"{home} ဒဏ်ရာရ/ပယ် ကစားသမားဦးရေ", min_value=0, max_value=5, value=0, key=f"hinj_{match_id}")
-                away_inj = st.number_input(f"{away} ဒဏ်ရာရ/ပယ် ကစားသမားဦးရေ", min_value=0, max_value=5, value=0, key=f"ainj_{match_id}")
+                local_hdp = st.text_input("ဒေသတွင်း Handicap", key=f"hdp_{match_id}")
+                local_ou = st.text_input("ဒေသတွင်း O/U", key=f"ou_{match_id}")
 
             with right:
-                st.markdown("### 🤖 AI Statistical & Motivation Analysis")
+                st.markdown("### 🤖 AI Statistical & Value Analysis")
                 hd = get_team_data(home, standings, recent_form)
                 ad = get_team_data(away, standings, recent_form)
-                
-                prediction = predict_match(hd, ad, match_id, home_inj, away_inj)
+                prediction = predict_match(hd, ad, match_id)
 
                 hl = prediction["home_lambda"]
                 al = prediction["away_lambda"]
                 score = prediction["best_score"]
                 probs = prediction["probabilities"]
 
-                # Display Position & Motivation Status
-                h_status = "🛡️ ရိုးရိုး"
-                if hd['position'] >= hd['total_teams'] - 2: h_status = "🔥 တန်းဆင်းဇုန်ရုန်း"
-                elif hd['position'] <= 4: h_status = "🏆 ချန်ပီယံလိဂ်/ထိပ်ဆုံး"
-
-                a_status = "🛡️ ရိုးရိုး"
-                if ad['position'] >= ad['total_teams'] - 2: a_status = "🔥 တန်းဆင်းဇုန်ရုန်း"
-                elif ad['position'] <= 4: a_status = "🏆 ချန်ပီယံလိဂ်/ထိပ်ဆုံး"
-
-                st.markdown(f"**Standings Pos:** {home} (#{hd['position']} - {h_status}) | {away} (#{ad['position']} - {a_status})")
-                st.markdown(f"**Elo & Form:** {home} {hd['elo']:.0f} (`{hd['recent_form']}`) | {away} {ad['elo']:.0f} (`{ad['recent_form']}`)")
-                st.markdown(f"**Adjusted Expected Goals:** {hl:.2f} - {al:.2f}")
+                st.markdown(f"**Elo:** {home} {hd['elo']:.0f} | {away} {ad['elo']:.0f}")
+                st.markdown(f"**Recent Form:** {home} `{hd['recent_form']}` | {away} `{ad['recent_form']}`")
+                st.markdown(f"**Expected Goals:** {hl:.2f} - {al:.2f}")
                 st.success(f"🎯 **Predicted Score: {home} {score[0]} - {score[1]} {away}**")
 
                 st.divider()
@@ -851,13 +824,13 @@ if nav_mode == "🏟️ Selected League View":
 
 elif nav_mode == "🔥 Top 10 Best Matches of the Day":
     st.subheader("🔥 Top 10 Most Probable Predicted Matches Across All 7 Leagues")
-    st.markdown("လိဂ် (၇) ခုလုံးမှ လာမည့် ၇ ရက်အတွင်း ပွဲစဉ်များကို စုစည်းစစ်ဆေးကာ Standings ဖိအားနှင့် အနိုင်ရလိုစိတ် (Motivation) များကို ထည့်သွင်းတွက်ချက်ထားသော Top 10 ပွဲစဉ်များ။")
+    st.markdown("လိဂ် (၇) ခုလုံးမှ လာမည့် ၇ ရက်အတွင်း ပွဲစဉ်များကို စုစည်းစစ်ဆေးပြီး အမြင့်မားဆုံး ယုံကြည်ရမှုနှင့် အကောင်းဆုံးအနိုင်ခန့်မှန်းချက်ရှိသော ပွဲစဉ် (၁၀) ခုကို အလိုအလျောက် ရွေးထုတ်ပေးထားပါသည်။")
 
     if not fb_key:
         st.warning("ကျေးဇူးပြု၍ Sidebar တွင် Football-data.org API Key ထည့်သွင်းပေးပါ။")
     else:
         all_candidate_matches = []
-        with st.spinner("လိဂ် ၇ ခုလုံးမှ ပွဲစဉ်များနှင့် အဆင့်မြင့် AI တွက်ချက်မှုများကို လုပ်ဆောင်နေပါသည်..."):
+        with st.spinner("လိဂ် ၇ ခုလုံးမှ ပွဲစဉ်များနှင့် AI ခန့်မှန်းချက်များကို တွက်ထုတ်နေပါသည်..."):
             for l_name, l_code in LEAGUES.items():
                 fxts = fetch_fixtures(l_code, fb_key)
                 stnds = fetch_standings(l_code, fb_key)
@@ -872,9 +845,10 @@ elif nav_mode == "🔥 Top 10 Best Matches of the Day":
 
                     h_dat = get_team_data(h_team, stnds, rc_form)
                     a_dat = get_team_data(a_team, stnds, rc_form)
-                    pred = predict_match(h_dat, a_dat, m_id, 0, 0)
+                    pred = predict_match(h_dat, a_dat, m_id)
                     probs = pred["probabilities"]
 
+                    # Confidence score metric calculation (Max probability of 1X2 or highest score certainty)
                     max_1x2_prob = max(probs["home_win"], probs["draw"], probs["away_win"])
                     best_sc = pred["best_score"]
                     sc_prob = pred["best_probability"]
@@ -932,4 +906,4 @@ elif nav_mode == "📚 Match History & Accuracy":
         )
 
 st.divider()
-st.caption("Professional Football Predictor Dashboard V2.5 (Motivation & Injuries Edition)")
+st.caption("Professional Football Predictor Dashboard V2.4 (7 Leagues + Top 10 Daily Picks Edition)")
