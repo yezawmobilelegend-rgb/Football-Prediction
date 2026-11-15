@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 # =========================================================
 
 st.set_page_config(
-    page_title="Professional Football Predictor V2.4",
+    page_title="Professional Football Predictor V2.5",
     page_icon="⚽",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -24,7 +24,7 @@ LOCAL_TZ = ZoneInfo("Asia/Yangon")  # မြန်မာစံတော်ချ
 
 LEAGUES = {
     "English Premier League (PL)": "PL",
-    "Italian Serie A (SA)": "SA",          # Added Serie A
+    "Italian Serie A (SA)": "SA",
     "Spanish La Liga (PD)": "PD",
     "German Bundesliga (BL1)": "BL1",
     "French Ligue 1 (FL1)": "FL1",
@@ -108,25 +108,15 @@ def update_actual_results(league_code, api_key):
     if not api_key:
         return
 
-    url = (
-        f"https://api.football-data.org/v4/"
-        f"competitions/{league_code}/matches"
-    )
+    url = f"https://api.football-data.org/v4/competitions/{league_code}/matches"
     headers = {"X-Auth-Token": api_key}
 
     try:
-        response = requests.get(
-            url,
-            headers=headers,
-            params={"status": "FINISHED"},
-            timeout=20,
-        )
-
+        response = requests.get(url, headers=headers, params={"status": "FINISHED"}, timeout=20)
         if response.status_code != 200:
             return
 
         matches = response.json().get("matches", [])
-
         with db_connection() as conn:
             for match in matches:
                 score = match.get("score", {}).get("fullTime", {})
@@ -137,46 +127,24 @@ def update_actual_results(league_code, api_key):
                     continue
 
                 match_id = str(match["id"])
-
-                row = conn.execute("""
-                    SELECT predicted_home, predicted_away
-                    FROM predictions
-                    WHERE match_id = ?
-                """, (match_id,)).fetchone()
-
+                row = conn.execute("SELECT predicted_home, predicted_away FROM predictions WHERE match_id = ?", (match_id,)).fetchone()
                 if row is None:
                     continue
 
-                correct = int(
-                    row[0] == actual_home
-                    and row[1] == actual_away
-                )
-
+                correct = int(row[0] == actual_home and row[1] == actual_away)
                 conn.execute("""
                     UPDATE predictions
-                    SET actual_home = ?,
-                        actual_away = ?,
-                        prediction_correct = ?
+                    SET actual_home = ?, actual_away = ?, prediction_correct = ?
                     WHERE match_id = ?
-                """, (
-                    actual_home,
-                    actual_away,
-                    correct,
-                    match_id,
-                ))
-
+                """, (actual_home, actual_away, correct, match_id))
             conn.commit()
-
     except Exception as e:
         print("Actual Result Update Error:", e)
 
 
 def load_history():
     with db_connection() as conn:
-        return pd.read_sql_query(
-            "SELECT * FROM predictions ORDER BY match_date DESC",
-            conn,
-        )
+        return pd.read_sql_query("SELECT * FROM predictions ORDER BY match_date DESC", conn)
 
 
 initialize_database()
@@ -190,29 +158,16 @@ st.sidebar.header("🔑 API Settings")
 fb_default = st.secrets.get("FOOTBALL_API_KEY", "")
 odds_default = st.secrets.get("ODDS_API_KEY", "")
 
-fb_key = st.sidebar.text_input(
-    "Football-data.org API Key",
-    value=fb_default,
-    type="password",
-)
+fb_key = st.sidebar.text_input("Football-data.org API Key", value=fb_default, type="password")
+odds_key = st.sidebar.text_input("Odds-api.io API Key", value=odds_default, type="password")
 
-odds_key = st.sidebar.text_input(
-    "Odds-api.io API Key",
-    value=odds_default,
-    type="password",
-)
-
-# App Navigation Mode
 nav_mode = st.sidebar.radio(
-    "navigation Mode",
+    "Navigation Mode",
     ["🏟️ Selected League View", "🔥 Top 10 Best Matches of the Day", "📚 Match History & Accuracy"]
 )
 
 if nav_mode == "🏟️ Selected League View":
-    selected_league = st.sidebar.selectbox(
-        "League",
-        list(LEAGUES.keys()),
-    )
+    selected_league = st.sidebar.selectbox("League", list(LEAGUES.keys()))
     league_code = LEAGUES[selected_league]
 
 st.sidebar.divider()
@@ -224,12 +179,7 @@ st.sidebar.caption("Odds မရရှိပါက Default Odds မထည့်�
 
 def api_get(url, headers=None, params=None):
     try:
-        response = requests.get(
-            url,
-            headers=headers,
-            params=params,
-            timeout=20,
-        )
+        response = requests.get(url, headers=headers, params=params, timeout=20)
         if response.status_code == 200:
             return response.json()
         return None
@@ -241,14 +191,11 @@ def api_get(url, headers=None, params=None):
 def fetch_fixtures(league, api_key):
     if not api_key:
         return []
-
     data = api_get(
-        f"https://api.football-data.org/v4/"
-        f"competitions/{league}/matches",
+        f"https://api.football-data.org/v4/competitions/{league}/matches",
         headers={"X-Auth-Token": api_key},
         params={"status": "SCHEDULED"},
     )
-
     if not data:
         return []
 
@@ -257,14 +204,9 @@ def fetch_fixtures(league, api_key):
     result = []
 
     for match in data.get("matches", []):
-        match_date = datetime.strptime(
-            match["utcDate"],
-            "%Y-%m-%dT%H:%M:%SZ",
-        ).replace(tzinfo=timezone.utc)
-
+        match_date = datetime.strptime(match["utcDate"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
         if now <= match_date <= end:
             result.append(match)
-
     return result
 
 
@@ -272,13 +214,10 @@ def fetch_fixtures(league, api_key):
 def fetch_standings(league, api_key):
     if not api_key:
         return {}
-
     data = api_get(
-        f"https://api.football-data.org/v4/"
-        f"competitions/{league}/standings",
+        f"https://api.football-data.org/v4/competitions/{league}/standings",
         headers={"X-Auth-Token": api_key},
     )
-
     if not data:
         return {}
 
@@ -287,17 +226,20 @@ def fetch_standings(league, api_key):
         if table.get("type") != "TOTAL":
             continue
 
-        for row in table.get("table", []):
+        total_teams = len(table.get("table", []))
+        for idx, row in enumerate(table.get("table", [])):
             name = row["team"]["name"]
             points = row.get("points", 0)
             gd = row.get("goalDifference", 0)
+            position = idx + 1  # 1 is top, total_teams is bottom
 
             stats[name] = {
+                "position": position,
+                "total_teams": total_teams,
                 "points": points,
                 "gd": gd,
                 "elo": 1500 + points * 15 + gd * 5,
             }
-
     return stats
 
 
@@ -305,16 +247,10 @@ def fetch_standings(league, api_key):
 def fetch_odds(api_key):
     if not api_key:
         return []
-
     data = api_get(
         "https://api.odds-api.io/v1/odds",
-        params={
-            "apiKey": api_key,
-            "sport": "soccer",
-            "region": "eu",
-        },
+        params={"apiKey": api_key, "sport": "soccer", "region": "eu"},
     )
-
     if isinstance(data, list):
         return data
     if isinstance(data, dict):
@@ -322,17 +258,10 @@ def fetch_odds(api_key):
     return []
 
 
-# =========================================================
-# LIVE REFRESH
-# =========================================================
-
 if st.sidebar.button("🔄 Live Odds Refresh", use_container_width=True):
     fetch_odds.clear()
     st.rerun()
 
-# =========================================================
-# TEAM NAME MATCH
-# =========================================================
 
 def normalize_name(name):
     return re.sub(r"[^a-z0-9]", "", str(name).lower())
@@ -344,35 +273,20 @@ def team_match(a, b):
     return a == b or a in b or b in a
 
 
-# =========================================================
-# ODDS EXTRACTION
-# =========================================================
-
 def extract_match_odds(home, away, odds_data):
     result = {
-        "home_hdp": None,
-        "home_price": None,
-        "away_hdp": None,
-        "away_price": None,
-        "over_line": None,
-        "over_price": None,
-        "under_line": None,
-        "under_price": None,
-        "home_win_price": None,
-        "draw_price": None,
-        "away_win_price": None,
+        "home_hdp": None, "home_price": None,
+        "away_hdp": None, "away_price": None,
+        "over_line": None, "over_price": None,
+        "under_line": None, "under_price": None,
+        "home_win_price": None, "draw_price": None, "away_win_price": None,
     }
-
     if not odds_data:
         return result
 
     for event in odds_data:
-        if not (
-            team_match(home, event.get("home_team", ""))
-            and team_match(away, event.get("away_team", ""))
-        ):
+        if not (team_match(home, event.get("home_team", "")) and team_match(away, event.get("away_team", ""))):
             continue
-
         for bookmaker in event.get("bookmakers", []):
             for market in bookmaker.get("markets", []):
                 key = market.get("key", "")
@@ -403,7 +317,6 @@ def extract_match_odds(home, away, odds_data):
                         elif "draw" in name or "tie" in name:
                             result["draw_price"] = price
         return result
-
     return result
 
 
@@ -442,32 +355,23 @@ def format_ou(line, price):
     return f"{line}{p}"
 
 
-# =========================================================
-# RECENT FORM: LAST 5 MATCHES
-# =========================================================
-
 @st.cache_data(ttl=1800)
 def fetch_recent_form(league, api_key):
     if not api_key:
         return {}
-
     data = api_get(
-        f"https://api.football-data.org/v4/"
-        f"competitions/{league}/matches",
+        f"https://api.football-data.org/v4/competitions/{league}/matches",
         headers={"X-Auth-Token": api_key},
         params={"status": "FINISHED"},
     )
-
     if not data:
         return {}
 
     team_matches = {}
-
     for match in data.get("matches", []):
         score = match.get("score", {}).get("fullTime", {})
         h = score.get("home")
         a = score.get("away")
-
         if h is None or a is None:
             continue
 
@@ -475,55 +379,29 @@ def fetch_recent_form(league, api_key):
         away = match["awayTeam"]["name"]
         date = match["utcDate"]
 
-        team_matches.setdefault(home, []).append({
-            "date": date,
-            "points": 3 if h > a else 1 if h == a else 0,
-            "gf": h,
-            "ga": a,
-        })
-
-        team_matches.setdefault(away, []).append({
-            "date": date,
-            "points": 3 if a > h else 1 if a == h else 0,
-            "gf": a,
-            "ga": h,
-        })
+        team_matches.setdefault(home, []).append({"date": date, "points": 3 if h > a else 1 if h == a else 0, "gf": h, "ga": a})
+        team_matches.setdefault(away, []).append({"date": date, "points": 3 if a > h else 1 if a == h else 0, "gf": a, "ga": h})
 
     form = {}
     for team, games in team_matches.items():
-        games = sorted(
-            games,
-            key=lambda x: x["date"],
-            reverse=True,
-        )[:5]
-
+        games = sorted(games, key=lambda x: x["date"], reverse=True)[:5]
         form[team] = {
             "points": sum(g["points"] for g in games),
             "gf": sum(g["gf"] for g in games),
             "ga": sum(g["ga"] for g in games),
             "played": len(games),
-            "form": "".join(
-                "W" if g["points"] == 3
-                else "D" if g["points"] == 1
-                else "L"
-                for g in games
-            ),
+            "form": "".join("W" if g["points"] == 3 else "D" if g["points"] == 1 else "L" for g in games),
         }
-
     return form
 
 
 def get_team_data(team, standings, form):
     s = standings.get(team, {})
-    f = form.get(team, {
-        "points": 0,
-        "gf": 0,
-        "ga": 0,
-        "played": 0,
-        "form": "N/A",
-    })
+    f = form.get(team, {"points": 0, "gf": 0, "ga": 0, "played": 0, "form": "N/A"})
 
     return {
+        "position": s.get("position", 10),
+        "total_teams": s.get("total_teams", 20),
         "elo": s.get("elo", 1500),
         "league_points": s.get("points", 0),
         "recent_points": f["points"],
@@ -535,99 +413,81 @@ def get_team_data(team, standings, form):
 
 
 # =========================================================
-# POISSON MODEL
+# POISSON MODEL WITH STAKES / MOTIVATION (V2.5 Feature)
 # =========================================================
 
 def poisson_pmf(lam, k):
-    return (
-        math.exp(-lam)
-        * lam**k
-        / math.factorial(k)
-    )
+    return math.exp(-lam) * lam**k / math.factorial(k)
+
+
+def calculate_motivation_multiplier(team_data):
+    """
+    Computes a motivation multiplier based on league position stakes:
+    - Title / Top 4 race (Top positions): High motivation (+5% to +10%)
+    - Relegation battle (Bottom 3-4 positions): High desperation/motivation (+8% to +12%)
+    - Mid-table with no stakes: Standard or slight dip
+    """
+    pos = team_data["position"]
+    total = team_data["total_teams"]
+    
+    # Relegation zone or near bottom (e.g., bottom 4)
+    if pos >= total - 3:
+        return 1.10  # 10% boost in urgency/attacking intensity
+    # Title / Champions League contenders (Top 4)
+    elif pos <= 4:
+        return 1.08  # 8% boost
+    return 1.00
 
 
 def calculate_lambdas(home_data, away_data):
     base_home = 1.65
     base_away = 1.15
 
-    elo_diff = (
-        home_data["elo"] - away_data["elo"]
-    ) / 200
+    elo_diff = (home_data["elo"] - away_data["elo"]) / 200
+    form_diff = (home_data["recent_points"] - away_data["recent_points"]) / 8
 
-    form_diff = (
-        home_data["recent_points"]
-        - away_data["recent_points"]
-    ) / 8
+    # Apply Motivation Multipliers (V2.5 Feature)
+    home_motivation = calculate_motivation_multiplier(home_data)
+    away_motivation = calculate_motivation_multiplier(away_data)
 
     home_lambda = max(
         0.30,
-        base_home
-        + elo_diff * 0.45
-        + form_diff * 0.20,
+        (base_home + elo_diff * 0.45 + form_diff * 0.20) * home_motivation,
     )
 
     away_lambda = max(
         0.30,
-        base_away
-        - elo_diff * 0.45
-        - form_diff * 0.20,
+        (base_away - elo_diff * 0.45 - form_diff * 0.20) * away_motivation,
     )
 
     if home_data["recent_played"] > 0:
-        home_avg = (
-            home_data["recent_gf"]
-            / home_data["recent_played"]
-        )
-        home_lambda = (
-            home_lambda * 0.60
-            + home_avg * 0.40
-        )
+        home_avg = home_data["recent_gf"] / home_data["recent_played"]
+        home_lambda = home_lambda * 0.60 + home_avg * 0.40
 
     if away_data["recent_played"] > 0:
-        away_avg = (
-            away_data["recent_gf"]
-            / away_data["recent_played"]
-        )
-        away_lambda = (
-            away_lambda * 0.60
-            + away_avg * 0.40
-        )
+        away_avg = away_data["recent_gf"] / away_data["recent_played"]
+        away_lambda = away_lambda * 0.60 + away_avg * 0.40
 
-    return (
-        max(0.30, home_lambda),
-        max(0.30, away_lambda),
-    )
+    return max(0.30, home_lambda), max(0.30, away_lambda)
 
 
 def score_matrix(home_lambda, away_lambda, max_goals=6):
-    matrix = np.zeros(
-        (max_goals + 1, max_goals + 1)
-    )
-
+    matrix = np.zeros((max_goals + 1, max_goals + 1))
     for h in range(max_goals + 1):
         for a in range(max_goals + 1):
-            matrix[h, a] = (
-                poisson_pmf(home_lambda, h)
-                * poisson_pmf(away_lambda, a)
-            )
-
+            matrix[h, a] = poisson_pmf(home_lambda, h) * poisson_pmf(away_lambda, a)
     return matrix
 
 
 def calculate_probabilities(matrix):
     max_goals = matrix.shape[0] - 1
-    home_win = 0
-    draw = 0
-    away_win = 0
+    home_win, draw, away_win = 0, 0, 0
 
     for h in range(max_goals + 1):
         for a in range(max_goals + 1):
-            if h > a:
-                home_win += matrix[h, a]
-            elif h == a:
-                draw += matrix[h, a]
-            else:
-                away_win += matrix[h, a]
+            if h > a: home_win += matrix[h, a]
+            elif h == a: draw += matrix[h, a]
+            else: away_win += matrix[h, a]
 
     total_probs = {}
     for total in range(2 * max_goals + 1):
@@ -639,72 +499,33 @@ def calculate_probabilities(matrix):
         total_probs[total] = probability
 
     def over_probability(line):
-        return sum(
-            p for goals, p in total_probs.items()
-            if goals > line
-        )
+        return sum(p for goals, p in total_probs.items() if goals > line)
 
     def under_probability(line):
-        return sum(
-            p for goals, p in total_probs.items()
-            if goals < line
-        )
+        return sum(p for goals, p in total_probs.items() if goals < line)
 
-    btts_yes = sum(
-        matrix[h, a]
-        for h in range(1, max_goals + 1)
-        for a in range(1, max_goals + 1)
-    )
+    btts_yes = sum(matrix[h, a] for h in range(1, max_goals + 1) for a in range(1, max_goals + 1))
     btts_no = 1 - btts_yes
 
     return {
-        "home_win": home_win,
-        "draw": draw,
-        "away_win": away_win,
-        "over15": over_probability(1.5),
-        "under15": under_probability(1.5),
-        "over25": over_probability(2.5),
-        "under25": under_probability(2.5),
-        "over35": over_probability(3.5),
-        "under35": under_probability(3.5),
-        "btts_yes": btts_yes,
-        "btts_no": btts_no,
-        "total_probs": total_probs,
+        "home_win": home_win, "draw": draw, "away_win": away_win,
+        "over25": over_probability(2.5), "under25": under_probability(2.5),
+        "btts_yes": btts_yes, "total_probs": total_probs,
     }
 
 
 def predict_match(home_data, away_data, match_id):
-    home_lambda, away_lambda = calculate_lambdas(
-        home_data,
-        away_data,
-    )
-
-    matrix = score_matrix(
-        home_lambda,
-        away_lambda,
-        max_goals=6,
-    )
+    home_lambda, away_lambda = calculate_lambdas(home_data, away_data)
+    matrix = score_matrix(home_lambda, away_lambda, max_goals=6)
 
     flat_matrix = matrix.flatten()
     flat_matrix /= flat_matrix.sum()
 
     seed_val = abs(hash(str(match_id))) % (2**32)
     rng = np.random.default_rng(seed_val)
-
-    chosen_index = rng.choice(
-        len(flat_matrix),
-        p=flat_matrix,
-    )
-    sampled_score = np.unravel_index(
-        chosen_index,
-        matrix.shape,
-    )
-
-    best_score = np.unravel_index(
-        np.argmax(matrix),
-        matrix.shape,
-    )
-
+    chosen_index = rng.choice(len(flat_matrix), p=flat_matrix)
+    sampled_score = np.unravel_index(chosen_index, matrix.shape)
+    best_score = np.unravel_index(np.argmax(matrix), matrix.shape)
     probs = calculate_probabilities(matrix)
 
     return {
@@ -722,8 +543,8 @@ def predict_match(home_data, away_data, match_id):
 # UI RENDERING & ROUTING
 # =========================================================
 
-st.title("⚽ Professional Football Predictor V2.4")
-st.markdown("အဆင့်မြင့် Poisson AI မော်ဒယ်၊ ၇ ခုသော ထိပ်တန်းလိဂ်များနှင့် **Top 10 Daily Confidence Matches** စနစ်")
+st.title("⚽ Professional Football Predictor V2.5")
+st.markdown("Poisson AI မော်ဒယ် + **Points Requirement & Relegation Stakes Motivation Boost** စနစ်")
 
 if nav_mode == "🏟️ Selected League View":
     fixtures = fetch_fixtures(league_code, fb_key)
@@ -772,12 +593,8 @@ if nav_mode == "🏟️ Selected League View":
                     if over: st.write("Over:", over)
                     if under: st.write("Under:", under)
 
-                st.divider()
-                local_hdp = st.text_input("ဒေသတွင်း Handicap", key=f"hdp_{match_id}")
-                local_ou = st.text_input("ဒေသတွင်း O/U", key=f"ou_{match_id}")
-
             with right:
-                st.markdown("### 🤖 AI Statistical & Value Analysis")
+                st.markdown("### 🤖 AI Statistical & Stakes Analysis")
                 hd = get_team_data(home, standings, recent_form)
                 ad = get_team_data(away, standings, recent_form)
                 prediction = predict_match(hd, ad, match_id)
@@ -787,50 +604,26 @@ if nav_mode == "🏟️ Selected League View":
                 score = prediction["best_score"]
                 probs = prediction["probabilities"]
 
-                st.markdown(f"**Elo:** {home} {hd['elo']:.0f} | {away} {ad['elo']:.0f}")
-                st.markdown(f"**Recent Form:** {home} `{hd['recent_form']}` | {away} `{ad['recent_form']}`")
-                st.markdown(f"**Expected Goals:** {hl:.2f} - {al:.2f}")
+                # Display Stakes / Urgency Status
+                home_status = "🔴 တန်းဆင်းဇုန်ရုန်းကန်နေရ" if hd["position"] >= hd["total_teams"] - 3 else "🔵 ချန်ပီယံ/ထိပ်ဆုံးလုနေရ" if hd["position"] <= 4 else "⚪ ပုံမှန်အဆင့်"
+                away_status = "🔴 တန်းဆင်းဇုန်ရုန်းကန်နေရ" if ad["position"] >= ad["total_teams"] - 3 else "🔵 ချန်ပီယံ/ထိပ်ဆုံးလုနေရ" if ad["position"] <= 4 else "⚪ ပုံမှန်အဆင့်"
+
+                st.markdown(f"**Standings Position:** {home} (Pos: {hd['position']}) | {away} (Pos: {ad['position']})")
+                st.markdown(f"**Stakes / Urgency:** {home}: {home_status} | {away}: {away_status}")
+                st.markdown(f"**Expected Goals (with Motivation):** {hl:.2f} - {al:.2f}")
                 st.success(f"🎯 **Predicted Score: {home} {score[0]} - {score[1]} {away}**")
-
-                st.divider()
-                st.markdown("### 💎 Value Bet Finder")
-                h_price = odds.get("home_win_price")
-                a_price = odds.get("away_win_price")
-                value_found = False
-
-                if h_price and h_price > 1.0:
-                    market_prob_home = 1.0 / h_price
-                    ai_prob_home = probs["home_win"]
-                    edge_home = (ai_prob_home - market_prob_home) * 100
-                    if (ai_prob_home * h_price) > 1.03:
-                        value_found = True
-                        st.success(f"🔥 **Value Bet ({home} အနိုင်):** Edge +{edge_home:.1f}%")
-
-                if a_price and a_price > 1.0:
-                    market_prob_away = 1.0 / a_price
-                    ai_prob_away = probs["away_win"]
-                    edge_away = (ai_prob_away - market_prob_away) * 100
-                    if (ai_prob_away * a_price) > 1.03:
-                        value_found = True
-                        st.success(f"🔥 **Value Bet ({away} အဝေးကွင်းအနိုင်):** Edge +{edge_away:.1f}%")
-
-                if not value_found:
-                    st.info("ℹ️ သိသာထင်ရှားသော Value Bet မတွေ့ရသေးပါ။")
-
-                predicted_total = score[0] + score[1]
-                st.write(f"မှန်းဆဂိုးပေါင်း: {predicted_total} ဂိုး")
 
                 save_prediction(match_id, league_code, match_date_str, home, away, score, hl, al)
 
 elif nav_mode == "🔥 Top 10 Best Matches of the Day":
-    st.subheader("🔥 Top 10 Most Probable Predicted Matches Across All 7 Leagues")
-    st.markdown("လိဂ် (၇) ခုလုံးမှ လာမည့် ၇ ရက်အတွင်း ပွဲစဉ်များကို စုစည်းစစ်ဆေးပြီး အမြင့်မားဆုံး ယုံကြည်ရမှုနှင့် အကောင်းဆုံးအနိုင်ခန့်မှန်းချက်ရှိသော ပွဲစဉ် (၁၀) ခုကို အလိုအလျောက် ရွေးထုတ်ပေးထားပါသည်။")
+    st.subheader("🔥 Top 10 Most Probable Predicted Matches (Stakes-Aware)")
+    st.markdown("လိဂ် (၇) ခုလုံးမှ အချက်အလက်များ၊ အမှတ်လိုအပ်ချက်နှင့် တန်းဆင်းဇုန်ဖိအားများကို ထည့်သွင်းတွက်ချက်ထားသော ထိပ်တန်းယုံကြည်ရဆုံး (၁၀) ပွဲ။")
 
     if not fb_key:
         st.warning("ကျေးဇူးပြု၍ Sidebar တွင် Football-data.org API Key ထည့်သွင်းပေးပါ။")
     else:
         all_candidate_matches = []
-        with st.spinner("လိဂ် ၇ ခုလုံးမှ ပွဲစဉ်များနှင့် AI ခန့်မှန်းချက်များကို တွက်ထုတ်နေပါသည်..."):
+        with st.spinner("လိဂ် ၇ ခုလုံးမှ ပွဲစဉ်များနှင့် Stakes ဖိအားများကို တွက်ထုတ်နေပါသည်..."):
             for l_name, l_code in LEAGUES.items():
                 fxts = fetch_fixtures(l_code, fb_key)
                 stnds = fetch_standings(l_code, fb_key)
@@ -848,7 +641,6 @@ elif nav_mode == "🔥 Top 10 Best Matches of the Day":
                     pred = predict_match(h_dat, a_dat, m_id)
                     probs = pred["probabilities"]
 
-                    # Confidence score metric calculation (Max probability of 1X2 or highest score certainty)
                     max_1x2_prob = max(probs["home_win"], probs["draw"], probs["away_win"])
                     best_sc = pred["best_score"]
                     sc_prob = pred["best_probability"]
@@ -860,9 +652,6 @@ elif nav_mode == "🔥 Top 10 Best Matches of the Day":
                         "Match": f"{h_team} vs {a_team}",
                         "Predicted Score": f"{h_team} {best_sc[0]} - {best_sc[1]} {a_team}",
                         "Confidence (%)": round(confidence_score * 100, 2),
-                        "Home Win %": round(probs["home_win"] * 100, 1),
-                        "Draw %": round(probs["draw"] * 100, 1),
-                        "Away Win %": round(probs["away_win"] * 100, 1),
                     })
 
         if not all_candidate_matches:
@@ -870,14 +659,12 @@ elif nav_mode == "🔥 Top 10 Best Matches of the Day":
         else:
             df_all = pd.DataFrame(all_candidate_matches)
             df_top10 = df_all.sort_values(by="Confidence (%)", ascending=False).head(10)
-            
-            st.success(f"အောင်မြင်စွာ စစ်ထုတ်ပြီးစီးပါပြီ (စုစုပေါင်း ပွဲစဉ် {len(df_all)} ပွဲမှ ထိပ်တန်း ၁၀ ပွဲ)")
+            st.success(f"အောင်မြင်စွာ စစ်ထုတ်ပြီးစီးပါပြီ (ထိပ်တန်း ၁၀ ပွဲ)")
             st.dataframe(df_top10, hide_index=True, use_container_width=True)
 
 elif nav_mode == "📚 Match History & Accuracy":
     st.header("📚 Match History & Prediction Accuracy")
     history = load_history()
-
     if history.empty:
         st.info("Prediction History မရှိသေးပါ။")
     else:
@@ -896,14 +683,8 @@ elif nav_mode == "📚 Match History & Accuracy":
             col3.metric("Exact Score Accuracy", "N/A")
 
         st.dataframe(history, use_container_width=True, hide_index=True)
-
         csv_data = history.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "📥 Download Match History CSV",
-            data=csv_data,
-            file_name="football_prediction_history.csv",
-            mime="text/csv",
-        )
+        st.download_button("📥 Download Match History CSV", data=csv_data, file_name="football_prediction_history.csv", mime="text/csv")
 
 st.divider()
-st.caption("Professional Football Predictor Dashboard V2.4 (7 Leagues + Top 10 Daily Picks Edition)")
+st.caption("Professional Football Predictor Dashboard V2.5 (Motivation & Stakes Edition)")
