@@ -13,13 +13,13 @@ from zoneinfo import ZoneInfo
 # =========================================================
 
 st.set_page_config(
-    page_title="Professional Football Predictor V2.9",
+    page_title="Professional Football Predictor V2.10",
     page_icon="⚽",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-DB_PATH = "football_history_v29.db"
+DB_PATH = "football_history_v210.db"
 LOCAL_TZ = ZoneInfo("Asia/Yangon")  # မြန်မာစံတော်ချိန်
 
 LEAGUES = {
@@ -315,7 +315,7 @@ def get_h2h_adjustment(home_team, away_team, league, api_key):
 
 
 # =========================================================
-# POISSON MODEL & BALANCED ELITE TUNING (MAX GOALS = 8)
+# POISSON MODEL & PROBABILISTIC SAMPLING (MAX GOALS = 8)
 # =========================================================
 
 def poisson_pmf(lam, k):
@@ -341,7 +341,6 @@ def calculate_lambdas(home_data, away_data, h2h_adj, elo_diff, home_elo, away_el
     home_fatigue = 0.90 if home_data["rest_days"] < 4 else 1.0
     away_fatigue = 0.90 if away_data["rest_days"] < 4 else 1.0
 
-    # Balanced Elite Team Multiplier (1.10 သို့ လျှော့ချထားပြီး Weight ကို 0.4 သို့ ပြန်ချိန်ထားသည်)
     elite_home_boost = 1.10 if (home_elo > 1700 or home_data["xg_for"] > 2.0) else 1.0
     elite_away_boost = 1.10 if (away_elo > 1700 or away_data["xg_for"] > 2.0) else 1.0
 
@@ -411,15 +410,21 @@ def predict_match(home_data, away_data, h2h_adj, elo_diff, home_elo, away_elo, m
     flat_sum = flat.sum()
     if flat_sum > 0:
         flat /= flat_sum
+    else:
+        flat = np.ones_like(flat) / len(flat)
 
-    best_score = np.unravel_index(np.argmax(matrix), matrix.shape)
+    # Probabilistic Weighted Sampling (ရလဒ်များ ကွဲပြားစုံလင်စေရန် rng.choice ကို ပြန်လည်အသုံးပြုသည်)
+    seed_val = abs(hash(str(match_id))) % (2**32)
+    rng = np.random.default_rng(seed_val)
+    chosen_index = rng.choice(len(flat), p=flat)
+    sampled_score = np.unravel_index(chosen_index, matrix.shape)
+    
     probs = calculate_probabilities(matrix)
 
     return {
         "home_lambda": hl,
         "away_lambda": al,
-        "best_score": best_score,
-        "best_probability": matrix[best_score],
+        "best_score": sampled_score,
         "probabilities": probs,
     }
 
@@ -451,8 +456,8 @@ def parse_myanmar_price(price_str):
 # UI RENDERING & ROUTING
 # =========================================================
 
-st.title("⚽ Professional Football Predictor V2.9")
-st.markdown("အဆင့်မြင့် **Balanced Elite Boost, Argmax Score & Local Myanmar Odds** စနစ်")
+st.title("⚽ Professional Football Predictor V2.10")
+st.markdown("အဆင့်မြင့် **Probabilistic Sampling, Balanced Elite Boost & Local Myanmar Odds** စနစ်")
 
 if nav_mode == "🏟️ Selected League View":
     fixtures = fetch_fixtures(league_code, fb_key)
@@ -488,7 +493,7 @@ if nav_mode == "🏟️ Selected League View":
                 local_ou_price = st.text_input("O/U ဈေး (ဥပမာ +40, -90, ဆုံ)", key=f"ou_price_{match_id}")
 
             with right:
-                st.markdown("### 🤖 Advanced AI Match Prediction (Balanced Edition)")
+                st.markdown("### 🤖 Advanced AI Match Prediction (Diverse Edition)")
                 h_elo = elos.get(home, 1500.0)
                 a_elo = elos.get(away, 1500.0)
                 hd_adv = get_team_advanced_metrics(home, league_code, fb_key, utc_dt)
@@ -503,7 +508,7 @@ if nav_mode == "🏟️ Selected League View":
                 probs = prediction["probabilities"]
 
                 st.markdown(f"**Expected Goals (λ):** {hl:.2f} - {al:.2f}")
-                st.success(f"🎯 **Predicted Score (Argmax): {home} {score[0]} - {score[1]} {away}**")
+                st.success(f"🎯 **Predicted Score: {home} {score[0]} - {score[1]} {away}**")
                 st.markdown(f"📈 **AI Probabilities:** Home Win: `{probs['home_win']*100:.1f}%` | Draw: `{probs['draw']*100:.1f}%` | Away Win: `{probs['away_win']*100:.1f}%`")
                 st.markdown(f"⚽ **O/U Probabilities:** Over 2.5: `{probs['over25']*100:.1f}%` | Over 3.5: `{probs['over35']*100:.1f}%`")
 
