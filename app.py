@@ -13,7 +13,7 @@ import requests
 import streamlit as st
 
 # ============================================================
-# Professional Football Predictor V3.0
+# Professional Football Predictor V5.0
 # - Selected league view
 # - Top 10 cross-league view
 # - Prediction history and multi-metric accuracy
@@ -23,7 +23,7 @@ import streamlit as st
 # ============================================================
 
 st.set_page_config(
-    page_title="Professional Football Predictor V3",
+    page_title="Professional Football Predictor V5",
     page_icon="⚽",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -43,7 +43,7 @@ LEAGUES: Dict[str, str] = {
     "UEFA Europa League": "EL",
 }
 
-MODEL_VERSION = "poisson-v3.0"
+MODEL_VERSION = "poisson-v5.0"
 REQUEST_TIMEOUT = 20
 
 # -----------------------------
@@ -698,10 +698,169 @@ def render_local_value_finder(match: Dict[str, Any], prediction: Dict[str, Any])
         st.caption("EV သည် model probability နှင့် manual price ကိုသာ အခြေခံထားသည်။ Value Bet ဆိုတာ အမြတ်အာမခံချက် မဟုတ်ပါ။")
 
 # -----------------------------
+# Version 5: squad, injury, motivation and tactical context
+# -----------------------------
+
+def api_football_request(endpoint: str, params: Dict[str, Any], api_key: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Optional API-Football adapter. Provider coverage depends on subscription."""
+    if not api_key:
+        return None, "API-Football key မထည့်ရသေးပါ။"
+    try:
+        response = requests.get(
+            f"https://v3.football.api-sports.io/{endpoint}",
+            params=params,
+            headers={"x-apisports-key": api_key},
+            timeout=20,
+        )
+        if response.status_code != 200:
+            return None, f"API-Football HTTP {response.status_code}"
+        data = response.json()
+        if data.get("errors"):
+            return None, str(data["errors"])
+        return data, None
+    except requests.RequestException as exc:
+        return None, f"API-Football network error: {exc}"
+
+
+def fetch_v5_team_context(api_fixture_id: int, api_key: str) -> Dict[str, Any]:
+    """Fetch squad/lineup/injury/statistics context for one API-Football fixture. Motivation and tactical change are not universally exposed as reliable API fields, therefore the UI also accepts manual scores. Missing data is shown as missing and never silently treated as confirmed information. """
+    result: Dict[str, Any] = {
+        "fixture": {}, "teams": [], "squads": [], "injuries": [], "lineups": [],
+        "statistics": [], "errors": [], "fetched_at": now_utc().isoformat(),
+    }
+    if not api_fixture_id:
+        result["errors"].append("API-Football fixture ID မထည့်ရသေးပါ။")
+        return result
+    calls = [
+        ("fixtures", {"id": api_fixture_id}, "fixture"),
+        ("fixtures/lineups", {"fixture": api_fixture_id}, "lineups"),
+        ("fixtures/statistics", {"fixture": api_fixture_id}, "statistics"),
+        ("injuries", {"fixture": api_fixture_id}, "injuries"),
+    ]
+    for endpoint, params, key in calls:
+        data, error = api_football_request(endpoint, params, api_key)
+        if error:
+            result["errors"].append(f"{endpoint}: {error}")
+        elif data:
+            result[key] = data.get("response", [])
+    if result["fixture"] and isinstance(result["fixture"], list):
+        result["fixture"] = result["fixture"][0] if result["fixture"] else {}
+    if result["fixture"]:
+        result["teams"] = [result["fixture"].get("teams", {}).get("home", {}), result["fixture"].get("teams", {}).get("away", {})]
+        for team in result["teams"]:
+            team_id = team.get("id")
+            if not team_id:
+                continue
+            data, error = api_football_request("players/squads", {"team": team_id}, api_key)
+            if error:
+                result["errors"].append(f"players/squads({team_id}): {error}")
+            elif data:
+                result["squads"].append({"team": team, "players": data.get("response", [])})
+    return result
+
+
+def summarize_v5_context(bundle: Dict[str, Any]) -> Dict[str, Any]:
+    summary = {
+        "home_injuries": 0, "away_injuries": 0,
+        "home_suspensions": 0, "away_suspensions": 0,
+        "home_lineup_confirmed": 0, "away_lineup_confirmed": 0,
+        "home_lineup_strength": 1.0, "away_lineup_strength": 1.0,
+        "home_xg": None, "away_xg": None,
+    }
+    teams = bundle.get("teams", [])
+    home_id = teams[0].get("id") if len(teams) > 0 else None
+    for item in bundle.get("injuries", []):
+        team_id = item.get("team", {}).get("id")
+        key = "home" if home_id is not None and team_id == home_id else "away"
+        summary[f"{key}_injuries"] += 1
+        reason = str(item.get("player", {}).get("reason", "")).lower()
+        if "susp" in reason:
+            summary[f"{key}_suspensions"] += 1
+    for lineup in bundle.get("lineups", []):
+        team_id = lineup.get("team", {}).get("id")
+        key = "home" if home_id is not None and team_id == home_id else "away"
+        if lineup.get("startXI"):
+            summary[f"{key}_lineup_confirmed"] = 1
+        # This is only a completeness proxy, not player-quality intelligence.
+        summary[f"{key}_lineup_strength"] = round(min(1.0, len(lineup.get("startXI", [])) / 11), 3)
+    for item in bundle.get("statistics", []):
+        team_id = item.get("team", {}).get("id")
+        key = "home" if home_id is not None and team_id == home_id else "away"
+        for stat in item.get("statistics", []):
+            name = str(stat.get("type", "")).lower()
+            if name in {"expected goals", "xg"}:
+                summary[f"{key}_xg"] = safe_float(stat.get("value"))
+    return summary
+
+
+def apply_v5_context_adjustment(prediction: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
+    """Apply small transparent context shifts to 1X2 probabilities. Manual scores use -2..+2: negative means adverse, positive means favorable. This is an interpretable overlay, not a trained causal model. """
+    p = np.array([prediction["probabilities"]["home_win"], prediction["probabilities"]["draw"], prediction["probabilities"]["away_win"]], dtype=float)
+    home_factor = (context.get("home_motivation", 0) - context.get("away_motivation", 0)) * 0.025
+    home_factor += (context.get("home_tactical_change", 0) - context.get("away_tactical_change", 0)) * 0.015
+    home_factor += (context.get("away_injuries", 0) - context.get("home_injuries", 0)) * 0.008
+    home_factor += (context.get("away_suspensions", 0) - context.get("home_suspensions", 0)) * 0.012
+    home_factor += (context.get("home_lineup_strength", 1.0) - context.get("away_lineup_strength", 1.0)) * 0.10
+    p[0] += home_factor
+    p[2] -= home_factor
+    p[1] = max(0.01, p[1])
+    p = np.clip(p, 0.01, 0.98); p /= p.sum()
+    adjusted = dict(prediction)
+    adjusted["probabilities"] = dict(prediction["probabilities"])
+    adjusted["probabilities"].update({"home_win": float(p[0]), "draw": float(p[1]), "away_win": float(p[2])})
+    adjusted["context_adjustment"] = float(home_factor)
+    return adjusted
+
+
+def render_v5_context_panel(match: Dict[str, Any], prediction: Dict[str, Any], api_key: str) -> Dict[str, Any]:
+    match_id = str(match["id"])
+    with st.expander("👥 လူစာရင်း / ဒဏ်ရာ / Motivation / Tactical change", expanded=False):
+        st.caption("Motivation နဲ့ Tactical change ကို API မရလျှင် manual score -2 မှ +2 ထည့်ပါ။ 0 = neutral")
+        api_fixture_id = st.number_input("API-Football fixture ID (optional)", min_value=0, step=1, value=0, key=f"v5_api_fixture_{match_id}")
+        a, b, c, d = st.columns(4)
+        with a:
+            home_motivation = st.slider("Home motivation", -2.0, 2.0, 0.0, 0.25, key=f"v5_hmot_{match_id}")
+            home_tactical = st.slider("Home tactical change", -2.0, 2.0, 0.0, 0.25, key=f"v5_htac_{match_id}")
+        with b:
+            away_motivation = st.slider("Away motivation", -2.0, 2.0, 0.0, 0.25, key=f"v5_amot_{match_id}")
+            away_tactical = st.slider("Away tactical change", -2.0, 2.0, 0.0, 0.25, key=f"v5_atac_{match_id}")
+        with c:
+            home_inj = st.number_input("Home injured players", 0, 30, 0, key=f"v5_hinj_{match_id}")
+            home_susp = st.number_input("Home suspensions", 0, 15, 0, key=f"v5_hsus_{match_id}")
+            home_strength = st.slider("Home lineup strength", 0.70, 1.00, 1.00, 0.01, key=f"v5_hstr_{match_id}")
+        with d:
+            away_inj = st.number_input("Away injured players", 0, 30, 0, key=f"v5_ainj_{match_id}")
+            away_susp = st.number_input("Away suspensions", 0, 15, 0, key=f"v5_asus_{match_id}")
+            away_strength = st.slider("Away lineup strength", 0.70, 1.00, 1.00, 0.01, key=f"v5_astr_{match_id}")
+        context = {"home_motivation": home_motivation, "away_motivation": away_motivation, "home_tactical_change": home_tactical, "away_tactical_change": away_tactical, "home_injuries": home_inj, "away_injuries": away_inj, "home_suspensions": home_susp, "away_suspensions": away_susp, "home_lineup_strength": home_strength, "away_lineup_strength": away_strength}
+        if api_fixture_id and api_key and st.button("Fetch squad/injury/lineup/xG", key=f"v5_fetch_{match_id}"):
+            st.session_state[f"v5_bundle_{match_id}"] = fetch_v5_team_context(int(api_fixture_id), api_key)
+        bundle = st.session_state.get(f"v5_bundle_{match_id}")
+        if bundle:
+            for error in bundle.get("errors", []): st.warning(error)
+            api_summary = summarize_v5_context(bundle)
+            context.update({k: v for k, v in api_summary.items() if v is not None})
+            squads = bundle.get("squads", [])
+            if squads:
+                st.markdown("**လက်ရှိ squad roster**")
+                for squad in squads:
+                    team_name = squad.get("team", {}).get("name", "Team")
+                    players = squad.get("players", [])
+                    names = [p.get("player", {}).get("name", "Unknown") for p in players]
+                    st.write(f"**{team_name}** ({len(names)} players): " + ", ".join(names))
+            st.json(api_summary)
+        adjusted = apply_v5_context_adjustment(prediction, context)
+        st.info(f"Context adjustment: Home {adjusted['context_adjustment']:+.3f} probability shift")
+        st.write(f"Adjusted 1X2 — Home: **{adjusted['probabilities']['home_win'] * 100:.1f}%**, Draw: **{adjusted['probabilities']['draw'] * 100:.1f}%**, Away: **{adjusted['probabilities']['away_win'] * 100:.1f}%**")
+        st.caption("Motivation/tactical scores are manual analyst inputs unless a provider supplies structured fields. They are not guarantees and should be backtested separately.")
+        return adjusted
+    return prediction
+
+# -----------------------------
 # UI components
 # -----------------------------
 
-def render_prediction_card(match: Dict[str, Any], prediction: Dict[str, Any], odds: Dict[str, Optional[float]], show_details: bool = True) -> None:
+def render_prediction_card(match: Dict[str, Any], prediction: Dict[str, Any], odds: Dict[str, Optional[float]], show_details: bool = True, api_key: str = "") -> None:
     home = match["homeTeam"]["name"]
     away = match["awayTeam"]["name"]
     probs = prediction["probabilities"]
@@ -735,6 +894,7 @@ def render_prediction_card(match: Dict[str, Any], prediction: Dict[str, Any], od
     else:
         st.info("Odds မရရှိသေးပါ။ Value edge မတွက်နိုင်ပါ။")
 
+    prediction = render_v5_context_panel(match, prediction, api_key)
     render_local_value_finder(match, prediction)
 
     if show_details:
@@ -777,7 +937,7 @@ def render_selected_league(league_name: str, league_code: str, fb_key: str, odds
         save_prediction(match, prediction, league_code, league_name)
         odds = extract_match_odds(match["homeTeam"]["name"], match["awayTeam"]["name"], odds_data)
         with st.expander(f"⚽ {match['homeTeam']['name']} vs {match['awayTeam']['name']} | {local_time(match['utcDate'])}", expanded=False):
-            render_prediction_card(match, prediction, odds)
+            render_prediction_card(match, prediction, odds, api_key=st.session_state.get("v5_api_key", ""))
 
 
 def render_top_matches(fb_key: str, odds_key: str) -> None:
@@ -819,7 +979,7 @@ def render_top_matches(fb_key: str, odds_key: str) -> None:
     for index, row in enumerate(top, 1):
         with st.expander(f"#{index} {row['match']} — {row['league']}"):
             odds = extract_match_odds(row["match_obj"]["homeTeam"]["name"], row["match_obj"]["awayTeam"]["name"], odds_data)
-            render_prediction_card(row["match_obj"], row["prediction_obj"], odds)
+            render_prediction_card(row["match_obj"], row["prediction_obj"], odds, api_key=st.session_state.get("v5_api_key", ""))
 
 
 def render_history() -> None:
@@ -857,7 +1017,7 @@ def render_history() -> None:
 # -----------------------------
 
 initialize_database()
-st.title("⚽ Professional Football Predictor V3")
+st.title("⚽ Professional Football Predictor V5")
 st.markdown("Poisson baseline model • multi-league Top 10 • history • calibrated disclosure • data-quality checks")
 
 with st.sidebar:
@@ -866,6 +1026,8 @@ with st.sidebar:
     odds_default = st.secrets.get("ODDS_API_KEY", "")
     fb_key = st.text_input("Football-data.org API key", value=fb_default, type="password")
     odds_key = st.text_input("Odds-api.io API key", value=odds_default, type="password")
+    api_football_key = st.text_input("API-Football key (optional)", value=st.secrets.get("API_FOOTBALL_KEY", ""), type="password")
+    st.session_state["v5_api_key"] = api_football_key
     nav_mode = st.radio("Navigation", ["🏟️ Selected league", "🔥 Top 10 best matches", "📚 History & accuracy"])
     if st.button("🔄 Clear cached API data", use_container_width=True):
         fetch_fixtures.clear(); fetch_finished.clear(); fetch_standings.clear(); fetch_odds.clear()
