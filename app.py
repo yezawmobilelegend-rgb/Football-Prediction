@@ -13,14 +13,14 @@ from zoneinfo import ZoneInfo
 # =========================================================
 
 st.set_page_config(
-    page_title="Professional Football Predictor V2.10",
+    page_title="Professional Football Predictor V2.11",
     page_icon="⚽",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-DB_PATH = "football_history_v210.db"
-LOCAL_TZ = ZoneInfo("Asia/Yangon")  # မြန်မာစံတော်ချိန်
+DB_PATH = "football_history_v211.db"
+LOCAL_TZ = ZoneInfo("Asia/Yangon")
 
 LEAGUES = {
     "English Premier League (PL)": "PL",
@@ -115,7 +115,7 @@ def load_history():
 initialize_database()
 
 # =========================================================
-# API HELPERS & SETTINGS
+# API SETTINGS & HELPERS
 # =========================================================
 
 st.sidebar.header("🔑 API Settings")
@@ -206,7 +206,7 @@ def calculate_dynamic_elos(league, api_key):
     
     elos = {}
     k_factor = 25
-    home_advantage = 65
+    home_advantage = 60
 
     for match in matches:
         score = match.get("score", {}).get("fullTime", {})
@@ -255,8 +255,8 @@ def get_team_advanced_metrics(team, league, api_key, current_match_date):
     team_matches = sorted(team_matches, key=lambda x: x["utcDate"], reverse=True)
 
     rest_days = 7
-    recent_xg_for = 1.3
-    recent_xg_against = 1.1
+    recent_xg_for = 1.2
+    recent_xg_against = 1.0
 
     last_5 = team_matches[:5]
     for i, m in enumerate(last_5):
@@ -274,8 +274,8 @@ def get_team_advanced_metrics(team, league, api_key, current_match_date):
         gf = h_g if is_home else a_g
         ga = a_g if is_home else h_g
 
-        recent_xg_for += gf * 0.85
-        recent_xg_against += ga * 0.85
+        recent_xg_for += gf * 0.80
+        recent_xg_against += ga * 0.80
 
     if len(last_5) > 0:
         recent_xg_for /= len(last_5)
@@ -283,8 +283,8 @@ def get_team_advanced_metrics(team, league, api_key, current_match_date):
 
     return {
         "rest_days": rest_days,
-        "xg_for": max(0.5, recent_xg_for),
-        "xg_against": max(0.5, recent_xg_against),
+        "xg_for": max(0.4, recent_xg_for),
+        "xg_against": max(0.4, recent_xg_against),
     }
 
 
@@ -307,22 +307,22 @@ def get_h2h_adjustment(home_team, away_team, league, api_key):
         ga = a_g if is_home else h_g
         
         if gf > ga:
-            home_advantage_h2h += 0.15
+            home_advantage_h2h += 0.10
         elif gf < ga:
-            home_advantage_h2h -= 0.15
+            home_advantage_h2h -= 0.10
 
     return home_advantage_h2h
 
 
 # =========================================================
-# POISSON MODEL & PROBABILISTIC SAMPLING (MAX GOALS = 8)
+# BALANCED POISSON MODEL & ARGMAX SCORE (NO OVER-BOOSTING)
 # =========================================================
 
 def poisson_pmf(lam, k):
     return math.exp(-lam) * (lam ** k) / math.factorial(k)
 
 
-def dixon_coles_tau(h, a, lam_h, lam_a, rho=-0.12):
+def dixon_coles_tau(h, a, lam_h, lam_a, rho=-0.13):
     if h == 0 and a == 0:
         return max(0.1, 1.0 - (lam_h * lam_a * rho))
     elif h == 1 and a == 0:
@@ -334,34 +334,32 @@ def dixon_coles_tau(h, a, lam_h, lam_a, rho=-0.12):
     return 1.0
 
 
-def calculate_lambdas(home_data, away_data, h2h_adj, elo_diff, home_elo, away_elo):
-    base_home = 1.55
-    base_away = 1.10
+def calculate_lambdas(home_data, away_data, h2h_adj, elo_diff):
+    base_home = 1.40
+    base_away = 1.05
 
-    home_fatigue = 0.90 if home_data["rest_days"] < 4 else 1.0
-    away_fatigue = 0.90 if away_data["rest_days"] < 4 else 1.0
+    home_fatigue = 0.92 if home_data["rest_days"] < 4 else 1.0
+    away_fatigue = 0.92 if away_data["rest_days"] < 4 else 1.0
 
-    elite_home_boost = 1.10 if (home_elo > 1700 or home_data["xg_for"] > 2.0) else 1.0
-    elite_away_boost = 1.10 if (away_elo > 1700 or away_data["xg_for"] > 2.0) else 1.0
-
+    # Boost များကို လုံးဝဖြုတ်ပြီး သဘာဝကျသော xG နဲ့ Elo ကွာခြားချက်ကိုသာ အသုံးချသည်
     home_lambda = (
         base_home 
-        + (elo_diff / 400.0) 
-        + (home_data["xg_for"] - 1.3) * 0.4
+        + (elo_diff / 450.0) 
+        + (home_data["xg_for"] - 1.2) * 0.35
         + h2h_adj
-    ) * home_fatigue * elite_home_boost
+    ) * home_fatigue
 
     away_lambda = (
         base_away 
-        - (elo_diff / 400.0) 
-        + (away_data["xg_for"] - 1.1) * 0.4
+        - (elo_diff / 450.0) 
+        + (away_data["xg_for"] - 1.0) * 0.35
         - h2h_adj
-    ) * away_fatigue * elite_away_boost
+    ) * away_fatigue
 
-    return max(0.30, home_lambda), max(0.30, away_lambda)
+    return max(0.25, home_lambda), max(0.25, away_lambda)
 
 
-def score_matrix(home_lambda, away_lambda, max_goals=8):
+def score_matrix(home_lambda, away_lambda, max_goals=6):
     matrix = np.zeros((max_goals + 1, max_goals + 1))
     for h in range(max_goals + 1):
         for a in range(max_goals + 1):
@@ -402,29 +400,18 @@ def calculate_probabilities(matrix):
     }
 
 
-def predict_match(home_data, away_data, h2h_adj, elo_diff, home_elo, away_elo, match_id):
-    hl, al = calculate_lambdas(home_data, away_data, h2h_adj, elo_diff, home_elo, away_elo)
-    matrix = score_matrix(hl, al, max_goals=8)
+def predict_match(home_data, away_data, h2h_adj, elo_diff, match_id):
+    hl, al = calculate_lambdas(home_data, away_data, h2h_adj, elo_diff)
+    matrix = score_matrix(hl, al, max_goals=6)
     
-    flat = matrix.flatten()
-    flat_sum = flat.sum()
-    if flat_sum > 0:
-        flat /= flat_sum
-    else:
-        flat = np.ones_like(flat) / len(flat)
-
-    # Probabilistic Weighted Sampling (ရလဒ်များ ကွဲပြားစုံလင်စေရန် rng.choice ကို ပြန်လည်အသုံးပြုသည်)
-    seed_val = abs(hash(str(match_id))) % (2**32)
-    rng = np.random.default_rng(seed_val)
-    chosen_index = rng.choice(len(flat), p=flat)
-    sampled_score = np.unravel_index(chosen_index, matrix.shape)
-    
+    # Argmax Score (အမှန်တကယ် ဖြစ်တန်စွမ်းအမြင့်ဆုံး Exact Score ကို တိုက်ရိုက်ယူသည်)
+    best_score = np.unravel_index(np.argmax(matrix), matrix.shape)
     probs = calculate_probabilities(matrix)
 
     return {
         "home_lambda": hl,
         "away_lambda": al,
-        "best_score": sampled_score,
+        "best_score": best_score,
         "probabilities": probs,
     }
 
@@ -456,8 +443,8 @@ def parse_myanmar_price(price_str):
 # UI RENDERING & ROUTING
 # =========================================================
 
-st.title("⚽ Professional Football Predictor V2.10")
-st.markdown("အဆင့်မြင့် **Probabilistic Sampling, Balanced Elite Boost & Local Myanmar Odds** စနစ်")
+st.title("⚽ Professional Football Predictor V2.11")
+st.markdown("အဆင့်မြင့် **Balanced Realistic Model, Argmax Score & Local Myanmar Odds** စနစ်")
 
 if nav_mode == "🏟️ Selected League View":
     fixtures = fetch_fixtures(league_code, fb_key)
@@ -489,18 +476,18 @@ if nav_mode == "🏟️ Selected League View":
                 local_hdp_price = st.text_input("Handicap ဈေး (ဥပမာ +20, -80, ဆုံ)", key=f"hdp_price_{match_id}")
                 
                 st.divider()
-                local_ou_line = st.text_input("O/U လိုင်း (ဥပမာ 2.5, 3, 3.5)", key=f"ou_line_{match_id}")
+                local_ou_line = st.text_input("O/U လိုင်း (ဥပမာ 2.5, 3)", key=f"ou_line_{match_id}")
                 local_ou_price = st.text_input("O/U ဈေး (ဥပမာ +40, -90, ဆုံ)", key=f"ou_price_{match_id}")
 
             with right:
-                st.markdown("### 🤖 Advanced AI Match Prediction (Diverse Edition)")
+                st.markdown("### 🤖 Advanced AI Match Prediction (Realistic Edition)")
                 h_elo = elos.get(home, 1500.0)
                 a_elo = elos.get(away, 1500.0)
                 hd_adv = get_team_advanced_metrics(home, league_code, fb_key, utc_dt)
                 ad_adv = get_team_advanced_metrics(away, league_code, fb_key, utc_dt)
                 h2h_adj = get_h2h_adjustment(home, away, league_code, fb_key)
                 
-                prediction = predict_match(hd_adv, ad_adv, h2h_adj, h_elo - a_elo, h_elo, a_elo, match_id)
+                prediction = predict_match(hd_adv, ad_adv, h2h_adj, h_elo - a_elo, match_id)
 
                 hl = prediction["home_lambda"]
                 al = prediction["away_lambda"]
@@ -510,7 +497,7 @@ if nav_mode == "🏟️ Selected League View":
                 st.markdown(f"**Expected Goals (λ):** {hl:.2f} - {al:.2f}")
                 st.success(f"🎯 **Predicted Score: {home} {score[0]} - {score[1]} {away}**")
                 st.markdown(f"📈 **AI Probabilities:** Home Win: `{probs['home_win']*100:.1f}%` | Draw: `{probs['draw']*100:.1f}%` | Away Win: `{probs['away_win']*100:.1f}%`")
-                st.markdown(f"⚽ **O/U Probabilities:** Over 2.5: `{probs['over25']*100:.1f}%` | Over 3.5: `{probs['over35']*100:.1f}%`")
+                st.markdown(f"⚽ **O/U Probabilities:** Over 2.5: `{probs['over25']*100:.1f}%` | Over 1.5: `{probs['over15']*100:.1f}%`")
 
                 # =========================================================
                 # LOCAL VALUE BET FINDER SYSTEM
@@ -536,9 +523,7 @@ if nav_mode == "🏟️ Selected League View":
                         implied_ou_prob = 1.0 / dec_ou_price
                         try:
                             ou_val = float(local_ou_line)
-                            if ou_val == 3.5:
-                                ai_ou_prob = probs['over35']
-                            elif ou_val == 2.5:
+                            if ou_val == 2.5:
                                 ai_ou_prob = probs['over25']
                             elif ou_val == 1.5:
                                 ai_ou_prob = probs['over15']
@@ -582,7 +567,7 @@ elif nav_mode == "🔥 Top 10 Best Matches of the Day":
                     h_e = l_elos.get(h_team, 1500.0)
                     a_e = l_elos.get(a_team, 1500.0)
                     
-                    pred = predict_match(h_adv, a_adv, h2h_adj, h_e - a_e, h_e, a_e, m_id)
+                    pred = predict_match(h_adv, a_adv, h2h_adj, h_e - a_e, m_id)
                     probs = pred["probabilities"]
                     best_sc = pred["best_score"]
                     
