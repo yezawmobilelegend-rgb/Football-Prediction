@@ -722,6 +722,86 @@ def api_football_request(endpoint: str, params: Dict[str, Any], api_key: str) ->
         return None, f"API-Football network error: {exc}"
 
 
+def rapidapi_request( endpoint: str, params: Dict[str, Any], rapidapi_key: str, rapidapi_host: str, base_path: str = "/v3", ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Call a RapidAPI football provider with the required RapidAPI headers. RapidAPI providers use different hosts and sometimes different response schemas. The host and base path are therefore configurable in the sidebar. For an API-Football RapidAPI subscription, common defaults are: host: api-football-v1.p.rapidapi.com base path: /v3 """
+    if not rapidapi_key:
+        return None, "X-RapidAPI-Key မထည့်ရသေးပါ။"
+    if not rapidapi_host:
+        return None, "X-RapidAPI-Host မထည့်ရသေးပါ။"
+    path = "/" + endpoint.strip("/")
+    url = f"https://{rapidapi_host.strip().strip('/')}{base_path.rstrip('/')}{path}"
+    try:
+        response = requests.get(
+            url,
+            params=params,
+            headers={
+                "X-RapidAPI-Key": rapidapi_key,
+                "X-RapidAPI-Host": rapidapi_host.strip(),
+            },
+            timeout=REQUEST_TIMEOUT,
+        )
+        if response.status_code != 200:
+            return None, f"RapidAPI HTTP {response.status_code}: {url}"
+        payload = response.json()
+        if isinstance(payload, dict) and payload.get("errors"):
+            return None, str(payload["errors"])
+        return payload, None
+    except requests.Timeout:
+        return None, "RapidAPI request timed out."
+    except (requests.RequestException, ValueError) as exc:
+        return None, f"RapidAPI error: {exc}"
+
+
+def rapidapi_response_list(payload: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Normalize common RapidAPI response shapes to a list."""
+    if not payload:
+        return []
+    value = payload.get("response", payload.get("data", payload.get("results", [])))
+    if isinstance(value, list):
+        return value
+    if isinstance(value, dict):
+        return [value]
+    return []
+
+
+def fetch_v5_rapidapi_context( fixture_id: int, rapidapi_key: str, rapidapi_host: str, base_path: str = "/v3", ) -> Dict[str, Any]:
+    """Fetch V5 context through a RapidAPI football provider. The default endpoint names match API-Football's RapidAPI mirror. If the selected provider uses different paths, change the base path/provider or adapt the four endpoint names below; missing fields remain explicit. """
+    result: Dict[str, Any] = {
+        "fixture": {}, "teams": [], "squads": [], "injuries": [],
+        "lineups": [], "statistics": [], "errors": [],
+        "fetched_at": now_utc().isoformat(), "source": "RapidAPI",
+    }
+    if not fixture_id:
+        result["errors"].append("RapidAPI fixture ID မထည့်ရသေးပါ။")
+        return result
+    calls = [
+        ("fixtures", {"id": fixture_id}, "fixture"),
+        ("fixtures/lineups", {"fixture": fixture_id}, "lineups"),
+        ("fixtures/statistics", {"fixture": fixture_id}, "statistics"),
+        ("injuries", {"fixture": fixture_id}, "injuries"),
+    ]
+    for endpoint, params, key in calls:
+        payload, error = rapidapi_request(endpoint, params, rapidapi_key, rapidapi_host, base_path)
+        if error:
+            result["errors"].append(f"{endpoint}: {error}")
+        else:
+            values = rapidapi_response_list(payload)
+            result[key] = values if key != "fixture" else (values[0] if values else {})
+    if result["fixture"]:
+        fixture = result["fixture"]
+        result["teams"] = [fixture.get("teams", {}).get("home", {}), fixture.get("teams", {}).get("away", {})]
+        for team in result["teams"]:
+            team_id = team.get("id")
+            if not team_id:
+                continue
+            payload, error = rapidapi_request("players/squads", {"team": team_id}, rapidapi_key, rapidapi_host, base_path)
+            if error:
+                result["errors"].append(f"players/squads({team_id}): {error}")
+            else:
+                result["squads"].append({"team": team, "players": rapidapi_response_list(payload)})
+    return result
+
+
 def fetch_v5_team_context(api_fixture_id: int, api_key: str) -> Dict[str, Any]:
     """Fetch squad/lineup/injury/statistics context for one API-Football fixture. Motivation and tactical change are not universally exposed as reliable API fields, therefore the UI also accepts manual scores. Missing data is shown as missing and never silently treated as confirmed information. """
     result: Dict[str, Any] = {
@@ -812,7 +892,7 @@ def apply_v5_context_adjustment(prediction: Dict[str, Any], context: Dict[str, A
     return adjusted
 
 
-def render_v5_context_panel(match: Dict[str, Any], prediction: Dict[str, Any], api_key: str) -> Dict[str, Any]:
+def render_v5_context_panel( match: Dict[str, Any], prediction: Dict[str, Any], api_key: str, rapidapi_key: str = "", rapidapi_host: str = "", rapidapi_base_path: str = "/v3", ) -> Dict[str, Any]:
     match_id = str(match["id"])
     with st.expander("👥 လူစာရင်း / ဒဏ်ရာ / Motivation / Tactical change", expanded=False):
         st.caption("Motivation နဲ့ Tactical change ကို API မရလျှင် manual score -2 မှ +2 ထည့်ပါ။ 0 = neutral")
@@ -833,8 +913,15 @@ def render_v5_context_panel(match: Dict[str, Any], prediction: Dict[str, Any], a
             away_susp = st.number_input("Away suspensions", 0, 15, 0, key=f"v5_asus_{match_id}")
             away_strength = st.slider("Away lineup strength", 0.70, 1.00, 1.00, 0.01, key=f"v5_astr_{match_id}")
         context = {"home_motivation": home_motivation, "away_motivation": away_motivation, "home_tactical_change": home_tactical, "away_tactical_change": away_tactical, "home_injuries": home_inj, "away_injuries": away_inj, "home_suspensions": home_susp, "away_suspensions": away_susp, "home_lineup_strength": home_strength, "away_lineup_strength": away_strength}
-        if api_fixture_id and api_key and st.button("Fetch squad/injury/lineup/xG", key=f"v5_fetch_{match_id}"):
-            st.session_state[f"v5_bundle_{match_id}"] = fetch_v5_team_context(int(api_fixture_id), api_key)
+        fetch_a, fetch_b = st.columns(2)
+        with fetch_a:
+            if api_fixture_id and api_key and st.button("Fetch API-Football context", key=f"v5_fetch_{match_id}"):
+                st.session_state[f"v5_bundle_{match_id}"] = fetch_v5_team_context(int(api_fixture_id), api_key)
+        with fetch_b:
+            if api_fixture_id and rapidapi_key and rapidapi_host and st.button("Fetch RapidAPI context", key=f"v5_rapid_fetch_{match_id}"):
+                st.session_state[f"v5_bundle_{match_id}"] = fetch_v5_rapidapi_context(
+                    int(api_fixture_id), rapidapi_key, rapidapi_host, rapidapi_base_path
+                )
         bundle = st.session_state.get(f"v5_bundle_{match_id}")
         if bundle:
             for error in bundle.get("errors", []): st.warning(error)
@@ -860,7 +947,7 @@ def render_v5_context_panel(match: Dict[str, Any], prediction: Dict[str, Any], a
 # UI components
 # -----------------------------
 
-def render_prediction_card(match: Dict[str, Any], prediction: Dict[str, Any], odds: Dict[str, Optional[float]], show_details: bool = True, api_key: str = "") -> None:
+def render_prediction_card( match: Dict[str, Any], prediction: Dict[str, Any], odds: Dict[str, Optional[float]], show_details: bool = True, api_key: str = "", rapidapi_key: str = "", rapidapi_host: str = "", rapidapi_base_path: str = "/v3", ) -> None:
     home = match["homeTeam"]["name"]
     away = match["awayTeam"]["name"]
     probs = prediction["probabilities"]
@@ -894,7 +981,9 @@ def render_prediction_card(match: Dict[str, Any], prediction: Dict[str, Any], od
     else:
         st.info("Odds မရရှိသေးပါ။ Value edge မတွက်နိုင်ပါ။")
 
-    prediction = render_v5_context_panel(match, prediction, api_key)
+    prediction = render_v5_context_panel(
+        match, prediction, api_key, rapidapi_key, rapidapi_host, rapidapi_base_path
+    )
     render_local_value_finder(match, prediction)
 
     if show_details:
@@ -937,7 +1026,15 @@ def render_selected_league(league_name: str, league_code: str, fb_key: str, odds
         save_prediction(match, prediction, league_code, league_name)
         odds = extract_match_odds(match["homeTeam"]["name"], match["awayTeam"]["name"], odds_data)
         with st.expander(f"⚽ {match['homeTeam']['name']} vs {match['awayTeam']['name']} | {local_time(match['utcDate'])}", expanded=False):
-            render_prediction_card(match, prediction, odds, api_key=st.session_state.get("v5_api_key", ""))
+            render_prediction_card(
+                match,
+                prediction,
+                odds,
+                api_key=st.session_state.get("v5_api_key", ""),
+                rapidapi_key=st.session_state.get("v5_rapid_key", ""),
+                rapidapi_host=st.session_state.get("v5_rapid_host", ""),
+                rapidapi_base_path=st.session_state.get("v5_rapid_base", "/v3"),
+            )
 
 
 def render_top_matches(fb_key: str, odds_key: str) -> None:
@@ -979,7 +1076,15 @@ def render_top_matches(fb_key: str, odds_key: str) -> None:
     for index, row in enumerate(top, 1):
         with st.expander(f"#{index} {row['match']} — {row['league']}"):
             odds = extract_match_odds(row["match_obj"]["homeTeam"]["name"], row["match_obj"]["awayTeam"]["name"], odds_data)
-            render_prediction_card(row["match_obj"], row["prediction_obj"], odds, api_key=st.session_state.get("v5_api_key", ""))
+            render_prediction_card(
+                row["match_obj"],
+                row["prediction_obj"],
+                odds,
+                api_key=st.session_state.get("v5_api_key", ""),
+                rapidapi_key=st.session_state.get("v5_rapid_key", ""),
+                rapidapi_host=st.session_state.get("v5_rapid_host", ""),
+                rapidapi_base_path=st.session_state.get("v5_rapid_base", "/v3"),
+            )
 
 
 def render_history() -> None:
@@ -1028,6 +1133,13 @@ with st.sidebar:
     odds_key = st.text_input("Odds-api.io API key", value=odds_default, type="password")
     api_football_key = st.text_input("API-Football key (optional)", value=st.secrets.get("API_FOOTBALL_KEY", ""), type="password")
     st.session_state["v5_api_key"] = api_football_key
+    st.markdown("**RapidAPI football enrichment**")
+    rapidapi_key = st.text_input("X-RapidAPI-Key (optional)", value=st.secrets.get("X_RAPIDAPI_KEY", ""), type="password")
+    rapidapi_host = st.text_input("X-RapidAPI-Host", value=st.secrets.get("X_RAPIDAPI_HOST", "api-football-v1.p.rapidapi.com"))
+    rapidapi_base_path = st.text_input("RapidAPI base path", value=st.secrets.get("X_RAPIDAPI_BASE_PATH", "/v3"))
+    st.session_state["v5_rapid_key"] = rapidapi_key
+    st.session_state["v5_rapid_host"] = rapidapi_host
+    st.session_state["v5_rapid_base"] = rapidapi_base_path
     nav_mode = st.radio("Navigation", ["🏟️ Selected league", "🔥 Top 10 best matches", "📚 History & accuracy"])
     if st.button("🔄 Clear cached API data", use_container_width=True):
         fetch_fixtures.clear(); fetch_finished.clear(); fetch_standings.clear(); fetch_odds.clear()
