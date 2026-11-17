@@ -13,13 +13,13 @@ from zoneinfo import ZoneInfo
 # =========================================================
 
 st.set_page_config(
-    page_title="Professional Football Predictor V2.7",
+    page_title="Professional Football Predictor V2.8",
     page_icon="⚽",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-DB_PATH = "football_history_v27.db"
+DB_PATH = "football_history_v28.db"
 LOCAL_TZ = ZoneInfo("Asia/Yangon")  # မြန်မာစံတော်ချိန်
 
 LEAGUES = {
@@ -95,8 +95,8 @@ def save_prediction(
             match_date,
             home_team,
             away_team,
-            score[0],
-            score[1],
+            int(score[0]),
+            int(score[1]),
             home_lambda,
             away_lambda,
             datetime.now().isoformat(),
@@ -274,8 +274,8 @@ def get_team_advanced_metrics(team, league, api_key, current_match_date):
         gf = h_g if is_home else a_g
         ga = a_g if is_home else h_g
 
-        recent_xg_for += gf * 0.85
-        recent_xg_against += ga * 0.85
+        recent_xg_for += gf * 0.90
+        recent_xg_against += ga * 0.90
 
     if len(last_5) > 0:
         recent_xg_for /= len(last_5)
@@ -315,7 +315,7 @@ def get_h2h_adjustment(home_team, away_team, league, api_key):
 
 
 # =========================================================
-# POISSON MODEL & ELITE ATTACK BOOST (MAX GOALS = 8)
+# POISSON MODEL & ELITE TEAM SCALING (MAX GOALS = 8)
 # =========================================================
 
 def poisson_pmf(lam, k):
@@ -334,36 +334,35 @@ def dixon_coles_tau(h, a, lam_h, lam_a, rho=-0.12):
     return 1.0
 
 
-def calculate_lambdas(home_data, away_data, h2h_adj, elo_diff):
+def calculate_lambdas(home_data, away_data, h2h_adj, elo_diff, home_elo, away_elo):
     base_home = 1.55
     base_away = 1.10
 
     home_fatigue = 0.90 if home_data["rest_days"] < 4 else 1.0
     away_fatigue = 0.90 if away_data["rest_days"] < 4 else 1.0
 
-    # Elite Attack Boost: Reduce shrinkage if team has high xG (e.g. Bayern, Man City)
-    home_xg_weight = 0.65 if home_data["xg_for"] > 2.0 else 0.4
-    away_xg_weight = 0.65 if away_data["xg_for"] > 2.0 else 0.4
+    # Elite Team Multiplier: If an elite team (Elo > 1700 or high xG) plays a weaker team, boost lambda significantly to allow 3-0, 4-0 predictions
+    elite_home_boost = 1.25 if (home_elo > 1700 or home_data["xg_for"] > 2.0) else 1.0
+    elite_away_boost = 1.25 if (away_elo > 1700 or away_data["xg_for"] > 2.0) else 1.0
 
     home_lambda = (
         base_home 
-        + (elo_diff / 380.0) 
-        + (home_data["xg_for"] - 1.3) * home_xg_weight
+        + (elo_diff / 350.0) 
+        + (home_data["xg_for"] - 1.2) * 0.55
         + h2h_adj
-    ) * home_fatigue
+    ) * home_fatigue * elite_home_boost
 
     away_lambda = (
         base_away 
-        - (elo_diff / 380.0) 
-        + (away_data["xg_for"] - 1.1) * away_xg_weight
+        - (elo_diff / 350.0) 
+        + (away_data["xg_for"] - 1.0) * 0.55
         - h2h_adj
-    ) * away_fatigue
+    ) * away_fatigue * elite_away_boost
 
     return max(0.30, home_lambda), max(0.30, away_lambda)
 
 
 def score_matrix(home_lambda, away_lambda, max_goals=8):
-    # Max goals increased to 8 to handle high-scoring teams (Bayern, Man City, etc.)
     matrix = np.zeros((max_goals + 1, max_goals + 1))
     for h in range(max_goals + 1):
         for a in range(max_goals + 1):
@@ -404,8 +403,8 @@ def calculate_probabilities(matrix):
     }
 
 
-def predict_match(home_data, away_data, h2h_adj, elo_diff, match_id):
-    hl, al = calculate_lambdas(home_data, away_data, h2h_adj, elo_diff)
+def predict_match(home_data, away_data, h2h_adj, elo_diff, home_elo, away_elo, match_id):
+    hl, al = calculate_lambdas(home_data, away_data, h2h_adj, elo_diff, home_elo, away_elo)
     matrix = score_matrix(hl, al, max_goals=8)
     
     flat = matrix.flatten()
@@ -413,7 +412,6 @@ def predict_match(home_data, away_data, h2h_adj, elo_diff, match_id):
     if flat_sum > 0:
         flat /= flat_sum
 
-    # ARGMAX Score (Highest probability score directly)
     best_score = np.unravel_index(np.argmax(matrix), matrix.shape)
     probs = calculate_probabilities(matrix)
 
@@ -453,8 +451,8 @@ def parse_myanmar_price(price_str):
 # UI RENDERING & ROUTING
 # =========================================================
 
-st.title("⚽ Professional Football Predictor V2.7")
-st.markdown("အဆင့်မြင့် **Elite Attack Boost, Max Goals = 8, Argmax Score & Local Myanmar Odds** စနစ်")
+st.title("⚽ Professional Football Predictor V2.8")
+st.markdown("အဆင့်မြင့် **Elite Team Boost, High-Scoring Correction & Argmax Score** စနစ်")
 
 if nav_mode == "🏟️ Selected League View":
     fixtures = fetch_fixtures(league_code, fb_key)
@@ -481,8 +479,6 @@ if nav_mode == "🏟️ Selected League View":
 
             with left:
                 st.markdown("### 🇲🇲 ဒေသတွင်းပေါက်ကြေး (Local Odds Manual Input)")
-                st.caption("မြန်မာပြည်ပေါက်ကြေးပုံစံ (ဥပမာ Handicap 1+20 / O/U 3+40) ဖြင့် ဖြည့်သွင်းပါ")
-                
                 local_hdp_team = st.selectbox("Handicap ပေးသည့်အသင်း", [home, away, "မရှိပါ"], key=f"hdp_team_{match_id}")
                 local_hdp_line = st.text_input("Handicap နှုန်း (ဥပမာ 0.5, 1, 1.5)", key=f"hdp_line_{match_id}")
                 local_hdp_price = st.text_input("Handicap ဈေး (ဥပမာ +20, -80, ဆုံ)", key=f"hdp_price_{match_id}")
@@ -499,7 +495,7 @@ if nav_mode == "🏟️ Selected League View":
                 ad_adv = get_team_advanced_metrics(away, league_code, fb_key, utc_dt)
                 h2h_adj = get_h2h_adjustment(home, away, league_code, fb_key)
                 
-                prediction = predict_match(hd_adv, ad_adv, h2h_adj, h_elo - a_elo, match_id)
+                prediction = predict_match(hd_adv, ad_adv, h2h_adj, h_elo - a_elo, h_elo, a_elo, match_id)
 
                 hl = prediction["home_lambda"]
                 al = prediction["away_lambda"]
@@ -581,7 +577,7 @@ elif nav_mode == "🔥 Top 10 Best Matches of the Day":
                     h_e = l_elos.get(h_team, 1500.0)
                     a_e = l_elos.get(a_team, 1500.0)
                     
-                    pred = predict_match(h_adv, a_adv, h2h_adj, h_e - a_e, m_id)
+                    pred = predict_match(h_adv, a_adv, h2h_adj, h_e - a_e, h_e, a_e, m_id)
                     probs = pred["probabilities"]
                     best_sc = pred["best_score"]
                     
