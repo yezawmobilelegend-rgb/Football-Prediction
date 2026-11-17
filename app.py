@@ -13,13 +13,13 @@ from zoneinfo import ZoneInfo
 # =========================================================
 
 st.set_page_config(
-    page_title="Professional Football Predictor V2.6",
+    page_title="Professional Football Predictor V2.7",
     page_icon="⚽",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-DB_PATH = "football_history_v26.db"
+DB_PATH = "football_history_v27.db"
 LOCAL_TZ = ZoneInfo("Asia/Yangon")  # မြန်မာစံတော်ချိန်
 
 LEAGUES = {
@@ -315,7 +315,7 @@ def get_h2h_adjustment(home_team, away_team, league, api_key):
 
 
 # =========================================================
-# POISSON MODEL & DIXON-COLES EXTENSION (ARGMAX SCORE)
+# POISSON MODEL & ELITE ATTACK BOOST (MAX GOALS = 8)
 # =========================================================
 
 def poisson_pmf(lam, k):
@@ -341,24 +341,29 @@ def calculate_lambdas(home_data, away_data, h2h_adj, elo_diff):
     home_fatigue = 0.90 if home_data["rest_days"] < 4 else 1.0
     away_fatigue = 0.90 if away_data["rest_days"] < 4 else 1.0
 
+    # Elite Attack Boost: Reduce shrinkage if team has high xG (e.g. Bayern, Man City)
+    home_xg_weight = 0.65 if home_data["xg_for"] > 2.0 else 0.4
+    away_xg_weight = 0.65 if away_data["xg_for"] > 2.0 else 0.4
+
     home_lambda = (
         base_home 
-        + (elo_diff / 400.0) 
-        + (home_data["xg_for"] - 1.3) * 0.4
+        + (elo_diff / 380.0) 
+        + (home_data["xg_for"] - 1.3) * home_xg_weight
         + h2h_adj
     ) * home_fatigue
 
     away_lambda = (
         base_away 
-        - (elo_diff / 400.0) 
-        + (away_data["xg_for"] - 1.1) * 0.4
+        - (elo_diff / 380.0) 
+        + (away_data["xg_for"] - 1.1) * away_xg_weight
         - h2h_adj
     ) * away_fatigue
 
     return max(0.30, home_lambda), max(0.30, away_lambda)
 
 
-def score_matrix(home_lambda, away_lambda, max_goals=6):
+def score_matrix(home_lambda, away_lambda, max_goals=8):
+    # Max goals increased to 8 to handle high-scoring teams (Bayern, Man City, etc.)
     matrix = np.zeros((max_goals + 1, max_goals + 1))
     for h in range(max_goals + 1):
         for a in range(max_goals + 1):
@@ -401,7 +406,7 @@ def calculate_probabilities(matrix):
 
 def predict_match(home_data, away_data, h2h_adj, elo_diff, match_id):
     hl, al = calculate_lambdas(home_data, away_data, h2h_adj, elo_diff)
-    matrix = score_matrix(hl, al, max_goals=6)
+    matrix = score_matrix(hl, al, max_goals=8)
     
     flat = matrix.flatten()
     flat_sum = flat.sum()
@@ -426,21 +431,17 @@ def predict_match(home_data, away_data, h2h_adj, elo_diff, match_id):
 # =========================================================
 
 def parse_myanmar_price(price_str):
-    """ Parses Myanmar local price string like '+20', '-80', 'ဆုံ', or decimal odds like '1.95' """
     price_str = str(price_str).strip().lower()
     if not price_str:
         return None
     try:
         if price_str in ["ဆုံ", "even", "1.0"]:
-            return 2.0  # Decimal equivalent for even money
-        
+            return 2.0
         if price_str.startswith("+"):
             val = float(price_str[1:])
-            # e.g., +20 means betting 100 makes 120 return or profit ratio
-            return 1.0 + (val / 100.0) + 1.0  # Decimal odds approx (e.g. 2.20)
+            return 1.0 + (val / 100.0) + 1.0
         elif price_str.startswith("-"):
             val = float(price_str[1:])
-            # e.g., -80 means risk 80 to win 100
             return 1.0 + (100.0 / val)
         else:
             return float(price_str)
@@ -452,8 +453,8 @@ def parse_myanmar_price(price_str):
 # UI RENDERING & ROUTING
 # =========================================================
 
-st.title("⚽ Professional Football Predictor V2.6")
-st.markdown("အဆင့်မြင့် **Argmax Score, Dynamic Elo, Dixon-Coles & Local Myanmar Odds Value Finder** စနစ်")
+st.title("⚽ Professional Football Predictor V2.7")
+st.markdown("အဆင့်မြင့် **Elite Attack Boost, Max Goals = 8, Argmax Score & Local Myanmar Odds** စနစ်")
 
 if nav_mode == "🏟️ Selected League View":
     fixtures = fetch_fixtures(league_code, fb_key)
@@ -487,11 +488,11 @@ if nav_mode == "🏟️ Selected League View":
                 local_hdp_price = st.text_input("Handicap ဈေး (ဥပမာ +20, -80, ဆုံ)", key=f"hdp_price_{match_id}")
                 
                 st.divider()
-                local_ou_line = st.text_input("O/U လိုင်း (ဥပမာ 2.5, 3)", key=f"ou_line_{match_id}")
+                local_ou_line = st.text_input("O/U လိုင်း (ဥပမာ 2.5, 3, 3.5)", key=f"ou_line_{match_id}")
                 local_ou_price = st.text_input("O/U ဈေး (ဥပမာ +40, -90, ဆုံ)", key=f"ou_price_{match_id}")
 
             with right:
-                st.markdown("### 🤖 Advanced AI Match Prediction")
+                st.markdown("### 🤖 Advanced AI Match Prediction (Elite Edition)")
                 h_elo = elos.get(home, 1500.0)
                 a_elo = elos.get(away, 1500.0)
                 hd_adv = get_team_advanced_metrics(home, league_code, fb_key, utc_dt)
@@ -508,7 +509,7 @@ if nav_mode == "🏟️ Selected League View":
                 st.markdown(f"**Expected Goals (λ):** {hl:.2f} - {al:.2f}")
                 st.success(f"🎯 **Predicted Score (Argmax): {home} {score[0]} - {score[1]} {away}**")
                 st.markdown(f"📈 **AI Probabilities:** Home Win: `{probs['home_win']*100:.1f}%` | Draw: `{probs['draw']*100:.1f}%` | Away Win: `{probs['away_win']*100:.1f}%`")
-                st.markdown(f"⚽ **O/U Probabilities:** Over 2.5: `{probs['over25']*100:.1f}%` | Over 1.5: `{probs['over15']*100:.1f}%`")
+                st.markdown(f"⚽ **O/U Probabilities:** Over 2.5: `{probs['over25']*100:.1f}%` | Over 3.5: `{probs['over35']*100:.1f}%`")
 
                 # =========================================================
                 # LOCAL VALUE BET FINDER SYSTEM
@@ -518,7 +519,6 @@ if nav_mode == "🏟️ Selected League View":
                 
                 value_found = False
                 
-                # Evaluate Handicap Value
                 if local_hdp_team != "မရှိပါ" and local_hdp_line and local_hdp_price:
                     dec_price = parse_myanmar_price(local_hdp_price)
                     if dec_price and dec_price > 1.0:
@@ -529,19 +529,20 @@ if nav_mode == "🏟️ Selected League View":
                             value_found = True
                             st.success(f"🔥 **Value Bet (Handicap - {local_hdp_team} {local_hdp_line} @ {local_hdp_price}):** Edge +{edge:.1f}% (AI Prob: {ai_prob*100:.1f}% vs Implied: {implied_prob*100:.1f}%)")
 
-                # Evaluate Over/Under Value
                 if local_ou_line and local_ou_price:
                     dec_ou_price = parse_myanmar_price(local_ou_price)
                     if dec_ou_price and dec_ou_price > 1.0:
                         implied_ou_prob = 1.0 / dec_ou_price
                         try:
                             ou_val = float(local_ou_line)
-                            if ou_val == 2.5:
+                            if ou_val == 3.5:
+                                ai_ou_prob = probs['over35']
+                            elif ou_val == 2.5:
                                 ai_ou_prob = probs['over25']
                             elif ou_val == 1.5:
                                 ai_ou_prob = probs['over15']
                             else:
-                                ai_ou_prob = probs['over25'] # default fallback
+                                ai_ou_prob = probs['over25']
                             
                             ou_edge = (ai_ou_prob - implied_ou_prob) * 100
                             if (ai_ou_prob * dec_ou_price) > 1.03:
