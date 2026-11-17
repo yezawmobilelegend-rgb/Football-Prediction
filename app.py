@@ -13,13 +13,13 @@ from zoneinfo import ZoneInfo
 # =========================================================
 
 st.set_page_config(
-    page_title="Professional Football Predictor V2.5",
+    page_title="Professional Football Predictor V2.6",
     page_icon="⚽",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-DB_PATH = "football_history_v2.db"
+DB_PATH = "football_history_v26.db"
 LOCAL_TZ = ZoneInfo("Asia/Yangon")  # မြန်မာစံတော်ချိန်
 
 LEAGUES = {
@@ -196,18 +196,17 @@ def fetch_finished_matches(league, api_key):
 
 
 # =========================================================
-# 1. ADVANCED DYNAMIC ELO RATING SYSTEM (Match-by-Match)
+# DYNAMIC ELO RATING SYSTEM
 # =========================================================
 
 @st.cache_data(ttl=3600)
 def calculate_dynamic_elos(league, api_key):
     matches = fetch_finished_matches(league, api_key)
-    # Sort matches chronologically
     matches = sorted(matches, key=lambda x: x["utcDate"])
     
     elos = {}
-    k_factor = 25  # Tournament Importance K-factor
-    home_advantage = 65  # Elo points for home advantage
+    k_factor = 25
+    home_advantage = 65
 
     for match in matches:
         score = match.get("score", {}).get("fullTime", {})
@@ -244,7 +243,7 @@ def calculate_dynamic_elos(league, api_key):
 
 
 # =========================================================
-# 4. REST DAYS / FIXTURE CONGESTION & 5. xG DATA INTEGRATION
+# ADVANCED METRICS (Rest Days & xG)
 # =========================================================
 
 def get_team_advanced_metrics(team, league, api_key, current_match_date):
@@ -255,11 +254,9 @@ def get_team_advanced_metrics(team, league, api_key, current_match_date):
     ]
     team_matches = sorted(team_matches, key=lambda x: x["utcDate"], reverse=True)
 
-    rest_days = 7  # Default if no prior match found
+    rest_days = 7
     recent_xg_for = 1.3
     recent_xg_against = 1.1
-    recent_form_points = 0
-    recent_form_str = ""
 
     last_5 = team_matches[:5]
     for i, m in enumerate(last_5):
@@ -277,11 +274,6 @@ def get_team_advanced_metrics(team, league, api_key, current_match_date):
         gf = h_g if is_home else a_g
         ga = a_g if is_home else h_g
 
-        pts = 3 if gf > ga else (1 if gf == ga else 0)
-        recent_form_points += pts
-        recent_form_str += "W" if pts == 3 else ("D" if pts == 1 else "L")
-
-        # xG approximation fallback if api stats unavailable
         recent_xg_for += gf * 0.85
         recent_xg_against += ga * 0.85
 
@@ -293,15 +285,8 @@ def get_team_advanced_metrics(team, league, api_key, current_match_date):
         "rest_days": rest_days,
         "xg_for": max(0.5, recent_xg_for),
         "xg_against": max(0.5, recent_xg_against),
-        "form_points": recent_form_points,
-        "form_str": recent_form_str[::-1] if recent_form_str else "N/A",
-        "played": len(last_5)
     }
 
-
-# =========================================================
-# 3. HEAD-TO-HEAD (H2H) HISTORY / BOGEY TEAM FACTOR
-# =========================================================
 
 def get_h2h_adjustment(home_team, away_team, league, api_key):
     matches = fetch_finished_matches(league, api_key)
@@ -330,7 +315,7 @@ def get_h2h_adjustment(home_team, away_team, league, api_key):
 
 
 # =========================================================
-# POISSON MODEL & 2. DIXON-COLES EXTENSION
+# POISSON MODEL & DIXON-COLES EXTENSION (ARGMAX SCORE)
 # =========================================================
 
 def poisson_pmf(lam, k):
@@ -338,7 +323,6 @@ def poisson_pmf(lam, k):
 
 
 def dixon_coles_tau(h, a, lam_h, lam_a, rho=-0.12):
-    """ Dixon-Coles correction factor for low-scoring matches """
     if h == 0 and a == 0:
         return max(0.1, 1.0 - (lam_h * lam_a * rho))
     elif h == 1 and a == 0:
@@ -354,7 +338,6 @@ def calculate_lambdas(home_data, away_data, h2h_adj, elo_diff):
     base_home = 1.55
     base_away = 1.10
 
-    # Fatigue penalty based on rest days (< 4 days rest reduces output)
     home_fatigue = 0.90 if home_data["rest_days"] < 4 else 1.0
     away_fatigue = 0.90 if away_data["rest_days"] < 4 else 1.0
 
@@ -408,7 +391,9 @@ def calculate_probabilities(matrix):
         "home_win": home_win,
         "draw": draw,
         "away_win": away_win,
+        "over15": sum(p for g, p in total_probs.items() if g > 1.5),
         "over25": sum(p for g, p in total_probs.items() if g > 2.5),
+        "over35": sum(p for g, p in total_probs.items() if g > 3.5),
         "btts_yes": btts_yes,
         "total_probs": total_probs,
     }
@@ -422,32 +407,53 @@ def predict_match(home_data, away_data, h2h_adj, elo_diff, match_id):
     flat_sum = flat.sum()
     if flat_sum > 0:
         flat /= flat_sum
-    else:
-        flat = np.ones_like(flat) / len(flat)
 
-    seed_val = abs(hash(str(match_id))) % (2**32)
-    rng = np.random.default_rng(seed_val)
-    chosen = rng.choice(len(flat), p=flat)
-    sampled_score = np.unravel_index(chosen, matrix.shape)
+    # ARGMAX Score (Highest probability score directly)
     best_score = np.unravel_index(np.argmax(matrix), matrix.shape)
     probs = calculate_probabilities(matrix)
 
     return {
         "home_lambda": hl,
         "away_lambda": al,
-        "best_score": sampled_score,
-        "argmax_score": best_score,
-        "best_probability": matrix[sampled_score],
+        "best_score": best_score,
+        "best_probability": matrix[best_score],
         "probabilities": probs,
     }
+
+
+# =========================================================
+# LOCAL ODDS PRICE PARSER & VALUE FINDER HELPER
+# =========================================================
+
+def parse_myanmar_price(price_str):
+    """ Parses Myanmar local price string like '+20', '-80', 'ဆုံ', or decimal odds like '1.95' """
+    price_str = str(price_str).strip().lower()
+    if not price_str:
+        return None
+    try:
+        if price_str in ["ဆုံ", "even", "1.0"]:
+            return 2.0  # Decimal equivalent for even money
+        
+        if price_str.startswith("+"):
+            val = float(price_str[1:])
+            # e.g., +20 means betting 100 makes 120 return or profit ratio
+            return 1.0 + (val / 100.0) + 1.0  # Decimal odds approx (e.g. 2.20)
+        elif price_str.startswith("-"):
+            val = float(price_str[1:])
+            # e.g., -80 means risk 80 to win 100
+            return 1.0 + (100.0 / val)
+        else:
+            return float(price_str)
+    except ValueError:
+        return None
 
 
 # =========================================================
 # UI RENDERING & ROUTING
 # =========================================================
 
-st.title("⚽ Professional Football Predictor V2.5")
-st.markdown("အဆင့်မြင့် **Dynamic Elo, Dixon-Coles, H2H, Rest Days & xG** မော်ဒယ်များ ပေါင်းစပ်ထားသော စနစ်")
+st.title("⚽ Professional Football Predictor V2.6")
+st.markdown("အဆင့်မြင့် **Argmax Score, Dynamic Elo, Dixon-Coles & Local Myanmar Odds Value Finder** စနစ်")
 
 if nav_mode == "🏟️ Selected League View":
     fixtures = fetch_fixtures(league_code, fb_key)
@@ -473,24 +479,26 @@ if nav_mode == "🏟️ Selected League View":
             left, right = st.columns([1, 1.3])
 
             with left:
-                st.markdown("### 📊 Team Dynamic Profile")
-                h_elo = elos.get(home, 1500.0)
-                a_elo = elos.get(away, 1500.0)
-                st.write(f"🏠 **{home} Elo:** {h_elo:.1f}")
-                st.write(f"✈️ **{away} Elo:** {a_elo:.1f}")
-
-                hd_adv = get_team_advanced_metrics(home, league_code, fb_key, utc_dt)
-                ad_adv = get_team_advanced_metrics(away, league_code, fb_key, utc_dt)
-
-                st.write(f"⏳ Rest Days: {home} ({hd_adv['rest_days']} days) vs {away} ({ad_adv['rest_days']} days)")
-                st.write(f"🎯 Recent xG: {home} ({hd_adv['xg_for']:.2f}) vs {away} ({ad_adv['xg_for']:.2f})")
+                st.markdown("### 🇲🇲 ဒေသတွင်းပေါက်ကြေး (Local Odds Manual Input)")
+                st.caption("မြန်မာပြည်ပေါက်ကြေးပုံစံ (ဥပမာ Handicap 1+20 / O/U 3+40) ဖြင့် ဖြည့်သွင်းပါ")
+                
+                local_hdp_team = st.selectbox("Handicap ပေးသည့်အသင်း", [home, away, "မရှိပါ"], key=f"hdp_team_{match_id}")
+                local_hdp_line = st.text_input("Handicap နှုန်း (ဥပမာ 0.5, 1, 1.5)", key=f"hdp_line_{match_id}")
+                local_hdp_price = st.text_input("Handicap ဈေး (ဥပမာ +20, -80, ဆုံ)", key=f"hdp_price_{match_id}")
+                
+                st.divider()
+                local_ou_line = st.text_input("O/U လိုင်း (ဥပမာ 2.5, 3)", key=f"ou_line_{match_id}")
+                local_ou_price = st.text_input("O/U ဈေး (ဥပမာ +40, -90, ဆုံ)", key=f"ou_price_{match_id}")
 
             with right:
                 st.markdown("### 🤖 Advanced AI Match Prediction")
+                h_elo = elos.get(home, 1500.0)
+                a_elo = elos.get(away, 1500.0)
+                hd_adv = get_team_advanced_metrics(home, league_code, fb_key, utc_dt)
+                ad_adv = get_team_advanced_metrics(away, league_code, fb_key, utc_dt)
                 h2h_adj = get_h2h_adjustment(home, away, league_code, fb_key)
-                elo_diff = h_elo - a_elo
                 
-                prediction = predict_match(hd_adv, ad_adv, h2h_adj, elo_diff, match_id)
+                prediction = predict_match(hd_adv, ad_adv, h2h_adj, h_elo - a_elo, match_id)
 
                 hl = prediction["home_lambda"]
                 al = prediction["away_lambda"]
@@ -498,9 +506,52 @@ if nav_mode == "🏟️ Selected League View":
                 probs = prediction["probabilities"]
 
                 st.markdown(f"**Expected Goals (λ):** {hl:.2f} - {al:.2f}")
-                st.success(f"🎯 **Predicted Score: {home} {score[0]} - {score[1]} {away}**")
-                st.write(f"📈 Home Win: {probs['home_win']*100:.1f}% | Draw: {probs['draw']*100:.1f}% | Away Win: {probs['away_win']*100:.1f}%")
-                st.write(f"⚽ Over 2.5 Goals Probability: {probs['over25']*100:.1f}%")
+                st.success(f"🎯 **Predicted Score (Argmax): {home} {score[0]} - {score[1]} {away}**")
+                st.markdown(f"📈 **AI Probabilities:** Home Win: `{probs['home_win']*100:.1f}%` | Draw: `{probs['draw']*100:.1f}%` | Away Win: `{probs['away_win']*100:.1f}%`")
+                st.markdown(f"⚽ **O/U Probabilities:** Over 2.5: `{probs['over25']*100:.1f}%` | Over 1.5: `{probs['over15']*100:.1f}%`")
+
+                # =========================================================
+                # LOCAL VALUE BET FINDER SYSTEM
+                # =========================================================
+                st.divider()
+                st.markdown("### 💎 Local Value Bet Finder")
+                
+                value_found = False
+                
+                # Evaluate Handicap Value
+                if local_hdp_team != "မရှိပါ" and local_hdp_line and local_hdp_price:
+                    dec_price = parse_myanmar_price(local_hdp_price)
+                    if dec_price and dec_price > 1.0:
+                        implied_prob = 1.0 / dec_price
+                        ai_prob = probs['home_win'] if local_hdp_team == home else probs['away_win']
+                        edge = (ai_prob - implied_prob) * 100
+                        if (ai_prob * dec_price) > 1.03:
+                            value_found = True
+                            st.success(f"🔥 **Value Bet (Handicap - {local_hdp_team} {local_hdp_line} @ {local_hdp_price}):** Edge +{edge:.1f}% (AI Prob: {ai_prob*100:.1f}% vs Implied: {implied_prob*100:.1f}%)")
+
+                # Evaluate Over/Under Value
+                if local_ou_line and local_ou_price:
+                    dec_ou_price = parse_myanmar_price(local_ou_price)
+                    if dec_ou_price and dec_ou_price > 1.0:
+                        implied_ou_prob = 1.0 / dec_ou_price
+                        try:
+                            ou_val = float(local_ou_line)
+                            if ou_val == 2.5:
+                                ai_ou_prob = probs['over25']
+                            elif ou_val == 1.5:
+                                ai_ou_prob = probs['over15']
+                            else:
+                                ai_ou_prob = probs['over25'] # default fallback
+                            
+                            ou_edge = (ai_ou_prob - implied_ou_prob) * 100
+                            if (ai_ou_prob * dec_ou_price) > 1.03:
+                                value_found = True
+                                st.success(f"🔥 **Value Bet (Over {ou_val} @ {local_ou_price}):** Edge +{ou_edge:.1f}% (AI Prob: {ai_ou_prob*100:.1f}% vs Implied: {implied_ou_prob*100:.1f}%)")
+                        except ValueError:
+                            pass
+
+                if not value_found:
+                    st.info("ℹ️ ထည့်သွင်းထားသော ဒေသတွင်းပေါက်ကြေးအပေါ် အခြေခံ၍ သိသာထင်ရှားသော Value Bet မတွေ့ရသေးပါ။")
 
                 save_prediction(match_id, league_code, match_date_str, home, away, score, hl, al)
 
