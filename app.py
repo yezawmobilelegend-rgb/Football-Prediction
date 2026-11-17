@@ -13,19 +13,20 @@ import requests
 import streamlit as st
 
 # ============================================================
-# Professional Football Predictor V7.2.0
+# Professional Football Predictor V7.3.0
 # - Selected league view
 # - Top 10 cross-league view
 # - Prediction history and multi-metric accuracy
 # - Robust API/error handling
 # - Data-quality and model-confidence disclosure
 # - League-relative, sample-smoothed home/away attack/defence rates
-# - Exact-score probability disclosure and probability-ranked alternatives
+# - Expected scoring percentages and strong-attack indicators
+# - Most probable 3+ goal scoreline with unconditional/conditional probabilities
 # - Reproducible Poisson prediction (not random/AI magic)
 # ============================================================
 
 st.set_page_config(
-    page_title="Professional Football Predictor V7.2",
+    page_title="Professional Football Predictor V7.3",
     page_icon="⚽",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -45,7 +46,7 @@ LEAGUES: Dict[str, str] = {
     "UEFA Europa League": "EL",
 }
 
-MODEL_VERSION = "league-relative-poisson-v7.2"
+MODEL_VERSION = "league-relative-poisson-v7.3"
 REQUEST_TIMEOUT = 20
 
 # -----------------------------
@@ -427,12 +428,19 @@ def calculate_probabilities(matrix: np.ndarray) -> Dict[str, Any]:
     draw = float(sum(matrix[h, a] for h in range(size) for a in range(size) if h == a))
     away_win = float(sum(matrix[h, a] for h in range(size) for a in range(size) if h < a))
     total_probs = {total: float(sum(matrix[h, total - h] for h in range(size) if 0 <= total - h < size)) for total in range(2 * size - 1)}
-    over25 = sum(p for total, p in total_probs.items() if total > 2.5)
-    under25 = sum(p for total, p in total_probs.items() if total < 2.5)
+    over15 = sum(p for total, p in total_probs.items() if total >= 2)
+    over25 = sum(p for total, p in total_probs.items() if total >= 3)
+    over35 = sum(p for total, p in total_probs.items() if total >= 4)
+    under25 = 1.0 - over25
+    home_scores_1plus = float(sum(matrix[h, a] for h in range(1, size) for a in range(size)))
+    away_scores_1plus = float(sum(matrix[h, a] for h in range(size) for a in range(1, size)))
     btts_yes = float(sum(matrix[h, a] for h in range(1, size) for a in range(1, size)))
     return {
         "home_win": home_win, "draw": draw, "away_win": away_win,
-        "over25": over25, "under25": under25,
+        "over15": over15, "over25": over25, "over35": over35,
+        "under25": under25,
+        "home_scores_1plus": home_scores_1plus,
+        "away_scores_1plus": away_scores_1plus,
         "btts_yes": btts_yes, "btts_no": 1 - btts_yes,
         "total_probs": total_probs,
     }
@@ -476,6 +484,23 @@ def predict_match( home: Dict[str, Any], away: Dict[str, Any], league_baseline: 
     matrix = score_matrix(home_lambda, away_lambda)
     best_score = tuple(int(x) for x in np.unravel_index(np.argmax(matrix), matrix.shape))
     probabilities = calculate_probabilities(matrix)
+    high_scorelines = top_scorelines(matrix, limit=5, min_total_goals=3)
+    best_high_scoreline = high_scorelines[0] if high_scorelines else None
+    high_score_total_probability = float(probabilities["over25"])
+    if best_high_scoreline is not None:
+        best_high_scoreline = dict(best_high_scoreline)
+        best_high_scoreline["conditional_probability"] = (
+            best_high_scoreline["probability"] / high_score_total_probability
+            if high_score_total_probability > 0 else 0.0
+        )
+    home_attack_index = home_attack / base_home
+    away_attack_index = away_attack / base_away
+    strong_attack_threshold = 1.15  # smoothed scoring rate at least 15% above league
+    strong_attackers = []
+    if home_attack_index >= strong_attack_threshold:
+        strong_attackers.append("home")
+    if away_attack_index >= strong_attack_threshold:
+        strong_attackers.append("away")
     result_probs = [probabilities["home_win"], probabilities["draw"], probabilities["away_win"]]
     confidence = clamp(max(result_probs), 0, 1)
     data_quality = (home.get("quality", 0) + away.get("quality", 0)) / 2 / 100
@@ -487,7 +512,12 @@ def predict_match( home: Dict[str, Any], away: Dict[str, Any], league_baseline: 
         "best_score": best_score,
         "best_probability": float(matrix[best_score]),
         "top_scorelines": top_scorelines(matrix, limit=8),
-        "high_scoring_scorelines": top_scorelines(matrix, limit=5, min_total_goals=3),
+        "high_scoring_scorelines": high_scorelines,
+        "best_high_scoreline": best_high_scoreline,
+        "home_attack_index": home_attack_index,
+        "away_attack_index": away_attack_index,
+        "strong_attackers": strong_attackers,
+        "strong_attack_threshold": strong_attack_threshold,
         "matrix": matrix,
         "probabilities": probabilities,
         "confidence": adjusted_confidence,
@@ -1066,17 +1096,56 @@ def render_prediction_card( match: Dict[str, Any], prediction: Dict[str, Any], o
     )
     score_a, score_b = st.columns(2)
     with score_a:
-        st.markdown("**Most likely scorelines**")
+        st.markdown("**Most likely exact scorelines**")
         score_table = pd.DataFrame(prediction.get("top_scorelines", []))
         if not score_table.empty:
             score_table["Probability"] = score_table.pop("probability").map(lambda x: f"{x * 100:.2f}%")
             st.dataframe(score_table[["score", "Probability"]], hide_index=True, use_container_width=True)
     with score_b:
-        st.markdown("**High-scoring alternatives (3+ goals)**")
-        high_table = pd.DataFrame(prediction.get("high_scoring_scorelines", []))
-        if not high_table.empty:
-            high_table["Probability"] = high_table.pop("probability").map(lambda x: f"{x * 100:.2f}%")
-            st.dataframe(high_table[["score", "Probability"]], hide_index=True, use_container_width=True)
+        st.markdown("**Most likely high-score pick (3+ total goals)**")
+        high_pick = prediction.get("best_high_scoreline")
+        strong_attackers = prediction.get("strong_attackers", [])
+        attack_label = {"home": home, "away": away}
+        if high_pick:
+            if strong_attackers:
+                attack_names = ", ".join(attack_label[side] for side in strong_attackers)
+                st.success(f"Above-league attack rate: {attack_names}")
+            else:
+                st.info("No team meets the model's strong-attack threshold; 3+ scoreline shown as a lower-probability alternative.")
+            st.markdown(
+                f"**{high_pick['score']}** — exact-score probability: "
+                f"**{high_pick['probability'] * 100:.2f}%**"
+            )
+            st.caption(
+                f"Match total 3+ probability: {probs['over25'] * 100:.1f}% | "
+                f"Among 3+ outcomes, this scoreline: "
+                f"{high_pick['conditional_probability'] * 100:.1f}%"
+            )
+            high_table = pd.DataFrame(prediction.get("high_scoring_scorelines", []))
+            if not high_table.empty:
+                high_table["Probability"] = high_table["probability"].map(lambda x: f"{x * 100:.2f}%")
+                st.dataframe(high_table[["score", "Probability"]], hide_index=True, use_container_width=True)
+        else:
+            st.caption("No 3+ goal scoreline available in the probability matrix.")
+    st.markdown("**Expected scoring probabilities**")
+    expected_table = pd.DataFrame({
+        "Event": [
+            f"{home} to score 1+",
+            f"{away} to score 1+",
+            "Match total 2+ goals",
+            "Match total 3+ goals",
+            "Match total 4+ goals",
+        ],
+        "Probability": [
+            probs["home_scores_1plus"],
+            probs["away_scores_1plus"],
+            probs["over15"],
+            probs["over25"],
+            probs["over35"],
+        ],
+    })
+    expected_table["Probability"] = expected_table["Probability"].map(lambda x: f"{x * 100:.1f}%")
+    st.dataframe(expected_table, hide_index=True, use_container_width=True)
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("1X2", f"{max(probs['home_win'], probs['draw'], probs['away_win']) * 100:.1f}%")
     c2.metric("Over 2.5", pct(probs["over25"]))
@@ -1112,12 +1181,17 @@ def render_prediction_card( match: Dict[str, Any], prediction: Dict[str, Any], o
     if show_details:
         with st.expander("Model details and limitations"):
             st.write(f"Expected goals: home **{prediction['home_lambda']:.2f}**, away **{prediction['away_lambda']:.2f}**")
+            st.write(
+                f"Smoothed attack index vs league: home **{prediction['home_attack_index']:.2f}×**, "
+                f"away **{prediction['away_attack_index']:.2f}×** "
+                f"(strong-attack threshold: {prediction['strong_attack_threshold']:.2f}×)"
+            )
             baseline = prediction.get("league_baseline", {})
             st.write(
                 f"League baseline (home/away): **{baseline.get('home_goals', 0):.2f} / "
                 f"{baseline.get('away_goals', 0):.2f}** goals per team-match"
             )
-            st.caption("Exact score သည် scoreline distribution ထဲက အမြင့်ဆုံးတစ်ခုသာဖြစ်ပြီး အာမခံချက်မဟုတ်ပါ။ Alternatives များ၏ probability ကိုလည်း အပေါ်တွင်ပြထားသည်။")
+            st.caption("Exact-score % သည် scoreline တစ်ခုချင်းစီ၏ probability ဖြစ်သည်။ 3+ ပွဲစုစုပေါင်း % နှင့် 3+ ဖြစ်ခဲ့သည့်အခြေအနေအတွင်း scoreline % ကို ခွဲပြထားပြီး အာမခံချက်မဟုတ်ပါ။")
             st.warning("ဤ model သည် trained/calibrated production model မဟုတ်သေးပါ။ Injury, lineup, xG နှင့် bookmaker closing-line data မပါသဖြင့် prediction ကို အာမခံချက်အဖြစ် မသုံးပါနှင့်။")
 
 
@@ -1273,8 +1347,8 @@ def render_history() -> None:
 # -----------------------------
 
 initialize_database()
-st.title("⚽ Professional Football Predictor V7.2")
-st.markdown("League-relative attack/defence Poisson • smoothed venue splits • scoreline probabilities • history & data-quality checks")
+st.title("⚽ Professional Football Predictor V7.3")
+st.markdown("League-relative attack/defence Poisson • expected percentages • strong-attack 3+ goal probabilities • history")
 
 with st.sidebar:
     st.header("🔑 API settings")
