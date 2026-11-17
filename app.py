@@ -13,7 +13,7 @@ import requests
 import streamlit as st
 
 # ============================================================
-# Professional Football Predictor V7.3.0
+# Professional Football Predictor V7.4.0
 # - Selected league view
 # - Top 10 cross-league view
 # - Prediction history and multi-metric accuracy
@@ -22,11 +22,12 @@ import streamlit as st
 # - League-relative, sample-smoothed home/away attack/defence rates
 # - Expected scoring percentages and strong-attack indicators
 # - Most probable 3+ goal scoreline with unconditional/conditional probabilities
+# - Expected-goal-bounded scoreline range with plausible lower-probability scores
 # - Reproducible Poisson prediction (not random/AI magic)
 # ============================================================
 
 st.set_page_config(
-    page_title="Professional Football Predictor V7.3",
+    page_title="Professional Football Predictor V7.4",
     page_icon="⚽",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -46,7 +47,7 @@ LEAGUES: Dict[str, str] = {
     "UEFA Europa League": "EL",
 }
 
-MODEL_VERSION = "league-relative-poisson-v7.3"
+MODEL_VERSION = "league-relative-poisson-v7.4"
 REQUEST_TIMEOUT = 20
 
 # -----------------------------
@@ -422,6 +423,32 @@ def top_scorelines(matrix: np.ndarray, limit: int = 8, min_total_goals: Optional
     return sorted(rows, key=lambda row: row["probability"], reverse=True)[:limit]
 
 
+def lower_probability_scorelines( matrix: np.ndarray, min_probability: float = 0.0005, max_probability: float = 0.02, marginal_coverage: float = 0.995, limit: int = 12, ) -> List[Dict[str, Any]]:
+    """List lower-probability scorelines inside an xG-based plausible range. The per-team goal ceiling is taken from each Poisson marginal's cumulative probability, so stronger expected-goal ratings naturally allow a wider, higher-scoring range. Individual scoreline probabilities are not inflated. """
+    home_marginal = np.sum(matrix, axis=1)
+    away_marginal = np.sum(matrix, axis=0)
+    home_cumulative = np.cumsum(home_marginal)
+    away_cumulative = np.cumsum(away_marginal)
+    home_hits = np.flatnonzero(home_cumulative >= marginal_coverage)
+    away_hits = np.flatnonzero(away_cumulative >= marginal_coverage)
+    home_ceiling = int(home_hits[0]) if len(home_hits) else matrix.shape[0] - 1
+    away_ceiling = int(away_hits[0]) if len(away_hits) else matrix.shape[1] - 1
+
+    rows: List[Dict[str, Any]] = []
+    for home_goals in range(home_ceiling + 1):
+        for away_goals in range(away_ceiling + 1):
+            probability = float(matrix[home_goals, away_goals])
+            if min_probability <= probability < max_probability:
+                rows.append({
+                    "score": f"{home_goals}-{away_goals}",
+                    "home_goals": home_goals,
+                    "away_goals": away_goals,
+                    "total_goals": home_goals + away_goals,
+                    "probability": probability,
+                })
+    return sorted(rows, key=lambda row: row["probability"], reverse=True)[:limit]
+
+
 def calculate_probabilities(matrix: np.ndarray) -> Dict[str, Any]:
     size = matrix.shape[0]
     home_win = float(sum(matrix[h, a] for h in range(size) for a in range(size) if h > a))
@@ -484,6 +511,7 @@ def predict_match( home: Dict[str, Any], away: Dict[str, Any], league_baseline: 
     matrix = score_matrix(home_lambda, away_lambda)
     best_score = tuple(int(x) for x in np.unravel_index(np.argmax(matrix), matrix.shape))
     probabilities = calculate_probabilities(matrix)
+    low_probability_scorelines = lower_probability_scorelines(matrix)
     high_scorelines = top_scorelines(matrix, limit=5, min_total_goals=3)
     best_high_scoreline = high_scorelines[0] if high_scorelines else None
     high_score_total_probability = float(probabilities["over25"])
@@ -514,6 +542,8 @@ def predict_match( home: Dict[str, Any], away: Dict[str, Any], league_baseline: 
         "top_scorelines": top_scorelines(matrix, limit=8),
         "high_scoring_scorelines": high_scorelines,
         "best_high_scoreline": best_high_scoreline,
+        "lower_probability_scorelines": low_probability_scorelines,
+        "lower_probability_band": {"minimum": 0.0005, "maximum_exclusive": 0.02},
         "home_attack_index": home_attack_index,
         "away_attack_index": away_attack_index,
         "strong_attackers": strong_attackers,
@@ -1094,6 +1124,12 @@ def render_prediction_card( match: Dict[str, Any], prediction: Dict[str, Any], o
         f"Kickoff: {local_time(match['utcDate'])} | Model: {MODEL_VERSION} | "
         f"Exact-score probability: {prediction['best_probability'] * 100:.1f}%"
     )
+    st.markdown("**Expected Goal rating (xG)**")
+    xg1, xg2, xg3, xg4 = st.columns(4)
+    xg1.metric(f"{home} expected goals", f"{prediction['home_lambda']:.2f}")
+    xg2.metric(f"{away} expected goals", f"{prediction['away_lambda']:.2f}")
+    xg3.metric(f"{home} to score 1+", f"{probs['home_scores_1plus'] * 100:.1f}%")
+    xg4.metric(f"{away} to score 1+", f"{probs['away_scores_1plus'] * 100:.1f}%")
     score_a, score_b = st.columns(2)
     with score_a:
         st.markdown("**Most likely exact scorelines**")
@@ -1146,6 +1182,18 @@ def render_prediction_card( match: Dict[str, Any], prediction: Dict[str, Any], o
     })
     expected_table["Probability"] = expected_table["Probability"].map(lambda x: f"{x * 100:.1f}%")
     st.dataframe(expected_table, hide_index=True, use_container_width=True)
+    with st.expander("Expected-goal-based lower-probability scorelines", expanded=False):
+        low_scores = pd.DataFrame(prediction.get("lower_probability_scorelines", []))
+        if low_scores.empty:
+            st.info("Expected-goal range ထဲမှာ 0.05%–2.00% ကြားရှိ scoreline မတွေ့ပါ။")
+        else:
+            low_scores["Probability"] = low_scores.pop("probability").map(lambda x: f"{x * 100:.2f}%")
+            st.caption(
+                "Expected Goal rating က သတ်မှတ်တဲ့ 99.5% scoring range အတွင်းက "
+                "ဖြစ်နိုင်ခြေ 0.05% မှ 2.00% အောက် scoreline တွေပါ။ "
+                "အဓိက prediction ထက် ဖြစ်နိုင်ခြေနည်းပြီး၊ ရလဒ်အာမခံချက်မဟုတ်ပါ။"
+            )
+            st.dataframe(low_scores[["score", "total_goals", "Probability"]], hide_index=True, use_container_width=True)
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("1X2", f"{max(probs['home_win'], probs['draw'], probs['away_win']) * 100:.1f}%")
     c2.metric("Over 2.5", pct(probs["over25"]))
@@ -1191,7 +1239,7 @@ def render_prediction_card( match: Dict[str, Any], prediction: Dict[str, Any], o
                 f"League baseline (home/away): **{baseline.get('home_goals', 0):.2f} / "
                 f"{baseline.get('away_goals', 0):.2f}** goals per team-match"
             )
-            st.caption("Exact-score % သည် scoreline တစ်ခုချင်းစီ၏ probability ဖြစ်သည်။ 3+ ပွဲစုစုပေါင်း % နှင့် 3+ ဖြစ်ခဲ့သည့်အခြေအနေအတွင်း scoreline % ကို ခွဲပြထားပြီး အာမခံချက်မဟုတ်ပါ။")
+            st.caption("Exact-score % သည် scoreline တစ်ခုချင်းစီ၏ probability ဖြစ်သည်။ xG က သတ်မှတ်သော 99.5% range အတွင်းရှိ 0.05%–2.00% lower-probability outcomes များကိုလည်း သီးခြားပြထားသည်။ 3+ ဂိုး probability ကိုလည်း သီးခြားကြည့်ပါ; မည်သည့် scoreline မဆို အာမခံချက်မဟုတ်ပါ။")
             st.warning("ဤ model သည် trained/calibrated production model မဟုတ်သေးပါ။ Injury, lineup, xG နှင့် bookmaker closing-line data မပါသဖြင့် prediction ကို အာမခံချက်အဖြစ် မသုံးပါနှင့်။")
 
 
@@ -1347,8 +1395,8 @@ def render_history() -> None:
 # -----------------------------
 
 initialize_database()
-st.title("⚽ Professional Football Predictor V7.3")
-st.markdown("League-relative attack/defence Poisson • expected percentages • strong-attack 3+ goal probabilities • history")
+st.title("⚽ Professional Football Predictor V7.4")
+st.markdown("xG-based scoreline probabilities • additional low-probability outcomes • strong-attack 3+ goal probabilities")
 
 with st.sidebar:
     st.header("🔑 API settings")
