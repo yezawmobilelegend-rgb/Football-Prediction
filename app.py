@@ -1,695 +1,485 @@
 from __future__ import annotations
 
+import io
+import json
 import math
-import re
 import sqlite3
-from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Iterable, List, Optional, Tuple
-from zoneinfo import ZoneInfo
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
 
+try:
+    from sklearn.linear_model import LogisticRegression
+    SKLEARN_AVAILABLE = True
+except Exception:
+    SKLEARN_AVAILABLE = False
+
 # ============================================================
-# Professional Football Predictor V3.0
-# - Selected league view
-# - Top 10 cross-league view
-# - Prediction history and multi-metric accuracy
-# - Robust API/error handling
-# - Data-quality and model-confidence disclosure
-# - Reproducible Poisson prediction (not random/AI magic)
+# Football Predictor V4
+# ============================================================
+# This version supports:
+# 1) walk-forward backtesting (no future leakage)
+# 2) temperature calibration on out-of-sample predictions
+# 3) injuries / suspensions features
+# 4) confirmed or expected line-up features
+# 5) team and match xG features
+# 6) bookmaker closing-line features and CLV
+# 7) optional API-Football enrichment adapter
+#
+# Required historical CSV columns for a full backtest:
+# date, home_team, away_team, home_goals, away_goals,
+# home_xg, away_xg, home_close_1x2, draw_close_1x2, away_close_1x2
+# Optional columns:
+# home_injuries, away_injuries, home_suspensions, away_suspensions,
+# home_lineup_confirmed, away_lineup_confirmed,
+# home_lineup_strength, away_lineup_strength,
+# home_close_over25, away_close_over25, closing_timestamp
+#
+# An API key is still required for live injury/lineup/xG/odds enrichment.
+# The code never invents unavailable data: missing features are imputed and
+# the data-quality score is reduced.
 # ============================================================
 
-st.set_page_config(
-    page_title="Professional Football Predictor V3",
-    page_icon="⚽",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
-
-DB_PATH = "football_history.db"
-LOCAL_TZ = ZoneInfo("Asia/Yangon")
+st.set_page_config(page_title="Professional Football Predictor V4", page_icon="⚽", layout="wide")
+DB_PATH = "football_history_v4.db"
 UTC = timezone.utc
+MODEL_VERSION = "walk-forward-logit-calibrated-v4.0"
 
-LEAGUES: Dict[str, str] = {
-    "English Premier League": "PL",
-    "Italian Serie A": "SA",
-    "Spanish La Liga": "PD",
-    "German Bundesliga": "BL1",
-    "French Ligue 1": "FL1",
-    "UEFA Champions League": "CL",
-    "UEFA Europa League": "EL",
+REQUIRED_COLUMNS = [
+    "date", "home_team", "away_team", "home_goals", "away_goals",
+    "home_xg", "away_xg", "home_close_1x2", "draw_close_1x2", "away_close_1x2",
+]
+OPTIONAL_DEFAULTS = {
+    "home_injuries": 0, "away_injuries": 0,
+    "home_suspensions": 0, "away_suspensions": 0,
+    "home_lineup_confirmed": 0, "away_lineup_confirmed": 0,
+    "home_lineup_strength": 1.0, "away_lineup_strength": 1.0,
+    "home_close_over25": np.nan, "away_close_over25": np.nan,
+    "closing_timestamp": "",
 }
 
-MODEL_VERSION = "poisson-v3.0"
-REQUEST_TIMEOUT = 20
-
 # -----------------------------
-# Generic helpers
+# General utilities
 # -----------------------------
 
-def now_utc() -> datetime:
-    return datetime.now(UTC)
+def now_iso() -> str:
+    return datetime.now(UTC).isoformat()
 
 
-def iso_now() -> str:
-    return now_utc().isoformat()
-
-
-def safe_float(value: Any) -> Optional[float]:
+def num(value: Any, default: float = np.nan) -> float:
     try:
         if value is None or str(value).strip() == "":
-            return None
+            return default
         return float(value)
     except (TypeError, ValueError):
-        return None
+        return default
 
 
-def pct(value: Optional[float]) -> str:
-    return "—" if value is None else f"{value * 100:.1f}%"
+def clamp(x: float, low: float, high: float) -> float:
+    return max(low, min(high, x))
 
 
-def clamp(value: float, low: float, high: float) -> float:
-    return max(low, min(high, value))
+def result_code(home: int, away: int) -> str:
+    return "H" if home > away else "D" if home == away else "A"
 
 
-def parse_utc(value: str) -> datetime:
-    return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(UTC)
+def normalize_team(name: Any) -> str:
+    return "".join(ch for ch in str(name or "").lower() if ch.isalnum())
 
 
-def local_time(value: str) -> str:
-    return parse_utc(value).astimezone(LOCAL_TZ).strftime("%Y-%m-%d %H:%M MMT")
+def team_equal(a: Any, b: Any) -> bool:
+    x, y = normalize_team(a), normalize_team(b)
+    return bool(x and y and (x == y or (len(x) >= 6 and x in y) or (len(y) >= 6 and y in x)))
 
 
-def normalize_name(name: Any) -> str:
-    text = str(name or "").lower()
-    replacements = {
-        "&": "and",
-        "fc": "",
-        "afc": "",
-        "cf": "",
-        "ssc": "",
-    }
-    for old, new in replacements.items():
-        text = text.replace(old, new)
-    return re.sub(r"[^a-z0-9]", "", text)
-
-
-def team_match(left: Any, right: Any) -> bool:
-    a, b = normalize_name(left), normalize_name(right)
-    if not a or not b:
-        return False
-    return a == b or (len(a) >= 6 and a in b) or (len(b) >= 6 and b in a)
-
-
-def result_code(home_goals: int, away_goals: int) -> str:
-    if home_goals > away_goals:
-        return "H"
-    if home_goals == away_goals:
-        return "D"
-    return "A"
+def safe_logit_probability(p: float) -> float:
+    return math.log(clamp(p, 1e-6, 1 - 1e-6) / clamp(1 - p, 1e-6, 1 - 1e-6))
 
 # -----------------------------
-# Database
+# Database for predictions/backtests
 # -----------------------------
 
-SCHEMA = """ CREATE TABLE IF NOT EXISTS predictions ( id INTEGER PRIMARY KEY AUTOINCREMENT, match_id TEXT UNIQUE NOT NULL, league_code TEXT, league_name TEXT, match_date TEXT, home_team TEXT, away_team TEXT, predicted_home INTEGER, predicted_away INTEGER, home_lambda REAL, away_lambda REAL, home_prob REAL, draw_prob REAL, away_prob REAL, over25_prob REAL, under25_prob REAL, btts_yes_prob REAL, confidence REAL, data_quality REAL, model_version TEXT, actual_home INTEGER, actual_away INTEGER, result_correct INTEGER, exact_score_correct INTEGER, over25_correct INTEGER, btts_correct INTEGER, created_at TEXT, actual_updated_at TEXT ) """
+SCHEMA = """ CREATE TABLE IF NOT EXISTS predictions ( id INTEGER PRIMARY KEY AUTOINCREMENT, match_id TEXT UNIQUE, match_date TEXT, home_team TEXT, away_team TEXT, predicted_home INTEGER, predicted_away INTEGER, p_home REAL, p_draw REAL, p_away REAL, p_over25 REAL, p_btts REAL, data_quality REAL, closing_home REAL, closing_draw REAL, closing_away REAL, actual_home INTEGER, actual_away INTEGER, created_at TEXT, model_version TEXT ) """
 
 
-def db_connection() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
+def conn() -> sqlite3.Connection:
+    return sqlite3.connect(DB_PATH)
 
 
-def initialize_database() -> None:
-    with db_connection() as conn:
-        conn.execute(SCHEMA)
-        # Safe migration for databases created by older versions.
-        existing = {row[1] for row in conn.execute("PRAGMA table_info(predictions)")}
-        additions = {
-            "league_code": "TEXT",
-            "league_name": "TEXT",
-            "home_prob": "REAL",
-            "draw_prob": "REAL",
-            "away_prob": "REAL",
-            "over25_prob": "REAL",
-            "under25_prob": "REAL",
-            "btts_yes_prob": "REAL",
-            "confidence": "REAL",
-            "data_quality": "REAL",
-            "model_version": "TEXT",
-            "result_correct": "INTEGER",
-            "exact_score_correct": "INTEGER",
-            "over25_correct": "INTEGER",
-            "btts_correct": "INTEGER",
-            "actual_updated_at": "TEXT",
-        }
-        for column, kind in additions.items():
-            if column not in existing:
-                conn.execute(f"ALTER TABLE predictions ADD COLUMN {column} {kind}")
-        conn.commit()
+def init_db() -> None:
+    with conn() as c:
+        c.execute(SCHEMA)
+        c.commit()
 
 
-def save_prediction(match: Dict[str, Any], prediction: Dict[str, Any], league_code: str, league_name: str) -> None:
-    with db_connection() as conn:
-        conn.execute(
-            """ INSERT INTO predictions ( match_id, league_code, league_name, match_date, home_team, away_team, predicted_home, predicted_away, home_lambda, away_lambda, home_prob, draw_prob, away_prob, over25_prob, under25_prob, btts_yes_prob, confidence, data_quality, model_version, created_at ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(match_id) DO UPDATE SET league_code=excluded.league_code, league_name=excluded.league_name, home_lambda=excluded.home_lambda, away_lambda=excluded.away_lambda, home_prob=excluded.home_prob, draw_prob=excluded.draw_prob, away_prob=excluded.away_prob, over25_prob=excluded.over25_prob, under25_prob=excluded.under25_prob, btts_yes_prob=excluded.btts_yes_prob, confidence=excluded.confidence, data_quality=excluded.data_quality, model_version=excluded.model_version """,
-            (
-                str(match["id"]), league_code, league_name, match["utcDate"],
-                match["homeTeam"]["name"], match["awayTeam"]["name"],
-                int(prediction["best_score"][0]), int(prediction["best_score"][1]),
-                prediction["home_lambda"], prediction["away_lambda"],
-                prediction["probabilities"]["home_win"], prediction["probabilities"]["draw"],
-                prediction["probabilities"]["away_win"], prediction["probabilities"]["over25"],
-                prediction["probabilities"]["under25"], prediction["probabilities"]["btts_yes"],
-                prediction["confidence"], prediction["data_quality"], MODEL_VERSION, iso_now(),
-            ),
+def save_live_prediction(row: Dict[str, Any], pred: Dict[str, Any]) -> None:
+    with conn() as c:
+        c.execute(
+            """INSERT INTO predictions (match_id, match_date, home_team, away_team, predicted_home, predicted_away, p_home, p_draw, p_away, p_over25, p_btts, data_quality, closing_home, closing_draw, closing_away, created_at, model_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(match_id) DO UPDATE SET p_home=excluded.p_home, p_draw=excluded.p_draw, p_away=excluded.p_away, p_over25=excluded.p_over25, p_btts=excluded.p_btts, data_quality=excluded.data_quality, model_version=excluded.model_version""",
+            (str(row.get("match_id", row.get("date", ""))), row.get("date"), row.get("home_team"), row.get("away_team"),
+             int(pred["score"][0]), int(pred["score"][1]), pred["p_home"], pred["p_draw"], pred["p_away"],
+             pred["p_over25"], pred["p_btts"], pred["data_quality"], row.get("home_close_1x2"),
+             row.get("draw_close_1x2"), row.get("away_close_1x2"), now_iso(), MODEL_VERSION),
         )
-        conn.commit()
-
-
-def load_history() -> pd.DataFrame:
-    with db_connection() as conn:
-        return pd.read_sql_query("SELECT * FROM predictions ORDER BY match_date DESC", conn)
+        c.commit()
 
 # -----------------------------
-# API layer
+# Historical data and feature engineering
 # -----------------------------
 
-
-def api_get(url: str, headers: Optional[Dict[str, str]] = None, params: Optional[Dict[str, Any]] = None) -> Tuple[Optional[Any], Optional[str]]:
-    try:
-        response = requests.get(url, headers=headers, params=params, timeout=REQUEST_TIMEOUT)
-        if response.status_code == 200:
-            try:
-                return response.json(), None
-            except ValueError:
-                return None, "API returned invalid JSON."
-        messages = {
-            401: "API key is invalid or missing.",
-            403: "API key does not have permission for this endpoint.",
-            404: "Requested API endpoint was not found.",
-            429: "API rate limit reached. Please wait before refreshing.",
-        }
-        return None, messages.get(response.status_code, f"API error: HTTP {response.status_code}")
-    except requests.Timeout:
-        return None, "API request timed out."
-    except requests.RequestException as exc:
-        return None, f"Network error: {exc}"
-
-
-@st.cache_data(ttl=900, show_spinner=False)
-def fetch_fixtures(league_code: str, api_key: str) -> Tuple[List[Dict[str, Any]], Optional[str]]:
-    if not api_key:
-        return [], "Football-data.org API key is missing."
-    data, error = api_get(
-        f"https://api.football-data.org/v4/competitions/{league_code}/matches",
-        headers={"X-Auth-Token": api_key},
-        params={"status": "SCHEDULED"},
-    )
-    if error or not data:
-        return [], error or "No fixture data returned."
-    start, end = now_utc(), now_utc() + timedelta(days=7)
-    fixtures = []
-    for match in data.get("matches", []):
-        try:
-            kickoff = parse_utc(match["utcDate"])
-            if start <= kickoff <= end:
-                fixtures.append(match)
-        except (KeyError, ValueError):
-            continue
-    return sorted(fixtures, key=lambda x: x.get("utcDate", "")), None
+def validate_history(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
+    errors = []
+    out = df.copy()
+    missing = [c for c in REQUIRED_COLUMNS if c not in out.columns]
+    if missing:
+        errors.append("Missing required columns: " + ", ".join(missing))
+        return out, errors
+    for col, default in OPTIONAL_DEFAULTS.items():
+        if col not in out.columns:
+            out[col] = default
+    out["date"] = pd.to_datetime(out["date"], utc=True, errors="coerce")
+    if out["date"].isna().any():
+        errors.append("Some date values are invalid and will be dropped.")
+    numeric_cols = [c for c in REQUIRED_COLUMNS[3:] if c != "closing_timestamp"] + list(OPTIONAL_DEFAULTS.keys())
+    for col in numeric_cols:
+        if col in out.columns and col != "closing_timestamp":
+            out[col] = pd.to_numeric(out[col], errors="coerce")
+    out = out.dropna(subset=["date", "home_team", "away_team", "home_goals", "away_goals"])
+    out = out.sort_values("date").reset_index(drop=True)
+    if len(out) < 30:
+        errors.append("Fewer than 30 usable matches: metrics will be unstable.")
+    return out, errors
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_finished(league_code: str, api_key: str) -> Tuple[List[Dict[str, Any]], Optional[str]]:
-    if not api_key:
-        return [], "Football-data.org API key is missing."
-    data, error = api_get(
-        f"https://api.football-data.org/v4/competitions/{league_code}/matches",
-        headers={"X-Auth-Token": api_key},
-        params={"status": "FINISHED"},
-    )
-    if error or not data:
-        return [], error or "No finished-match data returned."
-    return data.get("matches", []), None
+def rolling_team_features(history: pd.DataFrame, before_date: pd.Timestamp, team: str, venue: str, window: int = 10) -> Dict[str, float]:
+    past = history[history["date"] < before_date]
+    rows = past[(past["home_team"].map(lambda x: team_equal(x, team))) | (past["away_team"].map(lambda x: team_equal(x, team)))].tail(window)
+    if rows.empty:
+        return {"gf": 1.35, "ga": 1.35, "xgf": 1.35, "xga": 1.35, "points": 1.25, "played": 0}
+    gf, ga, xgf, xga, points = [], [], [], [], []
+    for _, r in rows.iterrows():
+        is_home = team_equal(r["home_team"], team)
+        goals_for = r["home_goals"] if is_home else r["away_goals"]
+        goals_against = r["away_goals"] if is_home else r["home_goals"]
+        x_for = num(r["home_xg"] if is_home else r["away_xg"], goals_for)
+        x_against = num(r["away_xg"] if is_home else r["home_xg"], goals_against)
+        gf.append(goals_for); ga.append(goals_against); xgf.append(x_for); xga.append(x_against)
+        points.append(3 if goals_for > goals_against else 1 if goals_for == goals_against else 0)
+    return {"gf": float(np.mean(gf)), "ga": float(np.mean(ga)), "xgf": float(np.mean(xgf)), "xga": float(np.mean(xga)), "points": float(np.mean(points)), "played": len(rows)}
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_standings(league_code: str, api_key: str) -> Tuple[Dict[str, Dict[str, Any]], Optional[str]]:
-    if not api_key:
-        return {}, "Football-data.org API key is missing."
-    data, error = api_get(
-        f"https://api.football-data.org/v4/competitions/{league_code}/standings",
-        headers={"X-Auth-Token": api_key},
-    )
-    if error or not data:
-        return {}, error or "No standings data returned."
-    stats: Dict[str, Dict[str, Any]] = {}
-    for table in data.get("standings", []):
-        if table.get("type") != "TOTAL":
-            continue
-        for row in table.get("table", []):
-            team = row.get("team", {}).get("name")
-            if not team:
-                continue
-            stats[team] = {
-                "position": row.get("position"),
-                "points": row.get("points", 0),
-                "played": row.get("playedGames", 0),
-                "gd": row.get("goalDifference", 0),
-                "gf": row.get("goalsFor", 0),
-                "ga": row.get("goalsAgainst", 0),
-            }
-    return stats, None
-
-
-@st.cache_data(ttl=300, show_spinner=False)
-def fetch_odds(api_key: str) -> Tuple[List[Dict[str, Any]], Optional[str]]:
-    if not api_key:
-        return [], "Odds API key is missing."
-    data, error = api_get(
-        "https://api.odds-api.io/v1/odds",
-        params={"apiKey": api_key, "sport": "soccer", "region": "eu"},
-    )
-    if error or data is None:
-        return [], error or "No odds data returned."
-    if isinstance(data, list):
-        return data, None
-    if isinstance(data, dict):
-        return data.get("data", []), None
-    return [], "Unexpected odds API response format."
-
-
-def update_actual_results(league_code: str, api_key: str) -> Tuple[int, Optional[str]]:
-    matches, error = fetch_finished(league_code, api_key)
-    if error:
-        return 0, error
-    updated = 0
-    with db_connection() as conn:
-        for match in matches:
-            score = match.get("score", {}).get("fullTime", {})
-            home_goals, away_goals = score.get("home"), score.get("away")
-            match_id = str(match.get("id"))
-            if home_goals is None or away_goals is None:
-                continue
-            row = conn.execute(
-                "SELECT predicted_home, predicted_away, home_prob, draw_prob, away_prob, over25_prob, btts_yes_prob FROM predictions WHERE match_id=?",
-                (match_id,),
-            ).fetchone()
-            if row is None:
-                continue
-            predicted_result = result_code(row[0], row[1])
-            actual_result = result_code(home_goals, away_goals)
-            expected_result = max(
-                [(row[2] or 0, "H"), (row[3] or 0, "D"), (row[4] or 0, "A")],
-                key=lambda x: x[0],
-            )[1]
-            actual_over25 = int(home_goals + away_goals > 2.5)
-            actual_btts = int(home_goals > 0 and away_goals > 0)
-            over_prediction = int((row[5] or 0) >= 0.5)
-            btts_prediction = int((row[6] or 0) >= 0.5)
-            conn.execute(
-                """ UPDATE predictions SET actual_home=?, actual_away=?, result_correct=?, exact_score_correct=?, over25_correct=?, btts_correct=?, actual_updated_at=? WHERE match_id=? """,
-                (
-                    home_goals, away_goals,
-                    int(expected_result == actual_result),
-                    int(row[0] == home_goals and row[1] == away_goals),
-                    int(over_prediction == actual_over25),
-                    int(btts_prediction == actual_btts),
-                    iso_now(), match_id,
-                ),
-            )
-            updated += 1
-        conn.commit()
-    fetch_finished.clear()
-    return updated, None
-
-# -----------------------------
-# Form and model
-# -----------------------------
-
-def build_form(finished: Iterable[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-    by_team: Dict[str, List[Dict[str, Any]]] = {}
-    for match in finished:
-        score = match.get("score", {}).get("fullTime", {})
-        hg, ag = score.get("home"), score.get("away")
-        if hg is None or ag is None:
-            continue
-        home = match.get("homeTeam", {}).get("name")
-        away = match.get("awayTeam", {}).get("name")
-        date = match.get("utcDate", "")
-        if not home or not away:
-            continue
-        by_team.setdefault(home, []).append({"date": date, "points": 3 if hg > ag else 1 if hg == ag else 0, "gf": hg, "ga": ag, "home": True})
-        by_team.setdefault(away, []).append({"date": date, "points": 3 if ag > hg else 1 if ag == hg else 0, "gf": ag, "ga": hg, "home": False})
-    result = {}
-    for team, games in by_team.items():
-        games = sorted(games, key=lambda x: x["date"], reverse=True)[:10]
-        result[team] = {
-            "played": len(games),
-            "points": sum(x["points"] for x in games),
-            "gf": sum(x["gf"] for x in games),
-            "ga": sum(x["ga"] for x in games),
-            "form": "".join("W" if x["points"] == 3 else "D" if x["points"] == 1 else "L" for x in games),
-            "home_games": [x for x in games if x["home"]],
-            "away_games": [x for x in games if not x["home"]],
-        }
-    return result
-
-
-def find_team_data(team: str, standings: Dict[str, Dict[str, Any]], form: Dict[str, Dict[str, Any]]) -> Tuple[Dict[str, Any], int]:
-    standing = next((v for k, v in standings.items() if team_match(team, k)), None)
-    recent = next((v for k, v in form.items() if team_match(team, k)), None)
-    data = recent or {"played": 0, "points": 0, "gf": 0, "ga": 0, "form": "N/A", "home_games": [], "away_games": []}
-    quality = 0
-    if standing:
-        quality += 30
-    if data["played"] >= 5:
-        quality += 30
-    elif data["played"] > 0:
-        quality += 15
-    if data["played"] >= 8:
-        quality += 20
-    if standing and standing.get("played", 0) > 0:
-        quality += 20
-    # A transparent strength score; it is intentionally not mislabeled as Elo.
-    points_per_game = (standing.get("points", 0) / standing.get("played", 1)) if standing else 1.2
-    gd_per_game = (standing.get("gd", 0) / standing.get("played", 1)) if standing else 0
-    data = dict(data)
-    data["strength"] = 1500 + clamp(points_per_game, 0, 3) * 45 + clamp(gd_per_game, -3, 3) * 15
-    data["standing"] = standing or {}
-    return data, min(100, quality)
-
-
-def poisson_pmf(lam: float, goals: int) -> float:
-    return math.exp(-lam) * lam ** goals / math.factorial(goals)
-
-
-def score_matrix(home_lambda: float, away_lambda: float, max_goals: int = 10) -> np.ndarray:
-    matrix = np.array(
-        [[poisson_pmf(home_lambda, h) * poisson_pmf(away_lambda, a) for a in range(max_goals + 1)] for h in range(max_goals + 1)],
-        dtype=float,
-    )
-    total = matrix.sum()
-    if total <= 0 or not np.isfinite(total):
-        raise ValueError("Invalid probability matrix")
-    return matrix / total
-
-
-def calculate_probabilities(matrix: np.ndarray) -> Dict[str, Any]:
-    size = matrix.shape[0]
-    home_win = float(sum(matrix[h, a] for h in range(size) for a in range(size) if h > a))
-    draw = float(sum(matrix[h, a] for h in range(size) for a in range(size) if h == a))
-    away_win = float(sum(matrix[h, a] for h in range(size) for a in range(size) if h < a))
-    total_probs = {total: float(sum(matrix[h, total - h] for h in range(size) if 0 <= total - h < size)) for total in range(2 * size - 1)}
-    over25 = sum(p for total, p in total_probs.items() if total > 2.5)
-    under25 = sum(p for total, p in total_probs.items() if total < 2.5)
-    btts_yes = float(sum(matrix[h, a] for h in range(1, size) for a in range(1, size)))
-    return {
-        "home_win": home_win, "draw": draw, "away_win": away_win,
-        "over25": over25, "under25": under25,
-        "btts_yes": btts_yes, "btts_no": 1 - btts_yes,
-        "total_probs": total_probs,
-    }
-
-
-def predict_match(home: Dict[str, Any], away: Dict[str, Any]) -> Dict[str, Any]:
-    # Conservative, reproducible model. It is a baseline and should be backtested before betting use.
-    base_home, base_away = 1.48, 1.12
-    strength_diff = (home["strength"] - away["strength"]) / 200
-    home_form_ppg = home["points"] / max(home["played"], 1)
-    away_form_ppg = away["points"] / max(away["played"], 1)
-    form_diff = (home_form_ppg - away_form_ppg) / 3
-
-    home_lambda = base_home + 0.35 * strength_diff + 0.20 * form_diff
-    away_lambda = base_away - 0.25 * strength_diff - 0.15 * form_diff
-
-    home_games = home.get("home_games", [])
-    away_games = away.get("away_games", [])
-    if home_games:
-        home_lambda = 0.65 * home_lambda + 0.35 * (sum(x["gf"] for x in home_games) / len(home_games))
-    if away_games:
-        away_lambda = 0.65 * away_lambda + 0.35 * (sum(x["gf"] for x in away_games) / len(away_games))
-
-    home_lambda = clamp(home_lambda, 0.25, 4.0)
-    away_lambda = clamp(away_lambda, 0.20, 3.5)
-    matrix = score_matrix(home_lambda, away_lambda)
-    best_score = tuple(int(x) for x in np.unravel_index(np.argmax(matrix), matrix.shape))
-    probabilities = calculate_probabilities(matrix)
-    result_probs = [probabilities["home_win"], probabilities["draw"], probabilities["away_win"]]
-    confidence = clamp(max(result_probs), 0, 1)
-    data_quality = (home.get("quality", 0) + away.get("quality", 0)) / 2 / 100
-    # Confidence is reduced when the underlying team data is incomplete.
-    adjusted_confidence = confidence * (0.65 + 0.35 * data_quality)
-    return {
-        "home_lambda": home_lambda,
-        "away_lambda": away_lambda,
-        "matrix": matrix,
-        "best_score": best_score,
-        "best_probability": float(matrix[best_score]),
-        "probabilities": probabilities,
-        "confidence": adjusted_confidence,
-        "data_quality": data_quality,
-    }
-
-# -----------------------------
-# Odds parsing and value checks
-# -----------------------------
-
-def extract_match_odds(home: str, away: str, odds_data: List[Dict[str, Any]]) -> Dict[str, Optional[float]]:
-    result: Dict[str, Optional[float]] = {
-        "home_win": None, "draw": None, "away_win": None,
-        "over25": None, "under25": None,
-        "home_handicap": None, "away_handicap": None,
-        "home_line": None, "away_line": None,
-    }
-    matching_events = [
-        event for event in odds_data
-        if team_match(home, event.get("home_team")) and team_match(away, event.get("away_team"))
+def feature_row(history: pd.DataFrame, row: pd.Series) -> Tuple[np.ndarray, float, Dict[str, float]]:
+    date = row["date"]
+    home = rolling_team_features(history, date, row["home_team"], "home")
+    away = rolling_team_features(history, date, row["away_team"], "away")
+    home_xg = num(row.get("home_xg"), home["xgf"])
+    away_xg = num(row.get("away_xg"), away["xgf"])
+    injuries_diff = num(row.get("away_injuries"), 0) - num(row.get("home_injuries"), 0)
+    suspension_diff = num(row.get("away_suspensions"), 0) - num(row.get("home_suspensions"), 0)
+    lineup_diff = num(row.get("home_lineup_strength"), 1) - num(row.get("away_lineup_strength"), 1)
+    lineup_confirmed = (num(row.get("home_lineup_confirmed"), 0) + num(row.get("away_lineup_confirmed"), 0)) / 2
+    close_home = num(row.get("home_close_1x2"))
+    close_draw = num(row.get("draw_close_1x2"))
+    close_away = num(row.get("away_close_1x2"))
+    close_home_p = 1 / close_home if np.isfinite(close_home) and close_home > 1 else 1 / 3
+    close_draw_p = 1 / close_draw if np.isfinite(close_draw) and close_draw > 1 else 1 / 3
+    close_away_p = 1 / close_away if np.isfinite(close_away) and close_away > 1 else 1 / 3
+    close_sum = close_home_p + close_draw_p + close_away_p
+    close_home_p, close_draw_p, close_away_p = close_home_p / close_sum, close_draw_p / close_sum, close_away_p / close_sum
+    x = np.array([
+        home["xgf"] - away["xgf"], home["xga"] - away["xga"],
+        home["gf"] - away["gf"], home["ga"] - away["ga"],
+        home["points"] - away["points"], home_xg - away_xg,
+        injuries_diff, suspension_diff, lineup_diff, lineup_confirmed,
+        close_home_p, close_draw_p, close_away_p,
+    ], dtype=float)
+    # Only values that genuinely exist receive full quality credit.
+    quality_parts = [
+        int(num(row.get("home_xg")) == num(row.get("home_xg")) and num(row.get("away_xg")) == num(row.get("away_xg"))),
+        int(np.isfinite(close_home) and np.isfinite(close_draw) and np.isfinite(close_away)),
+        int("home_injuries" in row.index and "away_injuries" in row.index),
+        int("home_lineup_confirmed" in row.index and "away_lineup_confirmed" in row.index),
+        int(home["played"] >= 5 and away["played"] >= 5),
     ]
-    # Prefer the first matching event but aggregate best prices across bookmakers.
-    for event in matching_events:
-        for bookmaker in event.get("bookmakers", []):
-            for market in bookmaker.get("markets", []):
-                key = str(market.get("key", "")).lower()
-                for outcome in market.get("outcomes", []):
-                    name = str(outcome.get("name", ""))
-                    price = safe_float(outcome.get("price"))
-                    point = safe_float(outcome.get("point"))
-                    if price is None or price <= 1:
-                        continue
-                    if key in {"h2h", "1x2", "match_winner"}:
-                        if team_match(home, name): result["home_win"] = max(result["home_win"] or 0, price)
-                        elif team_match(away, name): result["away_win"] = max(result["away_win"] or 0, price)
-                        elif "draw" in name.lower() or "tie" in name.lower(): result["draw"] = max(result["draw"] or 0, price)
-                    elif key in {"totals", "over_under"} and point == 2.5:
-                        if "over" in name.lower(): result["over25"] = max(result["over25"] or 0, price)
-                        elif "under" in name.lower(): result["under25"] = max(result["under25"] or 0, price)
-                    elif key in {"spreads", "handicap"}:
-                        if team_match(home, name): result["home_handicap"], result["home_line"] = max(result["home_handicap"] or 0, price), point
-                        elif team_match(away, name): result["away_handicap"], result["away_line"] = max(result["away_handicap"] or 0, price), point
+    quality = float(np.mean(quality_parts))
+    meta = {"close_home_p": close_home_p, "close_draw_p": close_draw_p, "close_away_p": close_away_p, "home_xg": home_xg, "away_xg": away_xg}
+    return x, quality, meta
+
+# -----------------------------
+# Model, calibration and backtesting
+# -----------------------------
+
+def fallback_probs(x: np.ndarray) -> np.ndarray:
+    z = np.array([0.8 * x[0] - 0.4 * x[1] + 0.9 * x[4] + 0.5 * x[5], 0.0, -0.8 * x[0] + 0.4 * x[1] - 0.9 * x[4] - 0.5 * x[5]])
+    z -= np.max(z)
+    e = np.exp(z)
+    return e / e.sum()
+
+
+def fit_classifier(X: np.ndarray, y: np.ndarray) -> Any:
+    if SKLEARN_AVAILABLE and len(np.unique(y)) >= 2 and len(y) >= 20:
+        model = LogisticRegression(max_iter=1000, multi_class="multinomial", C=0.7)
+        model.fit(X, y)
+        return model
+    return None
+
+
+def raw_probability(model: Any, x: np.ndarray) -> np.ndarray:
+    if model is None:
+        return fallback_probs(x)
+    p = model.predict_proba(x.reshape(1, -1))[0]
+    out = np.zeros(3)
+    for cls, value in zip(model.classes_, p):
+        out[int(cls)] = value
+    return out / out.sum()
+
+
+def temperature_scale(probs: np.ndarray, y: np.ndarray) -> float:
+    if len(probs) < 20:
+        return 1.0
+    best_t, best_loss = 1.0, float("inf")
+    for t in np.linspace(0.5, 3.0, 51):
+        logits = np.log(np.clip(probs, 1e-8, 1)) / t
+        logits -= logits.max(axis=1, keepdims=True)
+        calibrated = np.exp(logits); calibrated /= calibrated.sum(axis=1, keepdims=True)
+        loss = -np.mean(np.log(np.clip(calibrated[np.arange(len(y)), y], 1e-8, 1)))
+        if loss < best_loss:
+            best_loss, best_t = loss, float(t)
+    return best_t
+
+
+def apply_temperature(p: np.ndarray, t: float) -> np.ndarray:
+    logits = np.log(np.clip(p, 1e-8, 1)) / max(t, 1e-6)
+    logits -= logits.max()
+    out = np.exp(logits); return out / out.sum()
+
+
+def brier_score(probs: np.ndarray, y: np.ndarray) -> float:
+    onehot = np.eye(3)[y.astype(int)]
+    return float(np.mean(np.sum((probs - onehot) ** 2, axis=1)))
+
+
+def log_loss(probs: np.ndarray, y: np.ndarray) -> float:
+    return float(-np.mean(np.log(np.clip(probs[np.arange(len(y)), y.astype(int)], 1e-8, 1))))
+
+
+def backtest(history: pd.DataFrame, min_train: int = 30) -> Dict[str, Any]:
+    X, qualities, targets, metas = [], [], [], []
+    for _, row in history.iterrows():
+        x, q, meta = feature_row(history, row)
+        X.append(x); qualities.append(q); metas.append(meta)
+        targets.append(0 if row["home_goals"] > row["away_goals"] else 1 if row["home_goals"] == row["away_goals"] else 2)
+    X, y = np.asarray(X), np.asarray(targets)
+    predictions, actuals, dates, qs = [], [], [], []
+    # Strict walk-forward: each row is predicted only using previous rows.
+    for i in range(min_train, len(history)):
+        model = fit_classifier(X[:i], y[:i])
+        p = raw_probability(model, X[i])
+        predictions.append(p); actuals.append(y[i]); dates.append(history.iloc[i]["date"]); qs.append(qualities[i])
+    if not predictions:
+        return {"error": f"Need at least {min_train + 1} rows for a backtest."}
+    P, Y = np.asarray(predictions), np.asarray(actuals)
+    # Calibrator is fitted on OOS predictions only, never on training features.
+    t = temperature_scale(P, Y)
+    PC = np.asarray([apply_temperature(p, t) for p in P])
+    pred_class = PC.argmax(axis=1)
+    return {
+        "predictions": PC, "raw_predictions": P, "actuals": Y, "dates": dates, "qualities": qs,
+        "temperature": t, "accuracy": float(np.mean(pred_class == Y)),
+        "brier": brier_score(PC, Y), "logloss": log_loss(PC, Y),
+        "n": len(Y), "pred_class": pred_class,
+    }
+
+
+def train_final_model(history: pd.DataFrame, calibration: Optional[Dict[str, Any]]) -> Tuple[Any, float]:
+    X, y = [], []
+    for _, row in history.iterrows():
+        x, _, _ = feature_row(history, row); X.append(x)
+        y.append(0 if row["home_goals"] > row["away_goals"] else 1 if row["home_goals"] == row["away_goals"] else 2)
+    model = fit_classifier(np.asarray(X), np.asarray(y))
+    return model, float(calibration.get("temperature", 1.0) if calibration else 1.0)
+
+# -----------------------------
+# API-Football optional enrichment
+# -----------------------------
+
+def api_football_get(endpoint: str, params: Dict[str, Any], key: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    if not key:
+        return None, "API-Football key is missing."
+    try:
+        r = requests.get("https://v3.football.api-sports.io/" + endpoint, params=params, headers={"x-apisports-key": key}, timeout=20)
+        if r.status_code != 200:
+            return None, f"API-Football HTTP {r.status_code}"
+        data = r.json()
+        if data.get("errors"):
+            return None, str(data["errors"])
+        return data, None
+    except requests.RequestException as exc:
+        return None, str(exc)
+
+
+def fetch_enrichment(fixture_id: int, key: str) -> Dict[str, Any]:
+    """Fetch injuries, lineups, xG statistics and pre-match odds where provider supplies them. API-Football endpoint availability and quotas depend on plan. Missing endpoint responses are returned as missing fields rather than fabricated values. """
+    result: Dict[str, Any] = {"injuries": [], "lineups": [], "statistics": [], "odds": [], "errors": []}
+    for endpoint, target in [("injuries", "injuries"), ("fixtures/lineups", "lineups"), ("fixtures/statistics", "statistics"), ("odds", "odds")]:
+        params = {"fixture": fixture_id}
+        data, error = api_football_get(endpoint, params, key)
+        if error:
+            result["errors"].append(f"{endpoint}: {error}")
+        elif data:
+            result[target] = data.get("response", [])
     return result
 
 
-def implied_probability(decimal_odds: Optional[float]) -> Optional[float]:
-    return None if not decimal_odds or decimal_odds <= 1 else 1 / decimal_odds
-
-
-def value_edge(model_probability: float, decimal_odds: Optional[float]) -> Optional[float]:
-    implied = implied_probability(decimal_odds)
-    return None if implied is None else model_probability - implied
-
-# -----------------------------
-# UI components
-# -----------------------------
-
-def render_prediction_card(match: Dict[str, Any], prediction: Dict[str, Any], odds: Dict[str, Optional[float]], show_details: bool = True) -> None:
-    home = match["homeTeam"]["name"]
-    away = match["awayTeam"]["name"]
-    probs = prediction["probabilities"]
-    score = prediction["best_score"]
-    st.markdown(f"### {home} **{score[0]}–{score[1]}** {away}")
-    st.caption(f"Kickoff: {local_time(match['utcDate'])} | Model: {MODEL_VERSION}")
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("1X2", f"{max(probs['home_win'], probs['draw'], probs['away_win']) * 100:.1f}%")
-    c2.metric("Over 2.5", pct(probs["over25"]))
-    c3.metric("BTTS Yes", pct(probs["btts_yes"]))
-    c4.metric("Data quality", f"{prediction['data_quality'] * 100:.0f}%")
-    st.progress(float(prediction["confidence"]), text=f"Adjusted confidence: {prediction['confidence'] * 100:.1f}%")
-
-    result_table = pd.DataFrame({
-        "Market": ["Home win", "Draw", "Away win", "Over 2.5", "Under 2.5", "BTTS Yes", "BTTS No"],
-        "Model probability": [probs["home_win"], probs["draw"], probs["away_win"], probs["over25"], probs["under25"], probs["btts_yes"], probs["btts_no"]],
-    })
-    result_table["Model probability"] = result_table["Model probability"].map(lambda x: f"{x * 100:.1f}%")
-    st.dataframe(result_table, hide_index=True, use_container_width=True)
-
-    if any(value is not None for value in odds.values()):
-        st.caption("Best available decimal odds found from the returned odds feed")
-        odds_table = pd.DataFrame({
-            "Market": ["Home win", "Draw", "Away win", "Over 2.5", "Under 2.5"],
-            "Odds": [odds["home_win"], odds["draw"], odds["away_win"], odds["over25"], odds["under25"]],
-            "Model edge": [value_edge(probs["home_win"], odds["home_win"]), value_edge(probs["draw"], odds["draw"]), value_edge(probs["away_win"], odds["away_win"]), value_edge(probs["over25"], odds["over25"]), value_edge(probs["under25"], odds["under25"])],
-        })
-        odds_table["Odds"] = odds_table["Odds"].map(lambda x: "—" if x is None else f"{x:.2f}")
-        odds_table["Model edge"] = odds_table["Model edge"].map(lambda x: "—" if x is None else f"{x * 100:+.1f}%")
-        st.dataframe(odds_table, hide_index=True, use_container_width=True)
-    else:
-        st.info("Odds မရရှိသေးပါ။ Value edge မတွက်နိုင်ပါ။")
-
-    if show_details:
-        with st.expander("Model details and limitations"):
-            st.write(f"Expected goals: home **{prediction['home_lambda']:.2f}**, away **{prediction['away_lambda']:.2f}**")
-            st.warning("ဤ model သည် calibrated/backtested production model မဟုတ်သေးပါ။ Injury, lineup, xG နှင့် bookmaker closing-line data မပါသဖြင့် prediction ကို အာမခံချက်အဖြစ် မသုံးပါနှင့်။")
-
-
-def build_league_context(league_code: str, api_key: str) -> Dict[str, Any]:
-    finished, finished_error = fetch_finished(league_code, api_key)
-    standings, standings_error = fetch_standings(league_code, api_key)
-    form = build_form(finished)
-    return {"finished": finished, "standings": standings, "form": form, "errors": [x for x in [finished_error, standings_error] if x]}
-
-
-def create_prediction(match: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
-    home, home_quality = find_team_data(match["homeTeam"]["name"], context["standings"], context["form"])
-    away, away_quality = find_team_data(match["awayTeam"]["name"], context["standings"], context["form"])
-    home["quality"], away["quality"] = home_quality, away_quality
-    return predict_match(home, away)
-
-
-def render_selected_league(league_name: str, league_code: str, fb_key: str, odds_key: str) -> None:
-    fixtures, fixture_error = fetch_fixtures(league_code, fb_key)
-    context = build_league_context(league_code, fb_key)
-    odds_data, odds_error = fetch_odds(odds_key)
-    if fixture_error:
-        st.warning(fixture_error)
-    for error in context["errors"]:
-        st.warning(error)
-    if odds_error:
-        st.info(odds_error)
-    st.subheader(f"📅 {league_name} — next 7 days")
-    if not fixtures:
-        st.info("Scheduled fixture မရှိပါ၊ သို့မဟုတ် API data မရရှိပါ။")
-        return
-    st.success(f"{len(fixtures)} matches found")
-    for match in fixtures:
-        prediction = create_prediction(match, context)
-        save_prediction(match, prediction, league_code, league_name)
-        odds = extract_match_odds(match["homeTeam"]["name"], match["awayTeam"]["name"], odds_data)
-        with st.expander(f"⚽ {match['homeTeam']['name']} vs {match['awayTeam']['name']} | {local_time(match['utcDate'])}", expanded=False):
-            render_prediction_card(match, prediction, odds)
-
-
-def render_top_matches(fb_key: str, odds_key: str) -> None:
-    st.subheader("🔥 Top 10 best matches of the day")
-    odds_data, odds_error = fetch_odds(odds_key)
-    if odds_error:
-        st.info(odds_error)
-    rows: List[Dict[str, Any]] = []
-    for league_name, league_code in LEAGUES.items():
-        fixtures, _ = fetch_fixtures(league_code, fb_key)
-        if not fixtures:
-            continue
-        context = build_league_context(league_code, fb_key)
-        for match in fixtures:
-            prediction = create_prediction(match, context)
-            save_prediction(match, prediction, league_code, league_name)
-            probs = prediction["probabilities"]
-            rows.append({
-                "match": f"{match['homeTeam']['name']} vs {match['awayTeam']['name']}",
-                "league": league_name,
-                "kickoff": local_time(match["utcDate"]),
-                "confidence": prediction["confidence"],
-                "quality": prediction["data_quality"],
-                "prediction": f"{prediction['best_score'][0]}–{prediction['best_score'][1]}",
-                "home_prob": probs["home_win"], "draw_prob": probs["draw"], "away_prob": probs["away_win"],
-                "match_obj": match, "prediction_obj": prediction,
-            })
-    rows.sort(key=lambda x: (x["confidence"], x["quality"]), reverse=True)
-    if not rows:
-        st.info("API data မရရှိသဖြင့် Top 10 မတည်ဆောက်နိုင်ပါ။")
-        return
-    top = rows[:10]
-    table = pd.DataFrame([{k: v for k, v in row.items() if k not in {"match_obj", "prediction_obj"}} for row in top])
-    table["confidence"] = table["confidence"].map(lambda x: f"{x * 100:.1f}%")
-    table["quality"] = table["quality"].map(lambda x: f"{x * 100:.0f}%")
-    for col in ["home_prob", "draw_prob", "away_prob"]:
-        table[col] = table[col].map(lambda x: f"{x * 100:.1f}%")
-    st.dataframe(table, hide_index=True, use_container_width=True)
-    for index, row in enumerate(top, 1):
-        with st.expander(f"#{index} {row['match']} — {row['league']}"):
-            odds = extract_match_odds(row["match_obj"]["homeTeam"]["name"], row["match_obj"]["awayTeam"]["name"], odds_data)
-            render_prediction_card(row["match_obj"], row["prediction_obj"], odds)
-
-
-def render_history() -> None:
-    st.subheader("📚 Match history & accuracy")
-    history = load_history()
-    if history.empty:
-        st.info("Prediction history မရှိသေးပါ။ ပထမဆုံး fixture view ကို ဖွင့်ပါ။")
-        return
-    completed = history[history["actual_home"].notna() & history["actual_away"].notna()].copy()
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Saved predictions", len(history))
-    c2.metric("Completed", len(completed))
-    if completed.empty:
-        c3.metric("1X2 accuracy", "—")
-        c4.metric("Exact score accuracy", "—")
-    else:
-        c3.metric("1X2 accuracy", pct(completed["result_correct"].mean()))
-        c4.metric("Exact score accuracy", pct(completed["exact_score_correct"].mean()))
-        st.metric("Over 2.5 accuracy", pct(completed["over25_correct"].mean()))
-        st.metric("BTTS accuracy", pct(completed["btts_correct"].mean()))
-    st.caption("Accuracy သည် saved prediction တွေထဲက result update ရပြီးသား match များအပေါ်သာ တွက်ထားပါသည်။")
-    display = history.copy()
-    display["match"] = display["home_team"] + " vs " + display["away_team"]
-    display["prediction"] = display["predicted_home"].astype(str) + "–" + display["predicted_away"].astype(str)
-    cols = ["league_name", "match", "match_date", "prediction", "confidence", "data_quality", "actual_home", "actual_away", "result_correct", "exact_score_correct"]
-    display = display[[x for x in cols if x in display.columns]]
-    if "confidence" in display:
-        display["confidence"] = display["confidence"].map(lambda x: "—" if pd.isna(x) else f"{x * 100:.1f}%")
-    if "data_quality" in display:
-        display["data_quality"] = display["data_quality"].map(lambda x: "—" if pd.isna(x) else f"{x * 100:.0f}%")
-    st.dataframe(display, hide_index=True, use_container_width=True)
+def enrichment_to_features(bundle: Dict[str, Any]) -> Dict[str, Any]:
+    injuries = bundle.get("injuries", [])
+    lineups = bundle.get("lineups", [])
+    stats = bundle.get("statistics", [])
+    odds = bundle.get("odds", [])
+    out = {"home_injuries": 0, "away_injuries": 0, "home_suspensions": 0, "away_suspensions": 0,
+           "home_lineup_confirmed": 0, "away_lineup_confirmed": 0, "home_lineup_strength": 1.0, "away_lineup_strength": 1.0,
+           "home_xg": np.nan, "away_xg": np.nan, "home_close_1x2": np.nan, "draw_close_1x2": np.nan, "away_close_1x2": np.nan}
+    for item in injuries:
+        team = str(item.get("team", {}).get("name", "")).lower()
+        is_home = len(lineups) == 0 or (lineups and team_equal(team, lineups[0].get("team", {}).get("name", "")))
+        key = "home" if is_home else "away"
+        out[f"{key}_injuries"] += 1
+        if "susp" in str(item).lower(): out[f"{key}_suspensions"] += 1
+    for lineup in lineups:
+        team = lineup.get("team", {}).get("name", "")
+        key = "home" if not out["home_lineup_confirmed"] else "away"
+        out[f"{key}_lineup_confirmed"] = 1
+        players = lineup.get("startXI", [])
+        out[f"{key}_lineup_strength"] = clamp(1 - 0.02 * sum(1 for p in players if not p.get("player", {}).get("name")), 0.7, 1.0)
+    for index, team_stats in enumerate(stats):
+        team_name = team_stats.get("team", {}).get("name", "")
+        # API-Football returns numeric team IDs; response order is normally home/away.
+        # If a provider includes an explicit side field, prefer it.
+        side = str(team_stats.get("team", {}).get("side", "")).lower()
+        key = "home" if side == "home" or (not side and index == 0) else "away"
+        for item in team_stats.get("statistics", []):
+            if str(item.get("type", "")).lower() in {"expected_goals", "xg"}:
+                out[f"{key}_xg"] = num(item.get("value"))
+    # Odds response schemas differ by plan/bookmaker; map common values conservatively.
+    for item in odds:
+        for bookmaker in item.get("bookmakers", []):
+            for market in bookmaker.get("bets", bookmaker.get("markets", [])):
+                name = str(market.get("name", market.get("key", ""))).lower()
+                values = market.get("values", market.get("outcomes", []))
+                for value in values:
+                    label = str(value.get("value", value.get("name", ""))).lower()
+                    price = num(value.get("odd", value.get("price")))
+                    if "match winner" in name or name in {"h2h", "1x2"}:
+                        if label in {"home", "1"}: out["home_close_1x2"] = price
+                        elif label in {"draw", "x"}: out["draw_close_1x2"] = price
+                        elif label in {"away", "2"}: out["away_close_1x2"] = price
+    return out
 
 # -----------------------------
-# Main app
+# UI
 # -----------------------------
 
-initialize_database()
-st.title("⚽ Professional Football Predictor V3")
-st.markdown("Poisson baseline model • multi-league Top 10 • history • calibrated disclosure • data-quality checks")
+init_db()
+st.title("⚽ Professional Football Predictor V4")
+st.caption("Walk-forward backtesting • out-of-sample calibration • xG • injuries • line-ups • closing-line features")
 
 with st.sidebar:
-    st.header("🔑 API settings")
-    fb_default = st.secrets.get("FOOTBALL_API_KEY", "")
-    odds_default = st.secrets.get("ODDS_API_KEY", "")
-    fb_key = st.text_input("Football-data.org API key", value=fb_default, type="password")
-    odds_key = st.text_input("Odds-api.io API key", value=odds_default, type="password")
-    nav_mode = st.radio("Navigation", ["🏟️ Selected league", "🔥 Top 10 best matches", "📚 History & accuracy"])
-    if st.button("🔄 Clear cached API data", use_container_width=True):
-        fetch_fixtures.clear(); fetch_finished.clear(); fetch_standings.clear(); fetch_odds.clear()
-        st.success("Cache cleared. Reloading…")
-        st.rerun()
-    st.divider()
-    st.caption("Odds မရရှိပါက model probability ကိုသာ ပြပါမည်။ API data မပြည့်စုံလျှင် data quality ကို လျှော့ပြပါမည်။")
+    st.header("Data inputs")
+    api_key = st.text_input("API-Football key (optional)", value=st.secrets.get("API_FOOTBALL_KEY", ""), type="password")
+    fixture_id = st.number_input("API-Football fixture ID", min_value=0, step=1, value=0)
+    uploaded = st.file_uploader("Enriched historical CSV", type=["csv"])
+    min_train = st.slider("Minimum training matches", 20, 200, 30)
+    st.info("Full backtest needs historical xG, closing odds, injury and lineup columns. Missing optional columns are handled explicitly, not guessed.")
 
-if nav_mode == "🏟️ Selected league":
-    selected_name = st.sidebar.selectbox("League", list(LEAGUES.keys()))
-    selected_code = LEAGUES[selected_name]
-    if st.sidebar.button("📊 Update actual results", use_container_width=True):
-        count, error = update_actual_results(selected_code, fb_key)
-        if error:
-            st.error(error)
+if uploaded is None:
+    st.warning("Full feature pipeline အလုပ်လုပ်ရန် enriched historical CSV တင်ပါ။")
+    st.code(",".join(REQUIRED_COLUMNS + list(OPTIONAL_DEFAULTS.keys())), language="text")
+    st.stop()
+
+try:
+    history_raw = pd.read_csv(uploaded)
+    history, errors = validate_history(history_raw)
+except Exception as exc:
+    st.error(f"CSV read error: {exc}")
+    st.stop()
+for error in errors:
+    st.warning(error)
+
+bt_tab, live_tab, data_tab = st.tabs(["Backtest & calibration", "Live enrichment", "Data audit"])
+
+with data_tab:
+    st.subheader("Data audit")
+    audit = []
+    for col in REQUIRED_COLUMNS + list(OPTIONAL_DEFAULTS.keys()):
+        if col in history.columns:
+            present = int(history[col].notna().sum())
+            audit.append({"column": col, "rows": len(history), "present": present, "coverage": present / max(len(history), 1)})
+    audit_df = pd.DataFrame(audit)
+    audit_df["coverage"] = audit_df["coverage"].map(lambda x: f"{x * 100:.1f}%")
+    st.dataframe(audit_df, hide_index=True, use_container_width=True)
+    st.write(f"Usable rows: **{len(history)}** | Date range: **{history['date'].min()} → {history['date'].max()}**")
+
+with bt_tab:
+    st.subheader("Strict walk-forward backtest")
+    if st.button("Run backtest", type="primary"):
+        with st.spinner("Running leakage-safe walk-forward predictions and calibration…"):
+            result = backtest(history, min_train)
+        if "error" in result:
+            st.error(result["error"])
         else:
-            st.success(f"{count} saved prediction(s) updated.")
-            st.rerun()
-    render_selected_league(selected_name, selected_code, fb_key, odds_key)
-elif nav_mode == "🔥 Top 10 best matches":
-    render_top_matches(fb_key, odds_key)
-else:
-    render_history()
+            st.session_state["backtest"] = result
+            st.success(f"Completed {result['n']} out-of-sample predictions. Calibration temperature: {result['temperature']:.3f}")
+    result = st.session_state.get("backtest")
+    if result and "error" not in result:
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("1X2 accuracy", f"{result['accuracy'] * 100:.1f}%")
+        c2.metric("Brier score", f"{result['brier']:.4f}")
+        c3.metric("Log loss", f"{result['logloss']:.4f}")
+        c4.metric("OOS matches", result["n"])
+        curve = pd.DataFrame({"date": result["dates"], "actual": result["actuals"], "predicted": result["pred_class"], "quality": result["qualities"]})
+        curve["correct"] = (curve["actual"] == curve["predicted"]).astype(int)
+        curve["rolling_accuracy"] = curve["correct"].rolling(20, min_periods=5).mean()
+        st.line_chart(curve.set_index("date")["rolling_accuracy"])
+        st.dataframe(curve.tail(100), hide_index=True, use_container_width=True)
+        st.caption("Brier နှင့် log loss သည် lower-is-better ဖြစ်သည်။ Accuracy တစ်ခုတည်းနဲ့ calibration ကောင်း/မကောင်း မဆုံးဖြတ်ပါနှင့်။")
+
+with live_tab:
+    st.subheader("Live injury / lineup / xG / odds enrichment")
+    if fixture_id <= 0:
+        st.info("API-Football fixture ID ထည့်ပါ။")
+    elif not api_key:
+        st.warning("API-Football key မရှိသေးပါ။")
+    elif st.button("Fetch enrichment"):
+        bundle = fetch_enrichment(int(fixture_id), api_key)
+        st.session_state["bundle"] = bundle
+    bundle = st.session_state.get("bundle")
+    if bundle:
+        if bundle["errors"]:
+            for error in bundle["errors"]:
+                st.warning(error)
+        live_features = enrichment_to_features(bundle)
+        st.json(live_features)
+        st.caption("Provider response schema/plan အလိုက် field တချို့ မရနိုင်ပါ။ မရနိုင်တဲ့ field ကို model က missing အဖြစ်သာ ကိုင်တွယ်ပါသည်။")
+
+# Final prediction from the latest available historical context.
+if len(history) > 0:
+    st.divider()
+    st.subheader("Latest-row probability preview")
+    calibration = st.session_state.get("backtest")
+    model, temperature = train_final_model(history, calibration)
+    latest = history.iloc[-1]
+    x, quality, meta = feature_row(history, latest)
+    p = apply_temperature(raw_probability(model, x), temperature)
+    score_home = max(0, round(1.35 + 0.35 * (p[0] - p[2])))
+    score_away = max(0, round(1.10 + 0.35 * (p[2] - p[0])))
+    st.write(f"**{latest['home_team']} {score_home}–{score_away} {latest['away_team']}**")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Home", f"{p[0] * 100:.1f}%")
+    c2.metric("Draw", f"{p[1] * 100:.1f}%")
+    c3.metric("Away", f"{p[2] * 100:.1f}%")
+    c4.metric("Data quality", f"{quality * 100:.0f}%")
+    st.caption("Latest-row preview သည် uploaded history ၏ နောက်ဆုံး row ကိုပြသည်။ Live fixture prediction အတွက် provider fixture mapping နှင့် full live feature join ကို ဆက်ချိတ်ရန်လိုပါသည်။")
