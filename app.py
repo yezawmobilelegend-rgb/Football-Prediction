@@ -1,4 +1,4 @@
-From datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 import math
 import re
 import sqlite3
@@ -42,54 +42,13 @@ def db_connection():
 
 def initialize_database():
     with db_connection() as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS predictions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                match_id TEXT UNIQUE,
-                league TEXT,
-                match_date TEXT,
-                home_team TEXT,
-                away_team TEXT,
-                predicted_home INTEGER,
-                predicted_away INTEGER,
-                home_lambda REAL,
-                away_lambda REAL,
-                actual_home INTEGER,
-                actual_away INTEGER,
-                prediction_correct INTEGER,
-                created_at TEXT
-            )
-        """)
+        conn.execute(""" CREATE TABLE IF NOT EXISTS predictions ( id INTEGER PRIMARY KEY AUTOINCREMENT, match_id TEXT UNIQUE, league TEXT, match_date TEXT, home_team TEXT, away_team TEXT, predicted_home INTEGER, predicted_away INTEGER, home_lambda REAL, away_lambda REAL, actual_home INTEGER, actual_away INTEGER, prediction_correct INTEGER, created_at TEXT ) """)
         conn.commit()
 
 
-def save_prediction(
-    match_id,
-    league,
-    match_date,
-    home_team,
-    away_team,
-    score,
-    home_lambda,
-    away_lambda,
-):
+def save_prediction( match_id, league, match_date, home_team, away_team, score, home_lambda, away_lambda, ):
     with db_connection() as conn:
-        conn.execute("""
-            INSERT INTO predictions (
-                match_id,
-                league,
-                match_date,
-                home_team,
-                away_team,
-                predicted_home,
-                predicted_away,
-                home_lambda,
-                away_lambda,
-                created_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(match_id) DO NOTHING
-        """, (
+        conn.execute(""" INSERT INTO predictions ( match_id, league, match_date, home_team, away_team, predicted_home, predicted_away, home_lambda, away_lambda, created_at ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(match_id) DO NOTHING """, (
             str(match_id),
             league,
             match_date,
@@ -138,11 +97,7 @@ def update_actual_results(league_code, api_key):
 
                 match_id = str(match["id"])
 
-                row = conn.execute("""
-                    SELECT predicted_home, predicted_away
-                    FROM predictions
-                    WHERE match_id = ?
-                """, (match_id,)).fetchone()
+                row = conn.execute(""" SELECT predicted_home, predicted_away FROM predictions WHERE match_id = ? """, (match_id,)).fetchone()
 
                 if row is None:
                     continue
@@ -152,13 +107,7 @@ def update_actual_results(league_code, api_key):
                     and row[1] == actual_away
                 )
 
-                conn.execute("""
-                    UPDATE predictions
-                    SET actual_home = ?,
-                        actual_away = ?,
-                        prediction_correct = ?
-                    WHERE match_id = ?
-                """, (
+                conn.execute(""" UPDATE predictions SET actual_home = ?, actual_away = ?, prediction_correct = ? WHERE match_id = ? """, (
                     actual_home,
                     actual_away,
                     correct,
@@ -257,10 +206,7 @@ def fetch_fixtures(league, api_key):
     result = []
 
     for match in data.get("matches", []):
-        match_date = datetime.strptime(
-            match["utcDate"],
-            "%Y-%m-%dT%H:%M:%SZ",
-        ).replace(tzinfo=timezone.utc)
+        match_date = datetime.fromisoformat(match["utcDate"].replace("Z", "+00:00")).astimezone(timezone.utc)
 
         if now <= match_date <= end:
             result.append(match)
@@ -611,6 +557,12 @@ def score_matrix(home_lambda, away_lambda, max_goals=6):
                 * poisson_pmf(away_lambda, a)
             )
 
+    # The 0..max_goals grid truncates the Poisson tail. Normalize it so
+    # 1X2, O/U and BTTS probabilities add up correctly.
+    total = matrix.sum()
+    if total <= 0 or not np.isfinite(total):
+        raise ValueError("Invalid Poisson probability matrix")
+    matrix /= total
     return matrix
 
 
@@ -685,21 +637,6 @@ def predict_match(home_data, away_data, match_id):
         max_goals=6,
     )
 
-    flat_matrix = matrix.flatten()
-    flat_matrix /= flat_matrix.sum()
-
-    seed_val = abs(hash(str(match_id))) % (2**32)
-    rng = np.random.default_rng(seed_val)
-
-    chosen_index = rng.choice(
-        len(flat_matrix),
-        p=flat_matrix,
-    )
-    sampled_score = np.unravel_index(
-        chosen_index,
-        matrix.shape,
-    )
-
     best_score = np.unravel_index(
         np.argmax(matrix),
         matrix.shape,
@@ -711,9 +648,11 @@ def predict_match(home_data, away_data, match_id):
         "home_lambda": home_lambda,
         "away_lambda": away_lambda,
         "matrix": matrix,
-        "best_score": sampled_score,
+        # Use the most probable score; random sampling makes the UI
+        # change its prediction after a restart and hurts reproducibility.
+        "best_score": best_score,
         "argmax_score": best_score,
-        "best_probability": matrix[sampled_score],
+        "best_probability": matrix[best_score],
         "probabilities": probs,
     }
 
@@ -748,7 +687,7 @@ if nav_mode == "🏟️ Selected League View":
         away = match["awayTeam"]["name"]
         match_id = match["id"]
         
-        utc_dt = datetime.strptime(match["utcDate"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        utc_dt = datetime.fromisoformat(match["utcDate"].replace("Z", "+00:00")).astimezone(timezone.utc)
         local_dt = utc_dt.astimezone(LOCAL_TZ)
         match_date_str = local_dt.strftime("%Y-%m-%d %H:%M MMT")
 
@@ -796,6 +735,14 @@ if nav_mode == "🏟️ Selected League View":
                 st.markdown("### 💎 Value Bet Finder")
                 h_price = odds.get("home_win_price")
                 a_price = odds.get("away_win_price")
+                try:
+                    h_price = float(h_price) if h_price is not None else None
+                except (TypeError, ValueError):
+                    h_price = None
+                try:
+                    a_price = float(a_price) if a_price is not None else None
+                except (TypeError, ValueError):
+                    a_price = None
                 value_found = False
 
                 if h_price and h_price > 1.0:
