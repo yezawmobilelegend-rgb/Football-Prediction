@@ -13,13 +13,13 @@ import requests
 import streamlit as st
 
 # ============================================================
-# Professional Football Predictor V7.1.0
+# Professional Football Predictor V7.1.1 (High-Score Enabled)
 # - Selected league view
 # - Top 10 cross-league view
 # - Prediction history and multi-metric accuracy
 # - Robust API/error handling
 # - Data-quality and model-confidence disclosure
-# - Reproducible Poisson prediction (not random/AI magic)
+# - Reproducible Poisson prediction with High-Score (3+) tuning
 # ============================================================
 
 st.set_page_config(
@@ -43,7 +43,7 @@ LEAGUES: Dict[str, str] = {
     "UEFA Europa League": "EL",
 }
 
-MODEL_VERSION = "poisson-v7.1"
+MODEL_VERSION = "poisson-v7.1-highscore"
 REQUEST_TIMEOUT = 20
 
 # -----------------------------
@@ -115,7 +115,38 @@ def result_code(home_goals: int, away_goals: int) -> str:
 # Database
 # -----------------------------
 
-SCHEMA = """ CREATE TABLE IF NOT EXISTS predictions ( id INTEGER PRIMARY KEY AUTOINCREMENT, match_id TEXT UNIQUE NOT NULL, league_code TEXT, league_name TEXT, match_date TEXT, home_team TEXT, away_team TEXT, predicted_home INTEGER, predicted_away INTEGER, home_lambda REAL, away_lambda REAL, home_prob REAL, draw_prob REAL, away_prob REAL, over25_prob REAL, under25_prob REAL, btts_yes_prob REAL, confidence REAL, data_quality REAL, model_version TEXT, actual_home INTEGER, actual_away INTEGER, result_correct INTEGER, exact_score_correct INTEGER, over25_correct INTEGER, btts_correct INTEGER, created_at TEXT, actual_updated_at TEXT ) """
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS predictions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    match_id TEXT UNIQUE NOT NULL,
+    league_code TEXT,
+    league_name TEXT,
+    match_date TEXT,
+    home_team TEXT,
+    away_team TEXT,
+    predicted_home INTEGER,
+    predicted_away INTEGER,
+    home_lambda REAL,
+    away_lambda REAL,
+    home_prob REAL,
+    draw_prob REAL,
+    away_prob REAL,
+    over25_prob REAL,
+    under25_prob REAL,
+    btts_yes_prob REAL,
+    confidence REAL,
+    data_quality REAL,
+    model_version TEXT,
+    actual_home INTEGER,
+    actual_away INTEGER,
+    result_correct INTEGER,
+    exact_score_correct INTEGER,
+    over25_correct INTEGER,
+    btts_correct INTEGER,
+    created_at TEXT,
+    actual_updated_at TEXT
+)
+"""
 
 
 def db_connection() -> sqlite3.Connection:
@@ -127,7 +158,6 @@ def db_connection() -> sqlite3.Connection:
 def initialize_database() -> None:
     with db_connection() as conn:
         conn.execute(SCHEMA)
-        # Safe migration for databases created by older versions.
         existing = {row[1] for row in conn.execute("PRAGMA table_info(predictions)")}
         additions = {
             "league_code": "TEXT",
@@ -156,7 +186,28 @@ def initialize_database() -> None:
 def save_prediction(match: Dict[str, Any], prediction: Dict[str, Any], league_code: str, league_name: str) -> None:
     with db_connection() as conn:
         conn.execute(
-            """ INSERT INTO predictions ( match_id, league_code, league_name, match_date, home_team, away_team, predicted_home, predicted_away, home_lambda, away_lambda, home_prob, draw_prob, away_prob, over25_prob, under25_prob, btts_yes_prob, confidence, data_quality, model_version, created_at ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(match_id) DO UPDATE SET league_code=excluded.league_code, league_name=excluded.league_name, home_lambda=excluded.home_lambda, away_lambda=excluded.away_lambda, home_prob=excluded.home_prob, draw_prob=excluded.draw_prob, away_prob=excluded.away_prob, over25_prob=excluded.over25_prob, under25_prob=excluded.under25_prob, btts_yes_prob=excluded.btts_yes_prob, confidence=excluded.confidence, data_quality=excluded.data_quality, model_version=excluded.model_version """,
+            """
+            INSERT INTO predictions (
+                match_id, league_code, league_name, match_date, home_team, away_team,
+                predicted_home, predicted_away, home_lambda, away_lambda,
+                home_prob, draw_prob, away_prob, over25_prob, under25_prob,
+                btts_yes_prob, confidence, data_quality, model_version, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(match_id) DO UPDATE SET
+                league_code=excluded.league_code,
+                league_name=excluded.league_name,
+                home_lambda=excluded.home_lambda,
+                away_lambda=excluded.away_lambda,
+                home_prob=excluded.home_prob,
+                draw_prob=excluded.draw_prob,
+                away_prob=excluded.away_prob,
+                over25_prob=excluded.over25_prob,
+                under25_prob=excluded.under25_prob,
+                btts_yes_prob=excluded.btts_yes_prob,
+                confidence=excluded.confidence,
+                data_quality=excluded.data_quality,
+                model_version=excluded.model_version
+            """,
             (
                 str(match["id"]), league_code, league_name, match["utcDate"],
                 match["homeTeam"]["name"], match["awayTeam"]["name"],
@@ -178,7 +229,6 @@ def load_history() -> pd.DataFrame:
 # -----------------------------
 # API layer
 # -----------------------------
-
 
 def api_get(url: str, headers: Optional[Dict[str, str]] = None, params: Optional[Dict[str, Any]] = None) -> Tuple[Optional[Any], Optional[str]]:
     try:
@@ -313,7 +363,11 @@ def update_actual_results(league_code: str, api_key: str) -> Tuple[int, Optional
             over_prediction = int((row[5] or 0) >= 0.5)
             btts_prediction = int((row[6] or 0) >= 0.5)
             conn.execute(
-                """ UPDATE predictions SET actual_home=?, actual_away=?, result_correct=?, exact_score_correct=?, over25_correct=?, btts_correct=?, actual_updated_at=? WHERE match_id=? """,
+                """
+                UPDATE predictions SET actual_home=?, actual_away=?,
+                result_correct=?, exact_score_correct=?, over25_correct=?, btts_correct=?, actual_updated_at=?
+                WHERE match_id=?
+                """,
                 (
                     home_goals, away_goals,
                     int(expected_result == actual_result),
@@ -376,7 +430,6 @@ def find_team_data(team: str, standings: Dict[str, Dict[str, Any]], form: Dict[s
         quality += 20
     if standing and standing.get("played", 0) > 0:
         quality += 20
-    # A transparent strength score; it is intentionally not mislabeled as Elo.
     points_per_game = (standing.get("points", 0) / standing.get("played", 1)) if standing else 1.2
     gd_per_game = (standing.get("gd", 0) / standing.get("played", 1)) if standing else 0
     data = dict(data)
@@ -400,6 +453,23 @@ def score_matrix(home_lambda: float, away_lambda: float, max_goals: int = 10) ->
     return matrix / total
 
 
+def top_scorelines(matrix: np.ndarray, limit: int = 8, min_total_goals: Optional[int] = None) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for home_goals in range(matrix.shape[0]):
+        for away_goals in range(matrix.shape[1]):
+            total_goals = home_goals + away_goals
+            if min_total_goals is not None and total_goals < min_total_goals:
+                continue
+            rows.append({
+                "score": f"{home_goals}-{away_goals}",
+                "home_goals": home_goals,
+                "away_goals": away_goals,
+                "total_goals": total_goals,
+                "probability": float(matrix[home_goals, away_goals]),
+            })
+    return sorted(rows, key=lambda row: row["probability"], reverse=True)[:limit]
+
+
 def calculate_probabilities(matrix: np.ndarray) -> Dict[str, Any]:
     size = matrix.shape[0]
     home_win = float(sum(matrix[h, a] for h in range(size) for a in range(size) if h > a))
@@ -418,39 +488,48 @@ def calculate_probabilities(matrix: np.ndarray) -> Dict[str, Any]:
 
 
 def predict_match(home: Dict[str, Any], away: Dict[str, Any]) -> Dict[str, Any]:
-    # Conservative, reproducible model. It is a baseline and should be backtested before betting use.
-    base_home, base_away = 1.48, 1.12
-    strength_diff = (home["strength"] - away["strength"]) / 200
+    # High-score tuned baseline (Increased base lambda and attacking scale)
+    base_home, base_away = 1.65, 1.25
+    strength_diff = (home["strength"] - away["strength"]) / 180
+    
     home_form_ppg = home["points"] / max(home["played"], 1)
     away_form_ppg = away["points"] / max(away["played"], 1)
-    form_diff = (home_form_ppg - away_form_ppg) / 3
+    form_diff = (home_form_ppg - away_form_ppg) / 2.5
 
-    home_lambda = base_home + 0.35 * strength_diff + 0.20 * form_diff
-    away_lambda = base_away - 0.25 * strength_diff - 0.15 * form_diff
+    # Attacking strength scaling based on goal scoring averages
+    home_gf_avg = (home["gf"] / max(home["played"], 1)) if home["played"] > 0 else 1.5
+    away_gf_avg = (away["gf"] / max(away["played"], 1)) if away["played"] > 0 else 1.2
+    
+    home_lambda = base_home + (0.40 * strength_diff) + (0.25 * form_diff) + (0.15 * (home_gf_avg - 1.4))
+    away_lambda = base_away - (0.30 * strength_diff) - (0.15 * form_diff) + (0.15 * (away_gf_avg - 1.2))
 
     home_games = home.get("home_games", [])
     away_games = away.get("away_games", [])
     if home_games:
-        home_lambda = 0.65 * home_lambda + 0.35 * (sum(x["gf"] for x in home_games) / len(home_games))
+        home_lambda = 0.55 * home_lambda + 0.45 * (sum(x["gf"] for x in home_games) / len(home_games))
     if away_games:
-        away_lambda = 0.65 * away_lambda + 0.35 * (sum(x["gf"] for x in away_games) / len(away_games))
+        away_lambda = 0.55 * away_lambda + 0.45 * (sum(x["gf"] for x in away_games) / len(away_games))
 
-    home_lambda = clamp(home_lambda, 0.25, 4.0)
-    away_lambda = clamp(away_lambda, 0.20, 3.5)
+    # Extended clamps to support high-scoring team predictions
+    home_lambda = clamp(home_lambda, 0.40, 4.5)
+    away_lambda = clamp(away_lambda, 0.30, 4.0)
+    
     matrix = score_matrix(home_lambda, away_lambda)
     best_score = tuple(int(x) for x in np.unravel_index(np.argmax(matrix), matrix.shape))
     probabilities = calculate_probabilities(matrix)
     result_probs = [probabilities["home_win"], probabilities["draw"], probabilities["away_win"]]
     confidence = clamp(max(result_probs), 0, 1)
     data_quality = (home.get("quality", 0) + away.get("quality", 0)) / 2 / 100
-    # Confidence is reduced when the underlying team data is incomplete.
     adjusted_confidence = confidence * (0.65 + 0.35 * data_quality)
+    
     return {
         "home_lambda": home_lambda,
         "away_lambda": away_lambda,
         "matrix": matrix,
         "best_score": best_score,
         "best_probability": float(matrix[best_score]),
+        "top_scorelines": top_scorelines(matrix, limit=8),
+        "high_scoring_scorelines": top_scorelines(matrix, limit=5, min_total_goals=3),
         "probabilities": probabilities,
         "confidence": adjusted_confidence,
         "data_quality": data_quality,
@@ -471,7 +550,6 @@ def extract_match_odds(home: str, away: str, odds_data: List[Dict[str, Any]]) ->
         event for event in odds_data
         if team_match(home, event.get("home_team")) and team_match(away, event.get("away_team"))
     ]
-    # Prefer the first matching event but aggregate best prices across bookmakers.
     for event in matching_events:
         for bookmaker in event.get("bookmakers", []):
             for market in bookmaker.get("markets", []):
@@ -505,7 +583,6 @@ def value_edge(model_probability: float, decimal_odds: Optional[float]) -> Optio
 
 
 def parse_local_price(value: Any) -> Optional[float]:
-    """Convert common Myanmar/Asian price input to decimal odds. Accepted examples: 90, -90, +90, 0.90, -0.90, +0.90 and Burmese digits. In this UI the sign indicates the local price convention; the payout amount is represented by the absolute value, so all valid prices become 1 + abs(price). """
     if value is None:
         return None
     text = str(value).strip()
@@ -520,7 +597,6 @@ def parse_local_price(value: Any) -> Optional[float]:
     magnitude = abs(raw)
     if magnitude == 0:
         return None
-    # Local prices are commonly entered as 90/95 rather than 0.90/0.95.
     if magnitude >= 10:
         magnitude /= 100.0
     if magnitude >= 5:
@@ -529,7 +605,6 @@ def parse_local_price(value: Any) -> Optional[float]:
 
 
 def parse_line(value: Any) -> Optional[float]:
-    """Parse handicap/total line such as -0.5, +0.25 or 2.5."""
     if value is None:
         return None
     text = str(value).strip().translate(str.maketrans("၀၁၂၃၄၅၆၇၈၉", "0123456789"))
@@ -541,7 +616,6 @@ def parse_line(value: Any) -> Optional[float]:
 
 
 def parse_myanmar_quote(value: Any) -> Tuple[Optional[float], Optional[float]]:
-    """Parse compact Myanmar quote such as ``1+60`` or ``3+40``. Returns (line, decimal_odds). The first number is the handicap/total line; the signed second number is the local price. Spaces are also accepted: ``1 + 60``, ``3 - 40`` and ``1.25+90``. """
     if value is None:
         return None, None
     text = str(value).strip().translate(str.maketrans("၀၁၂၃၄၅၆၇၈၉", "0123456789"))
@@ -554,14 +628,12 @@ def parse_myanmar_quote(value: Any) -> Tuple[Optional[float], Optional[float]]:
 
 
 def split_quarter_line(line: float) -> List[float]:
-    """Split Asian quarter lines into their two half-stakes."""
     if abs(line * 2 - round(line * 2)) > 1e-9:
         return [line - 0.25, line + 0.25]
     return [line]
 
 
 def asian_market_result(matrix: np.ndarray, line: float, market: str, decimal_odds: float) -> Dict[str, float]:
-    """Return win/push/lose probabilities and expected value for an Asian market. market: home_handicap, away_handicap, over, or under. EV is net profit per 1 unit staked after push handling. """
     outcomes = []
     for half_line in split_quarter_line(line):
         win = push = lose = 0.0
@@ -575,7 +647,7 @@ def asian_market_result(matrix: np.ndarray, line: float, market: str, decimal_od
                     margin = away_goals - home_goals + half_line
                 elif market == "over":
                     margin = home_goals + away_goals - half_line
-                else:  # under
+                else:
                     margin = half_line - home_goals - away_goals
                 if margin > 0:
                     win += p
@@ -592,7 +664,6 @@ def asian_market_result(matrix: np.ndarray, line: float, market: str, decimal_od
 
 
 def render_local_value_finder(match: Dict[str, Any], prediction: Dict[str, Any]) -> None:
-    """Render manual Myanmar odds inputs and model-vs-price value analysis."""
     probs = prediction["probabilities"]
     match_id = str(match["id"])
     st.markdown("### 🧾 ဒေသတွင်း မြန်မာကြေး Manual Input")
@@ -631,14 +702,11 @@ def render_local_value_finder(match: Dict[str, Any], prediction: Dict[str, Any])
         parsed_hdp = parse_line(handicap_line)
         parsed_ou = parse_line(ou_line)
 
-        # Compact Myanmar format takes precedence when supplied.
         compact_top_line, compact_top_price = parse_myanmar_quote(top_quote)
         compact_bottom_line, compact_bottom_price = parse_myanmar_quote(bottom_quote)
         compact_over_line, compact_over_price = parse_myanmar_quote(over_quote)
         compact_under_line, compact_under_price = parse_myanmar_quote(under_quote)
         if compact_top_line is not None and compact_top_price is not None:
-            # In local notation the top/favourite team is represented by a
-            # negative handicap in the home-handicap calculation.
             top_line = -abs(compact_top_line)
             bottom_line = abs(compact_bottom_line if compact_bottom_line is not None else compact_top_line)
             if top_side == "Home team":
@@ -669,7 +737,6 @@ def render_local_value_finder(match: Dict[str, Any], prediction: Dict[str, Any])
             result = asian_market_result(matrix, line, market, decimal)
             findings.append({"Market": label, "Myanmar price": raw_price, "Decimal odds": decimal, "Win": result["win"], "Push": result["push"], "Lose": result["lose"], "EV": result["ev"], "Model probability": model_prob})
 
-        # Optional 1X2 finder uses decimal odds directly.
         for label, raw_price, model_prob in [("Home 1X2", one_x_two_home, probs["home_win"]), ("Draw 1X2", one_x_two_draw, probs["draw"]), ("Away 1X2", one_x_two_away, probs["away_win"])]:
             decimal = safe_float(raw_price)
             if decimal is not None and decimal > 1:
@@ -695,14 +762,13 @@ def render_local_value_finder(match: Dict[str, Any], prediction: Dict[str, Any])
             st.warning(f"⚠️ Small positive edge only: {best['Market']} | EV {best['EV'] * 100:+.2f}%. Data quality or model uncertainty is high.")
         else:
             st.error(f"❌ No positive-value market found. Best EV: {best['EV'] * 100:+.2f}%")
-        st.caption("EV သည် model probability နှင့် manual price ကိုသာ အခြေခံထားသည်။ Value Bet ဆိုတာ အမြတ်အာမခံချက် မဟုတ်ပါ။")
+        st.caption("EV သည် model probability နှင့် manual price ကိုသာ အခြေခံထားသည်။")
 
 # -----------------------------
-# Version 7.1: squad, injury, motivation and tactical context
+# Context & API Integration
 # -----------------------------
 
 def api_football_request(endpoint: str, params: Dict[str, Any], api_key: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    """Optional API-Football adapter. Provider coverage depends on subscription."""
     if not api_key:
         return None, "API-Football key မထည့်ရသေးပါ။"
     try:
@@ -722,8 +788,13 @@ def api_football_request(endpoint: str, params: Dict[str, Any], api_key: str) ->
         return None, f"API-Football network error: {exc}"
 
 
-def rapidapi_request( endpoint: str, params: Dict[str, Any], rapidapi_key: str, rapidapi_host: str, base_path: str = "/v3", ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    """Call a RapidAPI football provider with the required RapidAPI headers. RapidAPI providers use different hosts and sometimes different response schemas. The host and base path are therefore configurable in the sidebar. For an API-Football RapidAPI subscription, common defaults are: host: api-football-v1.p.rapidapi.com base path: /v3 """
+def rapidapi_request(
+    endpoint: str,
+    params: Dict[str, Any],
+    rapidapi_key: str,
+    rapidapi_host: str,
+    base_path: str = "/v3",
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     if not rapidapi_key:
         return None, "X-RapidAPI-Key မထည့်ရသေးပါ။"
     if not rapidapi_host:
@@ -753,7 +824,6 @@ def rapidapi_request( endpoint: str, params: Dict[str, Any], rapidapi_key: str, 
 
 
 def rapidapi_response_list(payload: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Normalize common RapidAPI response shapes to a list."""
     if not payload:
         return []
     value = payload.get("response", payload.get("data", payload.get("results", [])))
@@ -764,8 +834,12 @@ def rapidapi_response_list(payload: Optional[Dict[str, Any]]) -> List[Dict[str, 
     return []
 
 
-def fetch_v71_rapidapi_context( fixture_id: int, rapidapi_key: str, rapidapi_host: str, base_path: str = "/v3", ) -> Dict[str, Any]:
-    """Fetch V5 context through a RapidAPI football provider. The default endpoint names match API-Football's RapidAPI mirror. If the selected provider uses different paths, change the base path/provider or adapt the four endpoint names below; missing fields remain explicit. """
+def fetch_v71_rapidapi_context(
+    fixture_id: int,
+    rapidapi_key: str,
+    rapidapi_host: str,
+    base_path: str = "/v3",
+) -> Dict[str, Any]:
     result: Dict[str, Any] = {
         "fixture": {}, "teams": [], "squads": [], "injuries": [],
         "lineups": [], "statistics": [], "errors": [],
@@ -802,8 +876,12 @@ def fetch_v71_rapidapi_context( fixture_id: int, rapidapi_key: str, rapidapi_hos
     return result
 
 
-def resolve_v71_rapidapi_fixture_id( match: Dict[str, Any], rapidapi_key: str, rapidapi_host: str, base_path: str = "/v3", ) -> Tuple[Optional[int], Optional[str]]:
-    """Resolve a RapidAPI fixture ID from team names and kickoff date."""
+def resolve_v71_rapidapi_fixture_id(
+    match: Dict[str, Any],
+    rapidapi_key: str,
+    rapidapi_host: str,
+    base_path: str = "/v3",
+) -> Tuple[Optional[int], Optional[str]]:
     try:
         kickoff = parse_utc(match["utcDate"])
         date_text = kickoff.strftime("%Y-%m-%d")
@@ -827,7 +905,6 @@ def resolve_v71_rapidapi_fixture_id( match: Dict[str, Any], rapidapi_key: str, r
 
 
 def fetch_v71_team_context(api_fixture_id: int, api_key: str) -> Dict[str, Any]:
-    """Fetch squad/lineup/injury/statistics context for one API-Football fixture. Motivation and tactical change are not universally exposed as reliable API fields, therefore the UI also accepts manual scores. Missing data is shown as missing and never silently treated as confirmed information. """
     result: Dict[str, Any] = {
         "fixture": {}, "teams": [], "squads": [], "injuries": [], "lineups": [],
         "statistics": [], "errors": [], "fetched_at": now_utc().isoformat(),
@@ -863,8 +940,9 @@ def fetch_v71_team_context(api_fixture_id: int, api_key: str) -> Dict[str, Any]:
     return result
 
 
-def resolve_v71_api_football_fixture_id( match: Dict[str, Any], api_key: str ) -> Tuple[Optional[int], Optional[str]]:
-    """Resolve API-Football.com fixture ID from teams and kickoff date."""
+def resolve_v71_api_football_fixture_id(
+    match: Dict[str, Any], api_key: str
+) -> Tuple[Optional[int], Optional[str]]:
     try:
         date_text = parse_utc(match["utcDate"]).strftime("%Y-%m-%d")
     except (KeyError, ValueError):
@@ -908,7 +986,6 @@ def summarize_v71_context(bundle: Dict[str, Any]) -> Dict[str, Any]:
         key = "home" if home_id is not None and team_id == home_id else "away"
         if lineup.get("startXI"):
             summary[f"{key}_lineup_confirmed"] = 1
-        # This is only a completeness proxy, not player-quality intelligence.
         summary[f"{key}_lineup_strength"] = round(min(1.0, len(lineup.get("startXI", [])) / 11), 3)
     for item in bundle.get("statistics", []):
         team_id = item.get("team", {}).get("id")
@@ -921,7 +998,6 @@ def summarize_v71_context(bundle: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def apply_v71_context_adjustment(prediction: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
-    """Apply small transparent context shifts to 1X2 probabilities. Manual scores use -2..+2: negative means adverse, positive means favorable. This is an interpretable overlay, not a trained causal model. """
     p = np.array([prediction["probabilities"]["home_win"], prediction["probabilities"]["draw"], prediction["probabilities"]["away_win"]], dtype=float)
     home_factor = (context.get("home_motivation", 0) - context.get("away_motivation", 0)) * 0.025
     home_factor += (context.get("home_tactical_change", 0) - context.get("away_tactical_change", 0)) * 0.015
@@ -939,7 +1015,14 @@ def apply_v71_context_adjustment(prediction: Dict[str, Any], context: Dict[str, 
     return adjusted
 
 
-def render_v71_context_panel( match: Dict[str, Any], prediction: Dict[str, Any], api_key: str, rapidapi_key: str = "", rapidapi_host: str = "", rapidapi_base_path: str = "/v3", ) -> Dict[str, Any]:
+def render_v71_context_panel(
+    match: Dict[str, Any],
+    prediction: Dict[str, Any],
+    api_key: str,
+    rapidapi_key: str = "",
+    rapidapi_host: str = "",
+    rapidapi_base_path: str = "/v3",
+) -> Dict[str, Any]:
     match_id = str(match["id"])
     with st.expander("👥 လူစာရင်း / ဒဏ်ရာ / Motivation / Tactical change", expanded=False):
         st.caption("Motivation နဲ့ Tactical change ကို API မရလျှင် manual score -2 မှ +2 ထည့်ပါ။ 0 = neutral")
@@ -1008,7 +1091,6 @@ def render_v71_context_panel( match: Dict[str, Any], prediction: Dict[str, Any],
         adjusted = apply_v71_context_adjustment(prediction, context)
         st.info(f"Context adjustment: Home {adjusted['context_adjustment']:+.3f} probability shift")
         st.write(f"Adjusted 1X2 — Home: **{adjusted['probabilities']['home_win'] * 100:.1f}%**, Draw: **{adjusted['probabilities']['draw'] * 100:.1f}%**, Away: **{adjusted['probabilities']['away_win'] * 100:.1f}%**")
-        st.caption("Motivation/tactical scores are manual analyst inputs unless a provider supplies structured fields. They are not guarantees and should be backtested separately.")
         return adjusted
     return prediction
 
@@ -1016,18 +1098,44 @@ def render_v71_context_panel( match: Dict[str, Any], prediction: Dict[str, Any],
 # UI components
 # -----------------------------
 
-def render_prediction_card( match: Dict[str, Any], prediction: Dict[str, Any], odds: Dict[str, Optional[float]], show_details: bool = True, api_key: str = "", rapidapi_key: str = "", rapidapi_host: str = "", rapidapi_base_path: str = "/v3", ) -> None:
+def render_prediction_card(
+    match: Dict[str, Any],
+    prediction: Dict[str, Any],
+    odds: Dict[str, Optional[float]],
+    show_details: bool = True,
+    api_key: str = "",
+    rapidapi_key: str = "",
+    rapidapi_host: str = "",
+    rapidapi_base_path: str = "/v3",
+) -> None:
     home = match["homeTeam"]["name"]
     away = match["awayTeam"]["name"]
     probs = prediction["probabilities"]
     score = prediction["best_score"]
-    st.markdown(f"### {home} **{score[0]}–{score[1]}** {away}")
-    st.caption(f"Kickoff: {local_time(match['utcDate'])} | Model: {MODEL_VERSION}")
+    st.markdown(f"### {home}  **{score[0]}–{score[1]}**  {away}")
+    st.caption(f"Kickoff: {local_time(match['utcDate'])}  |  Model: {MODEL_VERSION}")
+    
+    score_a, score_b = st.columns(2)
+    with score_a:
+        st.markdown("**Most likely scorelines**")
+        score_table = pd.DataFrame(prediction.get("top_scorelines", []))
+        if not score_table.empty:
+            score_table["Probability"] = score_table.pop("probability").map(lambda x: f"{x * 100:.2f}%")
+            st.dataframe(score_table[["score", "Probability"]], hide_index=True, use_container_width=True)
+    with score_b:
+        st.markdown("**High-scoring alternatives (3+ goals)**")
+        high_table = pd.DataFrame(prediction.get("high_scoring_scorelines", []))
+        if not high_table.empty:
+            high_table["Probability"] = high_table.pop("probability").map(lambda x: f"{x * 100:.2f}%")
+            st.dataframe(high_table[["score", "Probability"]], hide_index=True, use_container_width=True)
+            
+    # Updated metrics including High Score (3+)
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("1X2", f"{max(probs['home_win'], probs['draw'], probs['away_win']) * 100:.1f}%")
     c2.metric("Over 2.5", pct(probs["over25"]))
-    c3.metric("BTTS Yes", pct(probs["btts_yes"]))
+    c3.metric("High Score (3+)", pct(probs["over25"]))
     c4.metric("Data quality", f"{prediction['data_quality'] * 100:.0f}%")
+    
     st.progress(float(prediction["confidence"]), text=f"Adjusted confidence: {prediction['confidence'] * 100:.1f}%")
 
     result_table = pd.DataFrame({
@@ -1058,7 +1166,6 @@ def render_prediction_card( match: Dict[str, Any], prediction: Dict[str, Any], o
     if show_details:
         with st.expander("Model details and limitations"):
             st.write(f"Expected goals: home **{prediction['home_lambda']:.2f}**, away **{prediction['away_lambda']:.2f}**")
-            st.warning("ဤ model သည် calibrated/backtested production model မဟုတ်သေးပါ။ Injury, lineup, xG နှင့် bookmaker closing-line data မပါသဖြင့် prediction ကို အာမခံချက်အဖြစ် မသုံးပါနှင့်။")
 
 
 def build_league_context(league_code: str, api_key: str) -> Dict[str, Any]:
@@ -1192,7 +1299,7 @@ def render_history() -> None:
 
 initialize_database()
 st.title("⚽ Professional Football Predictor V7.1")
-st.markdown("Poisson baseline model • multi-league Top 10 • history • calibrated disclosure • data-quality checks")
+st.markdown("Poisson baseline model with High-Score tuning • multi-league Top 10 • history • data-quality checks")
 
 with st.sidebar:
     st.header("🔑 API settings")
@@ -1215,7 +1322,6 @@ with st.sidebar:
         st.success("Cache cleared. Reloading…")
         st.rerun()
     st.divider()
-    st.caption("Odds မရရှိပါက model probability ကိုသာ ပြပါမည်။ API data မပြည့်စုံလျှင် data quality ကို လျှော့ပြပါမည်။")
 
 if nav_mode == "🏟️ Selected league":
     selected_name = st.sidebar.selectbox("League", list(LEAGUES.keys()))
