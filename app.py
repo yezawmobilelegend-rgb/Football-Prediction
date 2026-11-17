@@ -13,13 +13,13 @@ from zoneinfo import ZoneInfo
 # =========================================================
 
 st.set_page_config(
-    page_title="Professional Football Predictor V2.8",
+    page_title="Professional Football Predictor V2.9",
     page_icon="⚽",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-DB_PATH = "football_history_v28.db"
+DB_PATH = "football_history_v29.db"
 LOCAL_TZ = ZoneInfo("Asia/Yangon")  # မြန်မာစံတော်ချိန်
 
 LEAGUES = {
@@ -274,8 +274,8 @@ def get_team_advanced_metrics(team, league, api_key, current_match_date):
         gf = h_g if is_home else a_g
         ga = a_g if is_home else h_g
 
-        recent_xg_for += gf * 0.90
-        recent_xg_against += ga * 0.90
+        recent_xg_for += gf * 0.85
+        recent_xg_against += ga * 0.85
 
     if len(last_5) > 0:
         recent_xg_for /= len(last_5)
@@ -315,7 +315,7 @@ def get_h2h_adjustment(home_team, away_team, league, api_key):
 
 
 # =========================================================
-# POISSON MODEL & ELITE TEAM SCALING (MAX GOALS = 8)
+# POISSON MODEL & BALANCED ELITE TUNING (MAX GOALS = 8)
 # =========================================================
 
 def poisson_pmf(lam, k):
@@ -341,21 +341,21 @@ def calculate_lambdas(home_data, away_data, h2h_adj, elo_diff, home_elo, away_el
     home_fatigue = 0.90 if home_data["rest_days"] < 4 else 1.0
     away_fatigue = 0.90 if away_data["rest_days"] < 4 else 1.0
 
-    # Elite Team Multiplier: If an elite team (Elo > 1700 or high xG) plays a weaker team, boost lambda significantly to allow 3-0, 4-0 predictions
-    elite_home_boost = 1.25 if (home_elo > 1700 or home_data["xg_for"] > 2.0) else 1.0
-    elite_away_boost = 1.25 if (away_elo > 1700 or away_data["xg_for"] > 2.0) else 1.0
+    # Balanced Elite Team Multiplier (1.10 သို့ လျှော့ချထားပြီး Weight ကို 0.4 သို့ ပြန်ချိန်ထားသည်)
+    elite_home_boost = 1.10 if (home_elo > 1700 or home_data["xg_for"] > 2.0) else 1.0
+    elite_away_boost = 1.10 if (away_elo > 1700 or away_data["xg_for"] > 2.0) else 1.0
 
     home_lambda = (
         base_home 
-        + (elo_diff / 350.0) 
-        + (home_data["xg_for"] - 1.2) * 0.55
+        + (elo_diff / 400.0) 
+        + (home_data["xg_for"] - 1.3) * 0.4
         + h2h_adj
     ) * home_fatigue * elite_home_boost
 
     away_lambda = (
         base_away 
-        - (elo_diff / 350.0) 
-        + (away_data["xg_for"] - 1.0) * 0.55
+        - (elo_diff / 400.0) 
+        + (away_data["xg_for"] - 1.1) * 0.4
         - h2h_adj
     ) * away_fatigue * elite_away_boost
 
@@ -451,8 +451,8 @@ def parse_myanmar_price(price_str):
 # UI RENDERING & ROUTING
 # =========================================================
 
-st.title("⚽ Professional Football Predictor V2.8")
-st.markdown("အဆင့်မြင့် **Elite Team Boost, High-Scoring Correction & Argmax Score** စနစ်")
+st.title("⚽ Professional Football Predictor V2.9")
+st.markdown("အဆင့်မြင့် **Balanced Elite Boost, Argmax Score & Local Myanmar Odds** စနစ်")
 
 if nav_mode == "🏟️ Selected League View":
     fixtures = fetch_fixtures(league_code, fb_key)
@@ -488,7 +488,7 @@ if nav_mode == "🏟️ Selected League View":
                 local_ou_price = st.text_input("O/U ဈေး (ဥပမာ +40, -90, ဆုံ)", key=f"ou_price_{match_id}")
 
             with right:
-                st.markdown("### 🤖 Advanced AI Match Prediction (Elite Edition)")
+                st.markdown("### 🤖 Advanced AI Match Prediction (Balanced Edition)")
                 h_elo = elos.get(home, 1500.0)
                 a_elo = elos.get(away, 1500.0)
                 hd_adv = get_team_advanced_metrics(home, league_code, fb_key, utc_dt)
