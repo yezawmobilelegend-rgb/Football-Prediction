@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import math
 import re
 import sqlite3
@@ -14,7 +13,7 @@ import requests
 import streamlit as st
 
 # ============================================================
-# Professional Football Predictor V7.5.0
+# Professional Football Predictor V7.3.0
 # - Selected league view
 # - Top 10 cross-league view
 # - Prediction history and multi-metric accuracy
@@ -22,14 +21,13 @@ import streamlit as st
 # - Data-quality and model-confidence disclosure
 # - League-relative, sample-smoothed home/away attack/defence rates
 # - Expected scoring percentages and strong-attack indicators
-# - Most probable 3+ goal scoreline with unconditional/conditional probabilities
-# - Expected-goal-bounded scoreline range with plausible lower-probability scores
-# - Monte Carlo random sampling over the Poisson score distribution
-# - Stable per-fixture seed, sampled frequencies, and analytical comparison
+# - xG-scaled 3+ to 7+ high-goal probability ladder for every match
+# - Dynamic high-scoreline threshold with true Poisson probabilities
+# - Reproducible Poisson prediction (not random/AI magic)
 # ============================================================
 
 st.set_page_config(
-    page_title="Professional Football Predictor V7.5",
+    page_title="Professional Football Predictor V7.3",
     page_icon="⚽",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -49,19 +47,12 @@ LEAGUES: Dict[str, str] = {
     "UEFA Europa League": "EL",
 }
 
-MODEL_VERSION = "monte-carlo-poisson-v7.5"
+MODEL_VERSION = "league-relative-poisson-v7.3-xg-highscore"
 REQUEST_TIMEOUT = 20
-SIMULATION_COUNT = 50_000
 
 # -----------------------------
 # Generic helpers
 # -----------------------------
-
-def stable_match_seed(match_id: Any) -> int:
-    """Return a repeatable seed so a fixture's sampled scorelines do not flicker."""
-    digest = hashlib.sha256(str(match_id).encode("utf-8")).digest()
-    return int.from_bytes(digest[:4], byteorder="big", signed=False)
-
 
 def now_utc() -> datetime:
     return datetime.now(UTC)
@@ -432,60 +423,6 @@ def top_scorelines(matrix: np.ndarray, limit: int = 8, min_total_goals: Optional
     return sorted(rows, key=lambda row: row["probability"], reverse=True)[:limit]
 
 
-def lower_probability_scorelines( matrix: np.ndarray, min_probability: float = 0.0005, max_probability: float = 0.02, marginal_coverage: float = 0.995, limit: int = 12, ) -> List[Dict[str, Any]]:
-    """List lower-probability scorelines inside an xG-based plausible range. The per-team goal ceiling is taken from each Poisson marginal's cumulative probability, so stronger expected-goal ratings naturally allow a wider, higher-scoring range. Individual scoreline probabilities are not inflated. """
-    home_marginal = np.sum(matrix, axis=1)
-    away_marginal = np.sum(matrix, axis=0)
-    home_cumulative = np.cumsum(home_marginal)
-    away_cumulative = np.cumsum(away_marginal)
-    home_hits = np.flatnonzero(home_cumulative >= marginal_coverage)
-    away_hits = np.flatnonzero(away_cumulative >= marginal_coverage)
-    home_ceiling = int(home_hits[0]) if len(home_hits) else matrix.shape[0] - 1
-    away_ceiling = int(away_hits[0]) if len(away_hits) else matrix.shape[1] - 1
-
-    rows: List[Dict[str, Any]] = []
-    for home_goals in range(home_ceiling + 1):
-        for away_goals in range(away_ceiling + 1):
-            probability = float(matrix[home_goals, away_goals])
-            if min_probability <= probability < max_probability:
-                rows.append({
-                    "score": f"{home_goals}-{away_goals}",
-                    "home_goals": home_goals,
-                    "away_goals": away_goals,
-                    "total_goals": home_goals + away_goals,
-                    "probability": probability,
-                })
-    return sorted(rows, key=lambda row: row["probability"], reverse=True)[:limit]
-
-
-def monte_carlo_scorelines( matrix: np.ndarray, simulation_count: int = SIMULATION_COUNT, seed: int = 0, ) -> Tuple[List[Dict[str, Any]], np.ndarray]:
-    """Draw score outcomes from the model distribution and count frequencies."""
-    if simulation_count < 1:
-        raise ValueError("simulation_count must be at least 1")
-    probabilities = np.asarray(matrix, dtype=float).ravel()
-    probabilities = probabilities / probabilities.sum()
-    rng = np.random.default_rng(seed)
-    sampled_indices = rng.choice(probabilities.size, size=simulation_count, p=probabilities)
-    counts = np.bincount(sampled_indices, minlength=probabilities.size).reshape(matrix.shape)
-    rows: List[Dict[str, Any]] = []
-    for home_goals in range(matrix.shape[0]):
-        for away_goals in range(matrix.shape[1]):
-            sample_count = int(counts[home_goals, away_goals])
-            if sample_count == 0:
-                continue
-            rows.append({
-                "score": f"{home_goals}-{away_goals}",
-                "home_goals": home_goals,
-                "away_goals": away_goals,
-                "total_goals": home_goals + away_goals,
-                "sample_count": sample_count,
-                "probability": sample_count / simulation_count,
-                "model_probability": float(matrix[home_goals, away_goals]),
-            })
-    rows.sort(key=lambda row: (row["sample_count"], row["model_probability"]), reverse=True)
-    return rows, counts
-
-
 def calculate_probabilities(matrix: np.ndarray) -> Dict[str, Any]:
     size = matrix.shape[0]
     home_win = float(sum(matrix[h, a] for h in range(size) for a in range(size) if h > a))
@@ -510,6 +447,51 @@ def calculate_probabilities(matrix: np.ndarray) -> Dict[str, Any]:
     }
 
 
+def xg_scaled_high_goal_scenarios( matrix: np.ndarray, expected_total_goals: float, thresholds: Tuple[int, ...] = (3, 4, 5, 6, 7), ) -> Dict[str, Any]:
+    """Build true-probability high-goal scenarios and an xG-scaled highlight. The highlighted goal threshold escalates with combined expected goals. This does not inflate model probabilities; it selects a more ambitious event to inspect when the match xG is higher. """
+    if expected_total_goals < 2.5:
+        target_threshold = 3
+    elif expected_total_goals < 3.2:
+        target_threshold = 4
+    elif expected_total_goals < 4.0:
+        target_threshold = 5
+    elif expected_total_goals < 4.8:
+        target_threshold = 6
+    else:
+        target_threshold = 7
+
+    scenarios: List[Dict[str, Any]] = []
+    size_home, size_away = matrix.shape
+    for threshold in thresholds:
+        event_probability = float(sum(
+            matrix[h, a]
+            for h in range(size_home)
+            for a in range(size_away)
+            if h + a >= threshold
+        ))
+        candidates = top_scorelines(matrix, limit=1, min_total_goals=threshold)
+        best = candidates[0] if candidates else None
+        scenarios.append({
+            "threshold": threshold,
+            "label": f"{threshold}+ goals",
+            "probability": event_probability,
+            "best_scoreline": best,
+            "best_exact_probability": best["probability"] if best else 0.0,
+            "best_conditional_probability": (
+                best["probability"] / event_probability
+                if best and event_probability > 0 else 0.0
+            ),
+        })
+
+    selected = next((x for x in scenarios if x["threshold"] == target_threshold), scenarios[0])
+    return {
+        "expected_total_goals": float(expected_total_goals),
+        "target_threshold": int(selected["threshold"]),
+        "selected": selected,
+        "scenarios": scenarios,
+    }
+
+
 def _smoothed_goals_per_game(games: List[Dict[str, Any]], field: str, prior: float, prior_games: float = 4.0) -> float:
     """Shrink a small home/away sample toward the league rate to limit noise."""
     values = [safe_float(game.get(field)) for game in games]
@@ -517,7 +499,7 @@ def _smoothed_goals_per_game(games: List[Dict[str, Any]], field: str, prior: flo
     return (sum(values) + prior * prior_games) / (len(values) + prior_games)
 
 
-def predict_match( home: Dict[str, Any], away: Dict[str, Any], league_baseline: Optional[Dict[str, float]] = None, sampling_seed: int = 0, simulation_count: int = SIMULATION_COUNT, ) -> Dict[str, Any]:
+def predict_match( home: Dict[str, Any], away: Dict[str, Any], league_baseline: Optional[Dict[str, float]] = None, ) -> Dict[str, Any]:
     """Estimate score probabilities from league rates and smoothed team splits. This remains a transparent Poisson baseline, not a trained or calibrated betting model. A single modal score is only the most likely exact score, not a high-certainty forecast; the complete scoreline distribution is shown. """
     baseline = league_baseline or {}
     base_home = clamp(float(baseline.get("home_goals", 1.48)), 0.70, 2.40)
@@ -546,38 +528,18 @@ def predict_match( home: Dict[str, Any], away: Dict[str, Any], league_baseline: 
     home_lambda = clamp(home_lambda, 0.25, 4.0)
     away_lambda = clamp(away_lambda, 0.20, 3.5)
     matrix = score_matrix(home_lambda, away_lambda)
-    analytical_best_score = tuple(int(x) for x in np.unravel_index(np.argmax(matrix), matrix.shape))
+    best_score = tuple(int(x) for x in np.unravel_index(np.argmax(matrix), matrix.shape))
     probabilities = calculate_probabilities(matrix)
-    sampled_scorelines, sample_counts = monte_carlo_scorelines(
-        matrix, simulation_count=simulation_count, seed=sampling_seed
-    )
-    if not sampled_scorelines:
-        raise ValueError("Monte Carlo sampling did not produce any scorelines")
-    sampled_best = sampled_scorelines[0]
-    best_score = (sampled_best["home_goals"], sampled_best["away_goals"])
-    sampled_total_probability = float(sample_counts.sum())
-    sampled_over25 = float(sum(
-        sample_counts[h, a]
-        for h in range(sample_counts.shape[0])
-        for a in range(sample_counts.shape[1])
-        if h + a >= 3
-    ) / sampled_total_probability)
-    sampled_over35 = float(sum(
-        sample_counts[h, a]
-        for h in range(sample_counts.shape[0])
-        for a in range(sample_counts.shape[1])
-        if h + a >= 4
-    ) / sampled_total_probability)
-    low_probability_scorelines = [
-        row for row in sampled_scorelines if 0.0005 <= row["probability"] < 0.02
-    ][:12]
-    high_scorelines = [row for row in sampled_scorelines if row["total_goals"] >= 3][:5]
-    best_high_scoreline = dict(high_scorelines[0]) if high_scorelines else None
+    expected_total_goals = home_lambda + away_lambda
+    high_goal_system = xg_scaled_high_goal_scenarios(matrix, expected_total_goals)
+    target_threshold = high_goal_system["target_threshold"]
+    high_scorelines = top_scorelines(matrix, limit=5, min_total_goals=target_threshold)
+    best_high_scoreline = high_goal_system["selected"]["best_scoreline"]
     if best_high_scoreline is not None:
-        best_high_scoreline["conditional_probability"] = (
-            best_high_scoreline["probability"] / sampled_over25
-            if sampled_over25 > 0 else 0.0
-        )
+        best_high_scoreline = dict(best_high_scoreline)
+        best_high_scoreline["conditional_probability"] = high_goal_system["selected"]["best_conditional_probability"]
+        best_high_scoreline["event_probability"] = high_goal_system["selected"]["probability"]
+        best_high_scoreline["threshold"] = target_threshold
     home_attack_index = home_attack / base_home
     away_attack_index = away_attack / base_away
     strong_attack_threshold = 1.15  # smoothed scoring rate at least 15% above league
@@ -595,21 +557,11 @@ def predict_match( home: Dict[str, Any], away: Dict[str, Any], league_baseline: 
         "away_lambda": away_lambda,
         "league_baseline": {"home_goals": base_home, "away_goals": base_away},
         "best_score": best_score,
-        "best_probability": float(sampled_best["probability"]),
-        "analytical_best_score": analytical_best_score,
-        "analytical_best_probability": float(matrix[analytical_best_score]),
-        "top_scorelines": sampled_scorelines[:12],
+        "best_probability": float(matrix[best_score]),
+        "top_scorelines": top_scorelines(matrix, limit=8),
         "high_scoring_scorelines": high_scorelines,
         "best_high_scoreline": best_high_scoreline,
-        "lower_probability_scorelines": low_probability_scorelines,
-        "lower_probability_band": {"minimum": 0.0005, "maximum_exclusive": 0.02},
-        "sampling": {
-            "method": "Monte Carlo categorical sampling from Poisson score matrix",
-            "simulation_count": int(simulation_count),
-            "seed": int(sampling_seed),
-            "sampled_over25": sampled_over25,
-            "sampled_over35": sampled_over35,
-        },
+        "high_goal_system": high_goal_system,
         "home_attack_index": home_attack_index,
         "away_attack_index": away_attack_index,
         "strong_attackers": strong_attackers,
@@ -1186,33 +1138,21 @@ def render_prediction_card( match: Dict[str, Any], prediction: Dict[str, Any], o
     probs = prediction["probabilities"]
     score = prediction["best_score"]
     st.markdown(f"### {home} **{score[0]}–{score[1]}** {away}")
-    sampling = prediction["sampling"]
     st.caption(
         f"Kickoff: {local_time(match['utcDate'])} | Model: {MODEL_VERSION} | "
-        f"Monte Carlo frequency for this score: {prediction['best_probability'] * 100:.2f}% "
-        f"({sampling['simulation_count']:,} simulations)"
+        f"Exact-score probability: {prediction['best_probability'] * 100:.1f}%"
     )
-    st.caption(
-        f"Analytical Poisson estimate for the sampled score: "
-        f"{prediction['top_scorelines'][0]['model_probability'] * 100:.2f}%"
-    )
-    st.markdown("**Expected Goal rating (xG)**")
-    xg1, xg2, xg3, xg4 = st.columns(4)
-    xg1.metric(f"{home} expected goals", f"{prediction['home_lambda']:.2f}")
-    xg2.metric(f"{away} expected goals", f"{prediction['away_lambda']:.2f}")
-    xg3.metric(f"{home} to score 1+", f"{probs['home_scores_1plus'] * 100:.1f}%")
-    xg4.metric(f"{away} to score 1+", f"{probs['away_scores_1plus'] * 100:.1f}%")
     score_a, score_b = st.columns(2)
     with score_a:
-        st.markdown("**Most frequent Monte Carlo scorelines**")
+        st.markdown("**Most likely exact scorelines**")
         score_table = pd.DataFrame(prediction.get("top_scorelines", []))
         if not score_table.empty:
-            score_table["Sampled %"] = score_table.pop("probability").map(lambda x: f"{x * 100:.2f}%")
-            score_table["Poisson %"] = score_table.pop("model_probability").map(lambda x: f"{x * 100:.2f}%")
-            score_table.rename(columns={"sample_count": "Samples"}, inplace=True)
-            st.dataframe(score_table[["score", "Samples", "Sampled %", "Poisson %"]], hide_index=True, use_container_width=True)
+            score_table["Probability"] = score_table.pop("probability").map(lambda x: f"{x * 100:.2f}%")
+            st.dataframe(score_table[["score", "Probability"]], hide_index=True, use_container_width=True)
     with score_b:
-        st.markdown("**Most likely high-score pick (3+ total goals)**")
+        high_system = prediction.get("high_goal_system", {})
+        high_threshold = high_system.get("target_threshold", 3)
+        st.markdown(f"**xG-scaled high-score pick ({high_threshold}+ total goals)**")
         high_pick = prediction.get("best_high_scoreline")
         strong_attackers = prediction.get("strong_attackers", [])
         attack_label = {"home": home, "away": away}
@@ -1221,25 +1161,40 @@ def render_prediction_card( match: Dict[str, Any], prediction: Dict[str, Any], o
                 attack_names = ", ".join(attack_label[side] for side in strong_attackers)
                 st.success(f"Above-league attack rate: {attack_names}")
             else:
-                st.info("No team meets the model's strong-attack threshold; 3+ scoreline shown as a lower-probability alternative.")
+                st.info("No team meets the model's strong-attack threshold; the xG-scaled high-scoreline is shown as an alternative.")
             st.markdown(
                 f"**{high_pick['score']}** — exact-score probability: "
                 f"**{high_pick['probability'] * 100:.2f}%**"
             )
             st.caption(
-                f"Sampled match total 3+ probability: {sampling['sampled_over25'] * 100:.1f}% "
-                f"(Poisson: {probs['over25'] * 100:.1f}%) | "
-                f"Among sampled 3+ outcomes, this scoreline: "
-                f"{high_pick['conditional_probability'] * 100:.1f}%"
+                f"Combined xG: {high_system.get('expected_total_goals', 0):.2f} | "
+                f"{high_threshold}+ goals probability: {high_pick['event_probability'] * 100:.1f}% | "
+                f"Exact score probability: {high_pick['probability'] * 100:.2f}% | "
+                f"Within {high_threshold}+ outcomes: {high_pick['conditional_probability'] * 100:.1f}%"
             )
             high_table = pd.DataFrame(prediction.get("high_scoring_scorelines", []))
             if not high_table.empty:
-                high_table["Sampled %"] = high_table["probability"].map(lambda x: f"{x * 100:.2f}%")
-                high_table["Poisson %"] = high_table["model_probability"].map(lambda x: f"{x * 100:.2f}%")
-                high_table.rename(columns={"sample_count": "Samples"}, inplace=True)
-                st.dataframe(high_table[["score", "Samples", "Sampled %", "Poisson %"]], hide_index=True, use_container_width=True)
+                high_table["Probability"] = high_table["probability"].map(lambda x: f"{x * 100:.2f}%")
+                st.dataframe(high_table[["score", "Probability"]], hide_index=True, use_container_width=True)
         else:
-            st.caption("No 3+ goal scoreline available in the probability matrix.")
+            st.caption("No scoreline available for the xG-selected high-goal threshold.")
+    st.markdown("**Expected-goal-scaled high-score ladder**")
+    high_scenarios = prediction.get("high_goal_system", {}).get("scenarios", [])
+    if high_scenarios:
+        ladder_table = pd.DataFrame([{
+            "High-goal event": scenario["label"],
+            "Event probability": f"{scenario['probability'] * 100:.1f}%",
+            "Most likely score in band": scenario["best_scoreline"]["score"] if scenario["best_scoreline"] else "—",
+            "Exact-score probability": f"{scenario['best_exact_probability'] * 100:.2f}%",
+            "Conditional within band": f"{scenario['best_conditional_probability'] * 100:.1f}%",
+            "xG-selected": "Yes" if scenario["threshold"] == prediction["high_goal_system"]["target_threshold"] else "",
+        } for scenario in high_scenarios])
+        st.dataframe(ladder_table, hide_index=True, use_container_width=True)
+        st.caption(
+            f"Combined xG {prediction['high_goal_system']['expected_total_goals']:.2f} ၏အပေါ်မူတည်၍ "
+            f"{prediction['high_goal_system']['target_threshold']}+ goals ကို ဒီပွဲ၏ dynamic high-score level အဖြစ်ရွေးထားသည်။ "
+            "Probability ကို အတုအယောင်မြှင့်မထားဘဲ Poisson score matrix ထဲက အမှန်တကယ်တွက်ချက်ထားသည်။"
+        )
     st.markdown("**Expected scoring probabilities**")
     expected_table = pd.DataFrame({
         "Event": [
@@ -1259,20 +1214,6 @@ def render_prediction_card( match: Dict[str, Any], prediction: Dict[str, Any], o
     })
     expected_table["Probability"] = expected_table["Probability"].map(lambda x: f"{x * 100:.1f}%")
     st.dataframe(expected_table, hide_index=True, use_container_width=True)
-    with st.expander("Expected-goal-based lower-probability scorelines", expanded=False):
-        low_scores = pd.DataFrame(prediction.get("lower_probability_scorelines", []))
-        if low_scores.empty:
-            st.info("ဒီ simulation run မှာ 0.05%–2.00% frequency ကြား scoreline မတွေ့ပါ။ Simulation count တိုးပြီး စမ်းနိုင်ပါတယ်။")
-        else:
-            low_scores["Sampled %"] = low_scores.pop("probability").map(lambda x: f"{x * 100:.2f}%")
-            low_scores["Poisson %"] = low_scores.pop("model_probability").map(lambda x: f"{x * 100:.2f}%")
-            low_scores.rename(columns={"sample_count": "Samples"}, inplace=True)
-            st.caption(
-                f"Monte Carlo မှ {sampling['simulation_count']:,} ကြိမ် sample ယူရာမှာ "
-                "frequency 0.05% မှ 2.00% အောက် တွေ့ခဲ့တဲ့ ဖြစ်နိုင်ခြေနည်း scoreline များပါ။ "
-                "Sample % ဟာ အနီးစပ်ဆုံး estimate သာဖြစ်ပါတယ်။"
-            )
-            st.dataframe(low_scores[["score", "total_goals", "Samples", "Sampled %", "Poisson %"]], hide_index=True, use_container_width=True)
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("1X2", f"{max(probs['home_win'], probs['draw'], probs['away_win']) * 100:.1f}%")
     c2.metric("Over 2.5", pct(probs["over25"]))
@@ -1318,11 +1259,7 @@ def render_prediction_card( match: Dict[str, Any], prediction: Dict[str, Any], o
                 f"League baseline (home/away): **{baseline.get('home_goals', 0):.2f} / "
                 f"{baseline.get('away_goals', 0):.2f}** goals per team-match"
             )
-            st.caption(
-                f"Prediction score ကို fixture ID အခြေခံ seed ဖြင့် Monte Carlo {sampling['simulation_count']:,} ကြိမ် sample ယူထားသည်။ "
-                "ပြန်ဖွင့်ချိန်တွင် result တည်ငြိမ်စေရန် seed ကို ထိန်းထားပြီး၊ Sampled % သည် simulation ခန့်မှန်းချက်ဖြစ်ကာ Poisson % နှင့် အနည်းငယ်ကွာနိုင်သည်။"
-            )
-            st.caption("xG က သတ်မှတ်သော 99.5% range အတွင်းရှိ 0.05%–2.00% lower-probability outcomes များကိုလည်း သီးခြားပြထားသည်။ 3+ ဂိုး probability ကိုလည်း သီးခြားကြည့်ပါ; မည်သည့် scoreline မဆို အာမခံချက်မဟုတ်ပါ။")
+            st.caption("High-score threshold ကို combined xG အလိုက် 3+–7+ အတွင်း အဆင့်မြှင့်ပြထားသည်။ Scenario probability သည် original Poisson distribution မှတွက်ထားပြီး scoreline ကို အတုအယောင်မမြှင့်ပါ။")
             st.warning("ဤ model သည် trained/calibrated production model မဟုတ်သေးပါ။ Injury, lineup, xG နှင့် bookmaker closing-line data မပါသဖြင့် prediction ကို အာမခံချက်အဖြစ် မသုံးပါနှင့်။")
 
 
@@ -1359,14 +1296,7 @@ def create_prediction(match: Dict[str, Any], context: Dict[str, Any]) -> Dict[st
     home, home_quality = find_team_data(match["homeTeam"]["name"], context["standings"], context["form"])
     away, away_quality = find_team_data(match["awayTeam"]["name"], context["standings"], context["form"])
     home["quality"], away["quality"] = home_quality, away_quality
-    seed = stable_match_seed(match.get("id", f"{match['homeTeam']['name']}:{match['awayTeam']['name']}"))
-    return predict_match(
-        home,
-        away,
-        context.get("league_baseline"),
-        sampling_seed=seed,
-        simulation_count=SIMULATION_COUNT,
-    )
+    return predict_match(home, away, context.get("league_baseline"))
 
 
 def render_selected_league(league_name: str, league_code: str, fb_key: str, odds_key: str) -> None:
@@ -1485,8 +1415,8 @@ def render_history() -> None:
 # -----------------------------
 
 initialize_database()
-st.title("⚽ Professional Football Predictor V7.5")
-st.markdown("Monte Carlo sampled scorelines • empirical frequencies • xG and analytical probability comparison")
+st.title("⚽ Professional Football Predictor V7.3")
+st.markdown("League-relative attack/defence Poisson • expected percentages • strong-attack 3+ goal probabilities • history")
 
 with st.sidebar:
     st.header("🔑 API settings")
