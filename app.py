@@ -1,11 +1,26 @@
 from __future__ import annotations
 
-"""Professional Football Prediction Dashboard V8.0 Providers: - football-data.org v4: fixtures, recent finished results, standings - The Odds API v4: multi-region h2h and totals odds - API-Football v3: fixture injuries, lineups, and available match statistics Model: - chronological Elo ratings - league-relative venue-specific attack/defence goal-rate xG proxy - Dixon-Coles-adjusted Poisson score matrix - short-rest, injuries, and user-entered tactical/motivation adjustments Important: this is a transparent baseline model, not a trained/calibrated guarantee. The expected-goals values are goal-rate proxies unless a provider explicitly returns xG. """
+"""Professional Football Prediction Dashboard V8.1 (Live Football API)
+
+Providers:
+- football-data.org v4: fixtures, recent finished results, standings
+- The Odds API v4: multi-region h2h and totals odds
+- Live Football API: match injuries, lineups, and available match statistics
+
+Model:
+- chronological Elo ratings
+- league-relative venue-specific attack/defence goal-rate xG proxy
+- Dixon-Coles-adjusted Poisson score matrix
+- short-rest, injuries, and user-entered tactical/motivation adjustments
+
+Important: this is a transparent baseline model, not a trained/calibrated guarantee.
+The expected-goals values are goal-rate proxies unless a provider explicitly returns xG.
+"""
 
 import math
 import re
 import unicodedata
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
@@ -13,11 +28,6 @@ import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
-
-# Official API references:
-# football-data.org v4: https://docs.football-data.org/general/v4/index.html
-# The Odds API v4: https://the-odds-api.com/liveapi/guides/v4/
-# API-Football v3: https://www.api-football.com/documentation-v3
 
 st.set_page_config(
     page_title="Football Prediction Dashboard V8",
@@ -30,20 +40,23 @@ UTC = timezone.utc
 LOCAL_TZ = ZoneInfo("Asia/Yangon")
 FOOTBALL_DATA_BASE = "https://api.football-data.org/v4"
 ODDS_API_BASE = "https://api.the-odds-api.com/v4"
-API_FOOTBALL_BASE = "https://v3.football.api-sports.io"
+LIVE_FOOTBALL_API_BASES = [
+    "https://api.live-football-api.com",
+    "https://live-football-api.com/api",
+]
 REQUEST_TIMEOUT = 18
-MODEL_VERSION = "elo-dixon-coles-v8.0"
-DIXON_COLES_RHO = -0.06  # transparent starting prior; should be estimated by backtest
+MODEL_VERSION = "elo-dixon-coles-v8.1-lfa"
+DIXON_COLES_RHO = -0.06
 HOME_ELO_ADVANTAGE = 55.0
 
 LEAGUES: Dict[str, Dict[str, Any]] = {
-    "England Premier League": {"football_data": "PL", "odds": "soccer_epl", "api_football": 39},
-    "Spain LaLiga": {"football_data": "PD", "odds": "soccer_spain_la_liga", "api_football": 140},
-    "Germany Bundesliga": {"football_data": "BL1", "odds": "soccer_germany_bundesliga", "api_football": 78},
-    "Italy Serie A": {"football_data": "SA", "odds": "soccer_italy_serie_a", "api_football": 135},
-    "France Ligue 1": {"football_data": "FL1", "odds": "soccer_france_ligue_one", "api_football": 61},
-    "UEFA Champions League": {"football_data": "CL", "odds": "soccer_uefa_champs_league", "api_football": 2},
-    "UEFA Europa League": {"football_data": "EL", "odds": "soccer_uefa_europa_league", "api_football": 3},
+    "England Premier League": {"football_data": "PL", "odds": "soccer_epl", "lfa_league": "premier-league"},
+    "Spain LaLiga": {"football_data": "PD", "odds": "soccer_spain_la_liga", "lfa_league": "la-liga"},
+    "Germany Bundesliga": {"football_data": "BL1", "odds": "soccer_germany_bundesliga", "lfa_league": "bundesliga"},
+    "Italy Serie A": {"football_data": "SA", "odds": "soccer_italy_serie_a", "lfa_league": "serie-a"},
+    "France Ligue 1": {"football_data": "FL1", "odds": "soccer_france_ligue_one", "lfa_league": "ligue-1"},
+    "UEFA Champions League": {"football_data": "CL", "odds": "soccer_uefa_champs_league", "lfa_league": "champions-league"},
+    "UEFA Europa League": {"football_data": "EL", "odds": "soccer_uefa_europa_league", "lfa_league": "europa-league"},
 }
 
 # -----------------------------
@@ -52,7 +65,6 @@ LEAGUES: Dict[str, Dict[str, Any]] = {
 
 
 def safe_secret(name: str, default: str = "") -> str:
-    """Read an optional Streamlit secret without failing when no secrets file exists."""
     try:
         value = st.secrets.get(name, default)
     except Exception:
@@ -125,7 +137,12 @@ def error_message(response: requests.Response) -> str:
     return f"{base} {detail}" if detail else base
 
 
-def http_json( url: str, *, headers: Optional[Dict[str, str]] = None, params: Optional[Dict[str, Any]] = None, ) -> Tuple[Optional[Any], Optional[str], Dict[str, str]]:
+def http_json(
+    url: str,
+    *,
+    headers: Optional[Dict[str, str]] = None,
+    params: Optional[Dict[str, Any]] = None,
+) -> Tuple[Optional[Any], Optional[str], Dict[str, str]]:
     try:
         response = requests.get(url, headers=headers, params=params, timeout=REQUEST_TIMEOUT)
         response_headers = {k.lower(): v for k, v in response.headers.items()}
@@ -136,14 +153,6 @@ def http_json( url: str, *, headers: Optional[Dict[str, str]] = None, params: Op
         return None, "API request timed out.", {}
     except (requests.RequestException, ValueError) as exc:
         return None, f"API/network error: {exc}", {}
-
-
-def result_code(home_goals: int, away_goals: int) -> str:
-    if home_goals > away_goals:
-        return "H"
-    if home_goals == away_goals:
-        return "D"
-    return "A"
 
 
 # -----------------------------
@@ -213,7 +222,6 @@ def fixture_window(days_ahead: int = 7) -> Tuple[str, str, datetime, datetime]:
     now = utc_now()
     start = now - timedelta(hours=12)
     end = now + timedelta(days=days_ahead)
-    # football-data.org dateTo is exclusive; include one extra calendar date.
     return start.date().isoformat(), (end.date() + timedelta(days=1)).isoformat(), start, end
 
 
@@ -347,110 +355,200 @@ def build_value_bets(model: Dict[str, Any], odds: Dict[str, Any]) -> List[Dict[s
 
 
 # -----------------------------
-# Provider 3: API-Football v3 team news
+# Provider 3: Live Football API team news
 # -----------------------------
 
 
-def api_football_get(api_key: str, endpoint: str, params: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+def live_football_get(
+    api_key: str,
+    endpoints: Iterable[str],
+    params: Optional[Dict[str, Any]] = None,
+) -> Tuple[Optional[Any], Optional[str]]:
     if not api_key:
-        return None, "API-Football key is not configured."
-    return_data, error, _ = http_json(
-        f"{API_FOOTBALL_BASE}/{endpoint.lstrip('/')}",
-        headers={"x-apisports-key": api_key},
-        params=params,
-    )
-    if error:
-        return None, error
-    if isinstance(return_data, dict) and return_data.get("errors"):
-        return None, str(return_data["errors"])
-    return return_data, None
+        return None, "Live Football API key is not configured."
+    query_params = dict(params or {})
+    query_params.setdefault("api_key", api_key)
+    last_error = "No response from Live Football API."
+
+    for base in LIVE_FOOTBALL_API_BASES:
+        for ep in endpoints:
+            clean_ep = ep.lstrip("/")
+            payload, err, _ = http_json(
+                f"{base}/{clean_ep}",
+                headers={
+                    "x-api-key": api_key,
+                    "Authorization": f"Bearer {api_key}",
+                    "Accept": "application/json",
+                },
+                params=query_params,
+            )
+            if not err and payload is not None:
+                if isinstance(payload, dict) and payload.get("error"):
+                    last_error = str(payload["error"])
+                    continue
+                return payload, None
+            if err:
+                last_error = err
+    return None, last_error
 
 
-def season_start_year(kickoff: Any) -> int:
-    dt = parse_datetime(kickoff)
-    if not dt:
-        return utc_now().year if utc_now().month >= 7 else utc_now().year - 1
-    return dt.year if dt.month >= 7 else dt.year - 1
+def _extract_items(payload: Any, keys: Tuple[str, ...]) -> List[Dict[str, Any]]:
+    if isinstance(payload, list):
+        return [x for x in payload if isinstance(x, dict)]
+    if isinstance(payload, dict):
+        for k in keys:
+            val = payload.get(k)
+            if isinstance(val, list):
+                return [x for x in val if isinstance(x, dict)]
+            if isinstance(val, dict):
+                return [val]
+        data = payload.get("data")
+        if isinstance(data, list):
+            return [x for x in data if isinstance(x, dict)]
+        if isinstance(data, dict):
+            for k in keys:
+                val = data.get(k)
+                if isinstance(val, list):
+                    return [x for x in val if isinstance(x, dict)]
+    return []
 
 
 @st.cache_data(ttl=900, show_spinner=False)
-def fetch_api_football_team_news( api_key: str, api_league_id: int, season: int, kickoff_date: str, home_name: str, away_name: str, ) -> Dict[str, Any]:
-    result: Dict[str, Any] = {"fixture": {}, "injuries": [], "lineups": [], "statistics": [], "errors": []}
+def fetch_live_football_team_news(
+    api_key: str,
+    league_slug: str,
+    kickoff_date: str,
+    home_name: str,
+    away_name: str,
+) -> Dict[str, Any]:
+    result: Dict[str, Any] = {
+        "match_id": None,
+        "fixture": {},
+        "injuries": [],
+        "lineups": [],
+        "statistics": [],
+        "errors": [],
+    }
     if not api_key:
-        result["errors"].append("API-Football key is not configured.")
+        result["errors"].append("Live Football API key is not configured.")
         return result
-    fixtures, error = api_football_get(api_key, "fixtures", {"league": api_league_id, "season": season, "date": kickoff_date})
-    if error:
-        result["errors"].append(f"Fixture lookup: {error}")
+
+    fixtures_payload, fixture_err = live_football_get(
+        api_key,
+        endpoints=("fixtures", "matches", "events"),
+        params={"date": kickoff_date, "league": league_slug},
+    )
+    if fixture_err:
+        result["errors"].append(f"Fixture lookup: {fixture_err}")
         return result
-    candidates = (fixtures or {}).get("response", [])
-    matched = None
+
+    candidates = _extract_items(fixtures_payload, ("fixtures", "matches", "response", "events"))
+    matched: Optional[Dict[str, Any]] = None
     for item in candidates:
-        teams = item.get("teams", {})
-        if same_team(home_name, teams.get("home", {}).get("name")) and same_team(away_name, teams.get("away", {}).get("name")):
+        h_cand = (
+            item.get("home_team")
+            or item.get("homeTeam")
+            or (item.get("teams", {}).get("home", {}).get("name") if isinstance(item.get("teams"), dict) else None)
+            or item.get("home")
+        )
+        a_cand = (
+            item.get("away_team")
+            or item.get("awayTeam")
+            or (item.get("teams", {}).get("away", {}).get("name") if isinstance(item.get("teams"), dict) else None)
+            or item.get("away")
+        )
+        if isinstance(h_cand, dict):
+            h_cand = h_cand.get("name")
+        if isinstance(a_cand, dict):
+            a_cand = a_cand.get("name")
+        if same_team(home_name, h_cand) and same_team(away_name, a_cand):
             matched = item
             break
-    fixture_id = (matched or {}).get("fixture", {}).get("id")
-    if not fixture_id:
-        result["errors"].append("Matching fixture not found in API-Football for this date. Team naming or competition coverage may differ.")
+
+    if not matched:
+        result["errors"].append("Matching fixture not found in Live Football API for this date.")
         return result
+
     result["fixture"] = matched
-    for endpoint, key in (("injuries", "injuries"), ("fixtures/lineups", "lineups"), ("fixtures/statistics", "statistics")):
-        payload, endpoint_error = api_football_get(api_key, endpoint, {"fixture": fixture_id})
-        if endpoint_error:
-            result["errors"].append(f"{endpoint}: {endpoint_error}")
-        else:
-            result[key] = (payload or {}).get("response", [])
+    match_id = matched.get("id") or matched.get("match_id") or matched.get("fixture_id")
+    result["match_id"] = match_id
+
+    lookup_params: Dict[str, Any] = {"date": kickoff_date, "league": league_slug}
+    if match_id:
+        lookup_params["match_id"] = match_id
+        lookup_params["fixture_id"] = match_id
+        lookup_params["id"] = match_id
+
+    inj_payload, inj_err = live_football_get(api_key, ("injuries", "match/injuries", "fixture/injuries"), lookup_params)
+    if inj_err:
+        result["errors"].append(f"injuries: {inj_err}")
+    else:
+        result["injuries"] = _extract_items(inj_payload, ("injuries", "response", "missing"))
+
+    lineup_payload, lineup_err = live_football_get(api_key, ("lineups", "match/lineups", "fixture/lineups"), lookup_params)
+    if lineup_err:
+        result["errors"].append(f"lineups: {lineup_err}")
+    else:
+        result["lineups"] = _extract_items(lineup_payload, ("lineups", "response", "teams"))
+
+    stats_payload, stats_err = live_football_get(api_key, ("statistics", "match/statistics", "fixture/statistics"), lookup_params)
+    if not stats_err and stats_payload:
+        result["statistics"] = _extract_items(stats_payload, ("statistics", "response", "stats"))
+
     return result
 
 
 def summarize_team_news(bundle: Dict[str, Any], home_name: str, away_name: str) -> Dict[str, Any]:
-    summary = {
-        "fixture_id": None,
-        "home_injuries": [], "away_injuries": [],
-        "home_lineup_confirmed": False, "away_lineup_confirmed": False,
-        "home_starters": None, "away_starters": None,
+    summary: Dict[str, Any] = {
+        "fixture_id": bundle.get("match_id"),
+        "home_injuries": [],
+        "away_injuries": [],
+        "home_lineup_confirmed": False,
+        "away_lineup_confirmed": False,
+        "home_starters": None,
+        "away_starters": None,
         "statistics_available": False,
-        "home_xg": None, "away_xg": None,
-        "home_shots_on_target": None, "away_shots_on_target": None,
-        "lineup_note": "Lineup data is provider/competition dependent and may only appear shortly before kickoff.",
+        "home_xg": None,
+        "away_xg": None,
+        "home_shots_on_target": None,
+        "away_shots_on_target": None,
+        "lineup_note": "Confirmed lineups usually appear about 1 hour before kickoff.",
     }
-    fixture = bundle.get("fixture", {})
-    summary["fixture_id"] = fixture.get("fixture", {}).get("id")
-    team_ids = fixture.get("teams", {})
-    home_id = team_ids.get("home", {}).get("id")
-    away_id = team_ids.get("away", {}).get("id")
+
     for item in bundle.get("injuries", []):
-        team_id = item.get("team", {}).get("id")
-        player = item.get("player", {}).get("name", "Unknown player")
-        reason = item.get("player", {}).get("reason") or item.get("player", {}).get("type") or "Unavailable"
-        if team_id == home_id:
-            summary["home_injuries"].append(f"{player} ({reason})")
-        elif team_id == away_id:
-            summary["away_injuries"].append(f"{player} ({reason})")
+        player = item.get("player_name") or (item.get("player", {}).get("name") if isinstance(item.get("player"), dict) else None) or item.get("name") or "Unknown player"
+        reason = item.get("reason") or item.get("status") or item.get("type") or "Unavailable"
+        team_label = item.get("team_name") or item.get("team") or (item.get("team", {}).get("name") if isinstance(item.get("team"), dict) else "")
+        side = str(item.get("side") or item.get("team_side") or "").lower()
+        entry = f"{player} ({reason})"
+        if side in {"home", "h"} or same_team(team_label, home_name):
+            summary["home_injuries"].append(entry)
+        elif side in {"away", "a"} or same_team(team_label, away_name):
+            summary["away_injuries"].append(entry)
+
     for lineup in bundle.get("lineups", []):
-        team_id = lineup.get("team", {}).get("id")
-        starters = lineup.get("startXI", [])
-        if team_id == home_id:
-            summary["home_lineup_confirmed"] = bool(starters)
-            summary["home_starters"] = len(starters) if starters else None
-        elif team_id == away_id:
-            summary["away_lineup_confirmed"] = bool(starters)
-            summary["away_starters"] = len(starters) if starters else None
-    for team_stats in bundle.get("statistics", []):
-        team_id = team_stats.get("team", {}).get("id")
-        side = "home" if team_id == home_id else "away" if team_id == away_id else None
-        if not side:
-            continue
-        for stat in team_stats.get("statistics", []):
-            key = re.sub(r"[^a-z]", "", str(stat.get("type", "")).lower())
-            value = stat.get("value")
-            if key in {"expectedgoals", "xg"}:
-                summary[f"{side}_xg"] = safe_float(value)
-            if key in {"shotsongoal", "shotsontarget"}:
-                summary[f"{side}_shots_on_target"] = safe_float(value)
-            if key:
-                summary["statistics_available"] = True
+        team_label = lineup.get("team_name") or lineup.get("team") or (lineup.get("team", {}).get("name") if isinstance(lineup.get("team"), dict) else "")
+        side = str(lineup.get("side") or lineup.get("team_side") or "").lower()
+        starters = lineup.get("startXI") or lineup.get("starting_xi") or lineup.get("starters") or lineup.get("lineup") or []
+        count = len(starters) if isinstance(starters, list) and starters else None
+        if side in {"home", "h"} or same_team(team_label, home_name):
+            summary["home_lineup_confirmed"] = bool(count)
+            summary["home_starters"] = count
+        elif side in {"away", "a"} or same_team(team_label, away_name):
+            summary["away_lineup_confirmed"] = bool(count)
+            summary["away_starters"] = count
+
+    for stat in bundle.get("statistics", []):
+        key = re.sub(r"[^a-z]", "", str(stat.get("type") or stat.get("name") or "").lower())
+        if key in {"expectedgoals", "xg"}:
+            summary["home_xg"] = safe_float(stat.get("home"))
+            summary["away_xg"] = safe_float(stat.get("away"))
+            summary["statistics_available"] = True
+        elif key in {"shotsongoal", "shotsontarget"}:
+            summary["home_shots_on_target"] = safe_float(stat.get("home"))
+            summary["away_shots_on_target"] = safe_float(stat.get("away"))
+            summary["statistics_available"] = True
+
     return summary
 
 
@@ -467,8 +565,10 @@ def valid_finished_score(match: Dict[str, Any]) -> Optional[Tuple[int, int]]:
     return int(home_goals), int(away_goals)
 
 
-def build_team_context( finished_matches: List[Dict[str, Any]], standings: Dict[str, Dict[str, Any]], ) -> Dict[str, Any]:
-    """Build chronological Elo ratings, venue-specific recent rates, and league priors."""
+def build_team_context(
+    finished_matches: List[Dict[str, Any]],
+    standings: Dict[str, Dict[str, Any]],
+) -> Dict[str, Any]:
     matches = []
     for match in finished_matches:
         score = valid_finished_score(match)
@@ -521,7 +621,6 @@ def build_team_context( finished_matches: List[Dict[str, Any]], standings: Dict[
             "last_match": max((x["date"] for x in games), default=None),
             "standing": standings_row,
         }
-    # Include teams with standings but no finished scores in the rolling window.
     for key, row in standings.items():
         profiles.setdefault(key, {
             "name": row.get("name", key), "elo": 1500.0, "recent": [],
@@ -547,12 +646,10 @@ def poisson_pmf(lam: float, goals: int) -> float:
 
 
 def dixon_coles_matrix(home_lambda: float, away_lambda: float, rho: float = DIXON_COLES_RHO, max_goals: int = 10) -> np.ndarray:
-    """Independent Poisson score matrix with a low-score Dixon-Coles correction."""
     matrix = np.array([
         [poisson_pmf(home_lambda, h) * poisson_pmf(away_lambda, a) for a in range(max_goals + 1)]
         for h in range(max_goals + 1)
     ], dtype=float)
-    # Dixon-Coles tau adjustments for 0-0, 0-1, 1-0 and 1-1.
     matrix[0, 0] *= max(0.05, 1.0 - home_lambda * away_lambda * rho)
     matrix[0, 1] *= max(0.05, 1.0 + home_lambda * rho)
     matrix[1, 0] *= max(0.05, 1.0 + away_lambda * rho)
@@ -594,14 +691,19 @@ def _get_profile(context: Dict[str, Any], team_name: str) -> Dict[str, Any]:
     found = context.get("teams", {}).get(key)
     if found:
         return found
-    # Alias/partial matching for provider naming differences.
     for profile_key, profile in context.get("teams", {}).items():
         if same_team(team_name, profile.get("name", profile_key)):
             return profile
     return {"name": team_name, "elo": 1500.0, "recent": [], "home_games": [], "away_games": [], "recent_points": 0, "recent_played": 0, "last_match": None, "standing": {}}
 
 
-def predict_match( match: Dict[str, Any], league_context: Dict[str, Any], *, manual_context: Optional[Dict[str, float]] = None, team_news: Optional[Dict[str, Any]] = None, ) -> Dict[str, Any]:
+def predict_match(
+    match: Dict[str, Any],
+    league_context: Dict[str, Any],
+    *,
+    manual_context: Optional[Dict[str, float]] = None,
+    team_news: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     home_name = match.get("homeTeam", {}).get("name", "Home")
     away_name = match.get("awayTeam", {}).get("name", "Away")
     home = _get_profile(league_context, home_name)
@@ -617,13 +719,11 @@ def predict_match( match: Dict[str, Any], league_context: Dict[str, Any], *, man
     home_lambda = base_home * math.sqrt((home_attack / base_home) * (away_conceded / base_home))
     away_lambda = base_away * math.sqrt((away_attack / base_away) * (home_conceded / base_away))
 
-    # Elo adjusts the goal rates modestly; league home scoring already contains home advantage.
     elo_difference = float(home.get("elo", 1500.0)) - float(away.get("elo", 1500.0))
     elo_shift = clamp(elo_difference / 2200.0, -0.22, 0.22)
     home_lambda *= math.exp(elo_shift)
     away_lambda *= math.exp(-elo_shift * 0.80)
 
-    # Schedule congestion: conservatively lower attacking rates after short rest.
     kickoff = parse_datetime(match.get("utcDate")) or utc_now()
     rest_days: Dict[str, Optional[int]] = {}
     rest_factor: Dict[str, float] = {}
@@ -644,7 +744,6 @@ def predict_match( match: Dict[str, Any], league_context: Dict[str, Any], *, man
     news = team_news or {}
     home_injuries = len(news.get("home_injuries", []))
     away_injuries = len(news.get("away_injuries", []))
-    # Injury counts are not player-value ratings; apply only a very small capped team-level adjustment.
     home_lambda *= math.exp(-min(0.12, 0.018 * home_injuries))
     away_lambda *= math.exp(-min(0.12, 0.018 * away_injuries))
     home_lambda = clamp(home_lambda, 0.20, 4.20)
@@ -710,15 +809,22 @@ def render_value_finder(model: Dict[str, Any], odds: Dict[str, Any]) -> None:
         st.caption("Market probabilities are normalized across each bookmaker's outcomes before averaging. EV uses the best listed decimal price and the model probability; it is not a profit guarantee.")
 
 
-def render_fixture_card( match: Dict[str, Any], league_name: str, league_context: Dict[str, Any], api_football_key: str, api_league_id: int, odds_data: List[Dict[str, Any]], ) -> Dict[str, Any]:
+def render_fixture_card(
+    match: Dict[str, Any],
+    league_name: str,
+    league_context: Dict[str, Any],
+    lfa_key: str,
+    lfa_league: str,
+    odds_data: List[Dict[str, Any]],
+) -> Dict[str, Any]:
     home_name = match.get("homeTeam", {}).get("name", "Home")
     away_name = match.get("awayTeam", {}).get("name", "Away")
     match_id = str(match.get("id", f"{home_name}-{away_name}"))
     odds_event = match_odds_event(home_name, away_name, odds_data)
     odds = parse_global_odds(odds_event, home_name, away_name)
-    saved_key = f"api_football_news_{match_id}"
+    saved_key = f"lfa_news_{match_id}"
     with st.expander(f"⚽ {home_name} vs {away_name} | {local_datetime(match.get('utcDate'))}", expanded=False):
-        st.markdown(f"### {home_name} **vs** {away_name}")
+        st.markdown(f"### {home_name}  **vs**  {away_name}")
         st.caption(f"{league_name} | Kickoff {local_datetime(match.get('utcDate'))} | {MODEL_VERSION}")
 
         with st.expander("Manual tactical and motivation inputs", expanded=False):
@@ -733,17 +839,16 @@ def render_fixture_card( match: Dict[str, Any], league_name: str, league_context
             with c4:
                 away_tactical = st.slider("Away tactical adjustment", -2.0, 2.0, 0.0, 0.25, key=f"tac_a_{match_id}")
 
-        season = season_start_year(match.get("utcDate"))
         kickoff_date = (parse_datetime(match.get("utcDate")) or utc_now()).date().isoformat()
         fetch_col, note_col = st.columns([1, 2])
         with fetch_col:
-            fetch_clicked = st.button("Fetch API-Football injuries/lineup", key=f"fetch_team_news_{match_id}", disabled=not bool(api_football_key))
+            fetch_clicked = st.button("Fetch Live Football injuries/lineup", key=f"fetch_team_news_{match_id}", disabled=not bool(lfa_key))
         with note_col:
-            st.caption("Lineups/injuries depend on API coverage; lineups can appear only shortly before kickoff.")
+            st.caption("Lineups/injuries depend on Live Football API plan/coverage; lineups typically appear ~1 hour before kickoff.")
         if fetch_clicked:
             with st.spinner("Looking up fixture, injuries, lineups and available statistics…"):
-                st.session_state[saved_key] = fetch_api_football_team_news(
-                    api_football_key, api_league_id, season, kickoff_date, home_name, away_name
+                st.session_state[saved_key] = fetch_live_football_team_news(
+                    lfa_key, lfa_league, kickoff_date, home_name, away_name
                 )
         bundle = st.session_state.get(saved_key, {})
         summary = summarize_team_news(bundle, home_name, away_name) if bundle else {}
@@ -752,14 +857,14 @@ def render_fixture_card( match: Dict[str, Any], league_name: str, league_context
                 st.warning(err)
             if summary:
                 st.write({
-                    "API-Football fixture ID": summary["fixture_id"],
+                    "Live Football match ID": summary["fixture_id"],
                     f"{home_name} injuries": summary["home_injuries"] or "No reported entries / unavailable",
                     f"{away_name} injuries": summary["away_injuries"] or "No reported entries / unavailable",
                     f"{home_name} lineup confirmed": summary["home_lineup_confirmed"],
                     f"{away_name} lineup confirmed": summary["away_lineup_confirmed"],
                 })
                 if summary.get("statistics_available"):
-                    st.caption(f"Available fixture statistics: {home_name} xG={summary['home_xg']} / shots on target={summary['home_shots_on_target']}; {away_name} xG={summary['away_xg']} / shots on target={summary['away_shots_on_target']}. These in-match stats are not treated as pre-match xG forecasts.")
+                    st.caption(f"Available fixture statistics: {home_name} xG={summary['home_xg']} / shots on target={summary['home_shots_on_target']}; {away_name} xG={summary['away_xg']} / shots on target={summary['away_shots_on_target']}.")
 
         manual_context = {
             "home_motivation": home_motivation, "away_motivation": away_motivation,
@@ -777,7 +882,6 @@ def render_fixture_card( match: Dict[str, Any], league_name: str, league_context
             st.write(f"Recent rest days: home {prediction['home_rest_days'] if prediction['home_rest_days'] is not None else 'unknown'}, away {prediction['away_rest_days'] if prediction['away_rest_days'] is not None else 'unknown'}.")
             st.write(f"Reported injury counts used for small adjustment: home {prediction['home_injury_count']}, away {prediction['away_injury_count']}.")
             st.write(f"League finished-match history used: {league_context.get('finished_count', 0)}; data coverage indicator: {prediction['data_quality'] * 100:.0f}%.")
-            st.caption(f"Dixon-Coles rho={DIXON_COLES_RHO:.2f} is a documented starting value, not a fitted league parameter. Backtest and tune by league/season before operational or betting use.")
 
         if odds_event:
             st.caption(f"Global odds: {odds['bookmakers']} bookmakers | last update: {odds['last_update'] or 'not provided'}")
@@ -798,7 +902,14 @@ def make_league_context(league_name: str, football_key: str, days_back: int) -> 
     return context, errors
 
 
-def render_selected_league( league_name: str, football_key: str, odds_key: str, api_football_key: str, regions: str, days_back: int, ) -> None:
+def render_selected_league(
+    league_name: str,
+    football_key: str,
+    odds_key: str,
+    lfa_key: str,
+    regions: str,
+    days_back: int,
+) -> None:
     cfg = LEAGUES[league_name]
     date_from, date_to, start, end = fixture_window(7)
     fixtures_raw, fixtures_error = fetch_fixtures(cfg["football_data"], football_key, date_from, date_to)
@@ -819,13 +930,18 @@ def render_selected_league( league_name: str, football_key: str, odds_key: str, 
         return
     st.success(f"{len(fixtures)} fixture(s) found.")
     for match in fixtures:
-        render_fixture_card(match, league_name, context, api_football_key, cfg["api_football"], odds_data)
+        render_fixture_card(match, league_name, context, lfa_key, cfg["lfa_league"], odds_data)
 
 
-def render_top10( football_key: str, odds_key: str, api_football_key: str, regions: str, days_back: int, ) -> None:
+def render_top10(
+    football_key: str,
+    odds_key: str,
+    lfa_key: str,
+    regions: str,
+    days_back: int,
+) -> None:
     st.subheader("Daily Best Prediction Matches — Top 10")
-    st.caption("Ranks upcoming fixtures in the next 7 days by the strongest 1X2 model outcome, then by data coverage. This is a ranking, not a confidence guarantee.")
-    st.caption("The first uncached scan may use up to 21 football-data.org calls and up to 7 Odds API calls across the leagues; cached data reduces repeat requests.")
+    st.caption("Ranks upcoming fixtures in the next 7 days by the strongest 1X2 model outcome, then by data coverage.")
     date_from, date_to, start, end = fixture_window(7)
     entries: List[Dict[str, Any]] = []
     errors: List[str] = []
@@ -865,7 +981,7 @@ def render_top10( football_key: str, odds_key: str, api_football_key: str, regio
         odds_data, odds_error, _ = fetch_global_odds(cfg["odds"], odds_key, regions)
         if odds_error:
             st.caption(odds_error)
-        render_fixture_card(row["_fixture"], row["League"], row["_context"], api_football_key, cfg["api_football"], odds_data)
+        render_fixture_card(row["_fixture"], row["League"], row["_context"], lfa_key, cfg["lfa_league"], odds_data)
 
 
 # -----------------------------
@@ -873,13 +989,13 @@ def render_top10( football_key: str, odds_key: str, api_football_key: str, regio
 # -----------------------------
 
 st.title("⚽ Professional Football Prediction Dashboard V8")
-st.markdown("Football-data.org fixtures + The Odds API global prices + API-Football team news | Elo + Dixon–Coles/Poisson")
+st.markdown("Football-data.org fixtures + The Odds API global prices + Live Football API team news | Elo + Dixon–Coles/Poisson")
 
 with st.sidebar:
     st.header("API connection settings")
-    football_key = st.text_input("Football-data.org API token", value=safe_secret("FOOTBALL_DATA_API_KEY"), type="password", help="Used for competition fixtures, recent results and standings.")
-    odds_key = st.text_input("The Odds API key", value=safe_secret("THE_ODDS_API_KEY"), type="password", help="Uses v4 h2h and totals markets; global regions consume more quota.")
-    api_football_key = st.text_input("API-Football v3 key", value=safe_secret("API_FOOTBALL_KEY"), type="password", help="Used on demand for injuries, lineups and fixture statistics.")
+    football_key = st.text_input("Football-data.org API token", value=safe_secret("FOOTBALL_DATA_API_KEY"), type="password")
+    odds_key = st.text_input("The Odds API key", value=safe_secret("THE_ODDS_API_KEY"), type="password")
+    lfa_key = st.text_input("Live Football API key", value=safe_secret("LIVE_FOOTBALL_API_KEY"), type="password", help="Used on demand for injuries, lineups and fixture statistics.")
     regions_choice = st.multiselect("Global odds regions", ["eu", "uk", "us", "au"], default=["eu", "uk"])
     st.caption("Odds quota is typically charged per market × region for each sport request. Cached for 10 minutes.")
     days_back = st.slider("Recent match history used", min_value=60, max_value=300, value=210, step=30)
@@ -889,11 +1005,16 @@ regions = ",".join(regions_choice) if regions_choice else "eu"
 
 if nav == "Selected league":
     selected_league = st.sidebar.selectbox("League", list(LEAGUES.keys()))
-    render_selected_league(selected_league, football_key, odds_key, api_football_key, regions, days_back)
+    render_selected_league(selected_league, football_key, odds_key, lfa_key, regions, days_back)
 elif nav == "Daily Best Top 10":
-    render_top10(football_key, odds_key, api_football_key, regions, days_back)
+    render_top10(football_key, odds_key, lfa_key, regions, days_back)
 else:
     st.subheader("Model layers and provider limitations")
     st.markdown(
-        """ - **Fixtures, recent results and standings:** football-data.org v4. Competition access depends on the provider plan and account. - **Global odds:** The Odds API v4 `h2h` and `totals` markets. Returned odds can vary by region, bookmaker, and fixture availability. - **Injuries, lineups and available match statistics:** API-Football v3. Lineups and statistics are not available for every competition or before every kickoff. - **Elo layer:** ratings are updated chronologically from finished match results, with a modest home-field rating prior. - **Goal model:** venue-specific recent goals-for/goals-against rates are shrunk toward league averages. The output is a goal-rate xG proxy, not shot-based xG unless an API explicitly supplies xG. - **Score probabilities:** Dixon-Coles low-score adjustment is applied to a Poisson score matrix. The rho value is an untrained starting prior and should be tuned by historical backtesting. - **Context adjustments:** short rest and reported injury counts have small capped effects. Motivation and tactical inputs are manual analyst assumptions; they are not objective provider measurements. - **Value Bet Finder:** compares model probabilities with no-vig averages from bookmaker markets and computes expected value at the best returned price. A positive edge is not a guaranteed profit. This dashboard provides model estimates, not guaranteed outcomes or financial advice. Validate the model with out-of-sample results, proper scoring rules, and closing odds before relying on it. """
+        """
+- **Fixtures, recent results and standings:** football-data.org v4.
+- **Global odds:** The Odds API v4 `h2h` and `totals` markets.
+- **Injuries, lineups and statistics:** Live Football API (fetched on demand per match).
+- **Model:** Chronological Elo + venue-specific goal-rate proxy + Dixon–Coles Poisson matrix.
+        """
     )
