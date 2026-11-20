@@ -1197,4 +1197,3 @@ else:
 - **Goal Difference:** Displays probabilities for 2+ and 3+ goal margins for home and away teams alongside expected goal difference.
         """
     )
-
