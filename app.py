@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-"""Professional Football Prediction Dashboard V8.2
+"""Professional Football Prediction Dashboard V8.3
 
 Providers:
 - football-data.org v4: fixtures, recent finished results, standings
 - The Odds API v4: multi-region h2h and totals odds (on-demand per match; auto on Top 10)
-- Live Football API: match injuries, lineups, and available match statistics (on-demand)
+- Live Football API v1: match injuries, lineups, and available match statistics (on-demand)
 
 Model:
 - chronological Elo ratings
@@ -38,11 +38,11 @@ LOCAL_TZ = ZoneInfo("Asia/Yangon")
 FOOTBALL_DATA_BASE = "https://api.football-data.org/v4"
 ODDS_API_BASE = "https://api.the-odds-api.com/v4"
 LIVE_FOOTBALL_API_BASES = [
-    "https://api.live-football-api.com",
-    "https://live-football-api.com/api",
+    "https://live-football-api.com/api/v1",
+    "https://api.live-football-api.com/v1",
 ]
 REQUEST_TIMEOUT = 18
-MODEL_VERSION = "elo-dixon-coles-v8.2"
+MODEL_VERSION = "elo-dixon-coles-v8.3"
 DIXON_COLES_RHO = -0.06
 HOME_ELO_ADVANTAGE = 55.0
 
@@ -352,7 +352,7 @@ def build_value_bets(model: Dict[str, Any], odds: Dict[str, Any]) -> List[Dict[s
 
 
 # -----------------------------
-# Provider 3: Live Football API team news
+# Provider 3: Live Football API v1 team news
 # -----------------------------
 
 
@@ -364,7 +364,7 @@ def live_football_get(
     if not api_key:
         return None, "Live Football API key is not configured."
     query_params = dict(params or {})
-    query_params.setdefault("api_key", api_key)
+    query_params["api_key"] = api_key
     last_error = "No response from Live Football API."
 
     for base in LIVE_FOOTBALL_API_BASES:
@@ -372,11 +372,7 @@ def live_football_get(
             clean_ep = ep.lstrip("/")
             payload, err, _ = http_json(
                 f"{base}/{clean_ep}",
-                headers={
-                    "x-api-key": api_key,
-                    "Authorization": f"Bearer {api_key}",
-                    "Accept": "application/json",
-                },
+                headers={"Accept": "application/json"},
                 params=query_params,
             )
             if not err and payload is not None:
@@ -662,14 +658,11 @@ def calculate_probabilities(matrix: np.ndarray) -> Dict[str, Any]:
     draw = float(sum(matrix[h, a] for h in range(size) for a in range(size) if h == a))
     away_win = float(sum(matrix[h, a] for h in range(size) for a in range(size) if h < a))
 
-    # Goal Difference probabilities (Home goals - Away goals)
     home_gd_2plus = float(sum(matrix[h, a] for h in range(size) for a in range(size) if (h - a) >= 2))
     home_gd_3plus = float(sum(matrix[h, a] for h in range(size) for a in range(size) if (h - a) >= 3))
     away_gd_2plus = float(sum(matrix[h, a] for h in range(size) for a in range(size) if (a - h) >= 2))
     away_gd_3plus = float(sum(matrix[h, a] for h in range(size) for a in range(size) if (a - h) >= 3))
     any_gd_2plus = float(sum(matrix[h, a] for h in range(size) for a in range(size) if abs(h - a) >= 2))
-
-    # Expected Goal Difference from score matrix
     expected_gd = float(sum((h - a) * matrix[h, a] for h in range(size) for a in range(size)))
 
     total_probs = {
@@ -763,7 +756,6 @@ def predict_match(
     home_lambda *= math.exp(clamp(home_delta, -0.14, 0.14))
     away_lambda *= math.exp(clamp(-home_delta * 0.70, -0.12, 0.12))
 
-    # Live Football API injuries + lineup status adjustment
     news = team_news or {}
     home_injuries = len(news.get("home_injuries", []))
     away_injuries = len(news.get("away_injuries", []))
@@ -776,7 +768,6 @@ def predict_match(
     home_lambda *= math.exp(clamp(-0.020 * home_injuries + home_lineup_mod, -0.14, 0.03))
     away_lambda *= math.exp(clamp(-0.020 * away_injuries + away_lineup_mod, -0.14, 0.03))
 
-    # Optional market odds adjustment when Odds API data is fetched for this match
     odds_used = False
     mkt_h2h = (parsed_odds or {}).get("h2h_market_probability") or {}
     mkt_tot = (parsed_odds or {}).get("totals25_market_probability") or {}
@@ -786,7 +777,6 @@ def predict_match(
         mkt_home = clamp(float(mkt_h2h["home"]), 0.03, 0.92)
         mkt_away = clamp(float(mkt_h2h["away"]), 0.03, 0.92)
         ratio = clamp(mkt_home / max(0.03, mkt_away), 0.25, 4.0)
-        # Gentle multiplicative tilt toward market strength ratio
         home_lambda *= math.exp(w * 0.25 * math.log(ratio))
         away_lambda *= math.exp(-w * 0.25 * math.log(ratio))
         if "over" in mkt_tot and "under" in mkt_tot:
@@ -802,7 +792,6 @@ def predict_match(
     best_score = tuple(int(x) for x in np.unravel_index(flat_index, matrix.shape))
     probs = calculate_probabilities(matrix)
 
-    # Blend 1X2 probabilities with no-vig market probabilities when odds are fetched
     blended_1x2 = {
         "home_win": probs["home_win"],
         "draw": probs["draw"],
@@ -908,7 +897,6 @@ def render_fixture_card(
         st.markdown(f"### {home_name}  **vs**  {away_name}")
         st.caption(f"{league_name} | Kickoff {local_datetime(match.get('utcDate'))} | {MODEL_VERSION}")
 
-        # On-demand buttons (no auto Odds call unless preloaded by Top 10)
         b1, b2 = st.columns(2)
         with b1:
             fetch_odds_clicked = st.button(
@@ -939,7 +927,6 @@ def render_fixture_card(
                     lfa_key, lfa_league, kickoff_date, home_name, away_name
                 )
 
-        # Determine active odds events (from Top 10 preload or manual Fetch Odds button)
         odds_bundle = st.session_state.get(odds_state_key)
         if odds_bundle is not None:
             odds_events = odds_bundle.get("events", [])
@@ -956,7 +943,6 @@ def render_fixture_card(
         odds_event = match_odds_event(home_name, away_name, odds_events)
         odds = parse_global_odds(odds_event, home_name, away_name)
 
-        # Determine active Live Football team news
         lfa_bundle = st.session_state.get(lfa_state_key, {})
         summary = summarize_team_news(lfa_bundle, home_name, away_name) if lfa_bundle else {}
         if lfa_bundle:
@@ -1013,33 +999,14 @@ def render_fixture_card(
             f"Home {b1x2['home_win']*100:.1f}% | Draw {b1x2['draw']*100:.1f}% | Away {b1x2['away_win']*100:.1f}% | Over 2.5: {probs['over25']*100:.1f}%"
         )
 
-        # Goal Difference (ဂိုးပြတ်နိုင်ခြေ) section
         st.markdown("#### Goal Difference (ဂိုးပြတ်နိုင်ခြေ)")
         gd_df = pd.DataFrame([
-            {
-                "Goal Diff Market": "Home win by 2+ goals (GD >= +2)",
-                "Probability": f"{probs['home_gd_2plus']*100:.1f}%",
-            },
-            {
-                "Goal Diff Market": "Home win by 3+ goals (GD >= +3)",
-                "Probability": f"{probs['home_gd_3plus']*100:.1f}%",
-            },
-            {
-                "Goal Diff Market": "Away win by 2+ goals (GD <= -2)",
-                "Probability": f"{probs['away_gd_2plus']*100:.1f}%",
-            },
-            {
-                "Goal Diff Market": "Away win by 3+ goals (GD <= -3)",
-                "Probability": f"{probs['away_gd_3plus']*100:.1f}%",
-            },
-            {
-                "Goal Diff Market": "Any 2+ goal margin (|GD| >= 2)",
-                "Probability": f"{probs['any_gd_2plus']*100:.1f}%",
-            },
-            {
-                "Goal Diff Market": "Expected Goal Difference (Home - Away)",
-                "Probability": f"{probs['expected_gd']:+.2f} goals",
-            },
+            {"Goal Diff Market": "Home win by 2+ goals (GD >= +2)", "Probability": f"{probs['home_gd_2plus']*100:.1f}%"},
+            {"Goal Diff Market": "Home win by 3+ goals (GD >= +3)", "Probability": f"{probs['home_gd_3plus']*100:.1f}%"},
+            {"Goal Diff Market": "Away win by 2+ goals (GD <= -2)", "Probability": f"{probs['away_gd_2plus']*100:.1f}%"},
+            {"Goal Diff Market": "Away win by 3+ goals (GD <= -3)", "Probability": f"{probs['away_gd_3plus']*100:.1f}%"},
+            {"Goal Diff Market": "Any 2+ goal margin (|GD| >= 2)", "Probability": f"{probs['any_gd_2plus']*100:.1f}%"},
+            {"Goal Diff Market": "Expected Goal Difference (Home - Away)", "Probability": f"{probs['expected_gd']:+.2f} goals"},
         ])
         st.dataframe(gd_df, hide_index=True, use_container_width=True)
 
@@ -1057,7 +1024,6 @@ def render_fixture_card(
             st.info("No matching global odds were returned for this fixture.")
         return prediction
 
-    # Fallback return when expander is closed
     cached_odds = st.session_state.get(odds_state_key, {})
     cached_lfa = st.session_state.get(lfa_state_key, {})
     ev_list = cached_odds.get("events", preloaded_odds_events or [])
@@ -1165,7 +1131,6 @@ def render_top10(
         st.info("No upcoming fixtures were returned. Check provider keys, plan access, or fixture availability.")
         return
 
-    # Auto-fetch Odds API for leagues in Top 10
     odds_by_league: Dict[str, List[Dict[str, Any]]] = {}
     if odds_key:
         for lg_name, cfg in active_leagues.items():
