@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Professional Football Prediction Dashboard V8.4
+"""Professional Football Prediction Dashboard V8.5
 
 Providers:
 - football-data.org v4: fixtures, recent finished results, standings
@@ -9,8 +9,8 @@ Providers:
 
 Model:
 - chronological Elo ratings
-- league-relative venue-specific attack/defence goal-rate xG proxy
-- Dixon-Coles-adjusted Poisson score matrix + Goal Difference probabilities
+- league-relative venue-specific attack/defence goal-rate xG proxy (attacking power = 0.75)
+- Dixon-Coles-adjusted Poisson score matrix + Top 2 & Top 3 exact scores + Goal Difference probabilities
 - short-rest, injuries, lineup status, manual tactical/motivation, and optional odds blend
 """
 
@@ -27,7 +27,7 @@ import requests
 import streamlit as st
 
 st.set_page_config(
-    page_title="Football Prediction Dashboard V8",
+    page_title="Football Prediction Dashboard V8.5",
     page_icon="⚽",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -42,11 +42,12 @@ LIVE_FOOTBALL_API_BASES = [
     "https://api.live-football-api.com/v1",
 ]
 REQUEST_TIMEOUT = 18
-MODEL_VERSION = "elo-dixon-coles-v8.4"
-DIXON_COLES_RHO = -0.06
+MODEL_VERSION = "elo-dixon-coles-v8.5"
+DIXON_COLES_RHO = -0.04
 HOME_ELO_ADVANTAGE = 55.0
+DEFAULT_ATTACK_POWER = 0.75
 
-# Canonical team aliases to bridge naming differences across football-data.org, The Odds API, and Live Football API
+# Canonical team aliases to bridge naming differences across providers
 TEAM_ALIASES: Dict[str, str] = {
     "1fckoln": "koln",
     "fckoln": "koln",
@@ -349,7 +350,6 @@ def fetch_global_odds(sport_key: str, api_key: str, regions: str) -> Tuple[List[
         headers={"x-api-key": api_key},
         params=base_params,
     )
-    # Fallback to official apiKey query param if header auth is rejected
     if error and ("401" in error or "403" in error or "invalid" in error.lower()):
         query_params = dict(base_params)
         query_params["apiKey"] = api_key
@@ -828,6 +828,7 @@ def predict_match(
     team_news: Optional[Dict[str, Any]] = None,
     parsed_odds: Optional[Dict[str, Any]] = None,
     odds_weight: float = 0.25,
+    attack_power: float = DEFAULT_ATTACK_POWER,
 ) -> Dict[str, Any]:
     home_name = match.get("homeTeam", {}).get("name", "Home")
     away_name = match.get("awayTeam", {}).get("name", "Away")
@@ -841,11 +842,14 @@ def predict_match(
     home_conceded = _venue_rate(home.get("home_games", []), "ga", base_away)
     away_attack = _venue_rate(away.get("away_games", []), "gf", base_away)
     away_conceded = _venue_rate(away.get("away_games", []), "ga", base_home)
-    home_lambda = base_home * math.sqrt((home_attack / base_home) * (away_conceded / base_home))
-    away_lambda = base_away * math.sqrt((away_attack / base_away) * (home_conceded / base_away))
+
+    # Apply configurable attacking power (default 0.75) so attacking strength differences stand out more clearly
+    pwr = clamp(float(attack_power), 0.40, 1.10)
+    home_lambda = base_home * (((home_attack / base_home) ** pwr) * ((away_conceded / base_home) ** pwr)) ** 0.5
+    away_lambda = base_away * (((away_attack / base_away) ** pwr) * ((home_conceded / base_away) ** pwr)) ** 0.5
 
     elo_difference = float(home.get("elo", 1500.0)) - float(away.get("elo", 1500.0))
-    elo_shift = clamp(elo_difference / 2200.0, -0.22, 0.22)
+    elo_shift = clamp(elo_difference / 1800.0, -0.28, 0.28)
     home_lambda *= math.exp(elo_shift)
     away_lambda *= math.exp(-elo_shift * 0.80)
 
@@ -887,19 +891,27 @@ def predict_match(
         mkt_home = clamp(float(mkt_h2h["home"]), 0.03, 0.92)
         mkt_away = clamp(float(mkt_h2h["away"]), 0.03, 0.92)
         ratio = clamp(mkt_home / max(0.03, mkt_away), 0.25, 4.0)
-        home_lambda *= math.exp(w * 0.25 * math.log(ratio))
-        away_lambda *= math.exp(-w * 0.25 * math.log(ratio))
+        home_lambda *= math.exp(w * 0.28 * math.log(ratio))
+        away_lambda *= math.exp(-w * 0.28 * math.log(ratio))
         if "over" in mkt_tot and "under" in mkt_tot:
-            total_tilt = clamp((float(mkt_tot["over"]) - 0.50) * 0.35 * w, -0.08, 0.08)
+            total_tilt = clamp((float(mkt_tot["over"]) - 0.50) * 0.40 * w, -0.10, 0.10)
             home_lambda *= math.exp(total_tilt)
             away_lambda *= math.exp(total_tilt)
 
-    home_lambda = clamp(home_lambda, 0.20, 4.50)
-    away_lambda = clamp(away_lambda, 0.15, 4.20)
+    home_lambda = clamp(home_lambda, 0.20, 4.80)
+    away_lambda = clamp(away_lambda, 0.15, 4.50)
 
     matrix = dixon_coles_matrix(home_lambda, away_lambda)
-    flat_index = int(np.argmax(matrix))
-    best_score = tuple(int(x) for x in np.unravel_index(flat_index, matrix.shape))
+
+    # Top 3 most likely exact scores ranked by probability
+    flat_indices = np.argsort(matrix.ravel())[::-1][:3]
+    top_scores: List[Tuple[Tuple[int, int], float]] = [
+        (tuple(int(x) for x in np.unravel_index(int(idx), matrix.shape)), float(matrix.ravel()[int(idx)]))
+        for idx in flat_indices
+    ]
+    best_score, best_score_prob = top_scores[0]
+    second_score, second_score_prob = top_scores[1]
+
     probs = calculate_probabilities(matrix)
 
     blended_1x2 = {
@@ -935,11 +947,15 @@ def predict_match(
         "away_lambda": away_lambda,
         "expected_total_goals": home_lambda + away_lambda,
         "best_score": best_score,
-        "best_score_probability": float(matrix[best_score]),
+        "best_score_probability": best_score_prob,
+        "second_score": second_score,
+        "second_score_probability": second_score_prob,
+        "top_scores": top_scores,
         "matrix": matrix,
         "probabilities": probs,
         "blended_1x2": blended_1x2,
         "odds_used": odds_used,
+        "attack_power": pwr,
         "home_elo": float(home.get("elo", 1500.0)),
         "away_elo": float(away.get("elo", 1500.0)),
         "elo_difference": elo_difference,
@@ -953,7 +969,7 @@ def predict_match(
         "away_lineup_confirmed": away_lineup_ok,
         "top_outcome_probability": top_outcome,
         "data_quality": quality,
-        "xg_source": "league-relative goals-for/against proxy + context/odds adjustments",
+        "xg_source": f"league-relative goals-for/against proxy (attack power {pwr:.2f}) + context/odds",
         "model_version": MODEL_VERSION,
     }
 
@@ -993,6 +1009,7 @@ def render_fixture_card(
     odds_sport_key: str,
     regions: str,
     odds_weight: float,
+    attack_power: float,
     lfa_key: str,
     lfa_league: str,
     preloaded_odds_events: Optional[List[Dict[str, Any]]] = None,
@@ -1097,13 +1114,35 @@ def render_fixture_card(
             team_news=summary,
             parsed_odds=odds if odds_event else None,
             odds_weight=odds_weight,
+            attack_power=attack_power,
         )
         probs = prediction["probabilities"]
         b1x2 = prediction["blended_1x2"]
+        top_scores = prediction["top_scores"]
 
-        st.markdown("#### Dashboard prediction")
-        home_goals, away_goals = prediction["best_score"]
-        st.markdown(f"## **{home_goals} – {away_goals}**")
+        st.markdown("#### Dashboard prediction — Top 2 Most Likely Scores")
+        sc1, sc2 = st.columns(2)
+        with sc1:
+            s1_h, s1_a = top_scores[0][0]
+            st.metric(
+                label="#1 Most Likely Score",
+                value=f"{s1_h} – {s1_a}",
+                delta=f"{top_scores[0][1] * 100:.1f}% probability",
+            )
+        with sc2:
+            s2_h, s2_a = top_scores[1][0]
+            st.metric(
+                label="#2 Most Likely Score",
+                value=f"{s2_h} – {s2_a}",
+                delta=f"{top_scores[1][1] * 100:.1f}% probability",
+            )
+
+        top3_line = "  |  ".join(
+            f"**#{idx} {h}–{a}** ({p * 100:.1f}%)"
+            for idx, ((h, a), p) in enumerate(top_scores, 1)
+        )
+        st.markdown(f"**Top 3 Exact Scores:** {top3_line}")
+
         st.caption(
             f"1X2 ({'Odds+Model blended' if prediction['odds_used'] else 'Model'}): "
             f"Home {b1x2['home_win']*100:.1f}% | Draw {b1x2['draw']*100:.1f}% | Away {b1x2['away_win']*100:.1f}% | Over 2.5: {probs['over25']*100:.1f}%"
@@ -1121,7 +1160,7 @@ def render_fixture_card(
         st.dataframe(gd_df, hide_index=True, use_container_width=True)
 
         with st.expander("Model components and data quality", expanded=False):
-            st.write(f"Expected goals: home {prediction['home_lambda']:.2f}, away {prediction['away_lambda']:.2f} (Total {prediction['expected_total_goals']:.2f})")
+            st.write(f"Expected goals: home {prediction['home_lambda']:.2f}, away {prediction['away_lambda']:.2f} (Total {prediction['expected_total_goals']:.2f}) | Attacking power: {prediction['attack_power']:.2f}")
             st.write(f"Elo: home {prediction['home_elo']:.0f}, away {prediction['away_elo']:.0f}; gap {prediction['elo_difference']:+.0f}.")
             st.write(f"Recent rest days: home {prediction['home_rest_days'] if prediction['home_rest_days'] is not None else 'unknown'}, away {prediction['away_rest_days'] if prediction['away_rest_days'] is not None else 'unknown'}.")
             st.write(f"Injuries: home {prediction['home_injury_count']}, away {prediction['away_injury_count']} | Lineup confirmed: home={prediction['home_lineup_confirmed']}, away={prediction['away_lineup_confirmed']}.")
@@ -1146,6 +1185,7 @@ def render_fixture_card(
         team_news=lfa_sum,
         parsed_odds=parsed_ev if ev_match else None,
         odds_weight=odds_weight,
+        attack_power=attack_power,
     )
 
 
@@ -1166,6 +1206,7 @@ def render_selected_league(
     lfa_key: str,
     regions: str,
     odds_weight: float,
+    attack_power: float,
     days_back: int,
 ) -> None:
     cfg = LEAGUES[league_name]
@@ -1192,6 +1233,7 @@ def render_selected_league(
             cfg["odds"],
             regions,
             odds_weight,
+            attack_power,
             lfa_key,
             cfg["lfa_league"],
             preloaded_odds_events=None,
@@ -1204,6 +1246,7 @@ def render_top10(
     lfa_key: str,
     regions: str,
     odds_weight: float,
+    attack_power: float,
     days_back: int,
 ) -> None:
     st.subheader("Daily Best Prediction Matches — Top 10 (Auto Odds Fetch)")
@@ -1224,12 +1267,15 @@ def render_top10(
         context, context_errors = make_league_context(league_name, football_key, days_back)
         errors.extend(f"{league_name}: {err}" for err in context_errors)
         for match in fixtures:
-            prediction = predict_match(match, context)
+            prediction = predict_match(match, context, attack_power=attack_power)
+            top_s = prediction["top_scores"]
             entries.append({
                 "Match": f"{match.get('homeTeam', {}).get('name')} vs {match.get('awayTeam', {}).get('name')}",
                 "League": league_name,
                 "Kickoff (MMT)": local_datetime(match.get("utcDate")),
-                "Prediction": f"{prediction['best_score'][0]}–{prediction['best_score'][1]}",
+                "#1 Score": f"{top_s[0][0][0]}–{top_s[0][0][1]} ({top_s[0][1]*100:.1f}%)",
+                "#2 Score": f"{top_s[1][0][0]}–{top_s[1][0][1]} ({top_s[1][1]*100:.1f}%)",
+                "#3 Score": f"{top_s[2][0][0]}–{top_s[2][0][1]} ({top_s[2][1]*100:.1f}%)",
                 "_rank": prediction["top_outcome_probability"] * (0.75 + 0.25 * prediction["data_quality"]),
                 "_fixture": match,
                 "_context": context,
@@ -1267,6 +1313,7 @@ def render_top10(
             cfg["odds"],
             regions,
             odds_weight,
+            attack_power,
             lfa_key,
             cfg["lfa_league"],
             preloaded_odds_events=odds_by_league.get(row["League"], []),
@@ -1277,8 +1324,8 @@ def render_top10(
 # Main application
 # -----------------------------
 
-st.title("⚽ Professional Football Prediction Dashboard V8")
-st.markdown("On-demand Odds & Live Football API (Auto Odds on Top 10) + Goal Difference + Elo / Dixon–Coles")
+st.title("⚽ Professional Football Prediction Dashboard V8.5")
+st.markdown("Attacking Power 0.75 + Top 2 & Top 3 Exact Scores + On-demand Odds & Live Football API + Goal Difference")
 
 with st.sidebar:
     st.header("API connection settings")
@@ -1287,6 +1334,7 @@ with st.sidebar:
     lfa_key = st.text_input("Live Football API key", value=safe_secret("LIVE_FOOTBALL_API_KEY"), type="password")
     regions_choice = st.multiselect("Global odds regions", ["eu", "uk", "us", "au"], default=["eu"])
     odds_weight = st.slider("Odds weight in prediction", min_value=0.0, max_value=0.50, value=0.25, step=0.05)
+    attack_power = st.slider("Attacking power weight", min_value=0.50, max_value=1.00, value=DEFAULT_ATTACK_POWER, step=0.05)
     days_back = st.slider("Recent match history used", min_value=60, max_value=300, value=210, step=30)
     nav = st.radio("Navigation", ["Selected league", "Daily Best Top 10", "About the model"])
 
@@ -1294,16 +1342,16 @@ regions = ",".join(regions_choice) if regions_choice else "eu"
 
 if nav == "Selected league":
     selected_league = st.sidebar.selectbox("League", list(LEAGUES.keys()))
-    render_selected_league(selected_league, football_key, odds_key, lfa_key, regions, odds_weight, days_back)
+    render_selected_league(selected_league, football_key, odds_key, lfa_key, regions, odds_weight, attack_power, days_back)
 elif nav == "Daily Best Top 10":
-    render_top10(football_key, odds_key, lfa_key, regions, odds_weight, days_back)
+    render_top10(football_key, odds_key, lfa_key, regions, odds_weight, attack_power, days_back)
 else:
     st.subheader("Model layers and provider limitations")
     st.markdown(
         """
-- **On-demand buttons:** Odds API and Live Football API buttons fetch data only when clicked in Selected League mode.
-- **Daily Best Top 10:** Automatically fetches Odds API for active leagues in the upcoming window.
-- **Prediction integration:** Fetched no-vig odds, injury counts, and lineup confirmation status are incorporated into match probabilities and goal rates.
+- **Attacking power (0.75 default):** Amplifies venue-specific goal-rate differentials compared to standard square-root damping so high-scoring or dominant matchups separate more clearly.
+- **Top 2 & Top 3 Exact Scores:** Shows the #1 and #2 most likely exact scores with probabilities alongside the full Top 3 score breakdown.
+- **On-demand buttons:** Odds API and Live Football API buttons fetch data only when clicked in Selected League mode; Daily Best Top 10 auto-fetches Odds API.
 - **Goal Difference:** Displays probabilities for 2+ and 3+ goal margins for home and away teams alongside expected goal difference.
         """
     )
