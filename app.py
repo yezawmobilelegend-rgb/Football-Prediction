@@ -46,8 +46,8 @@ MODEL_VERSION = "elo-dixon-coles-v8.5"
 DIXON_COLES_RHO = -0.04
 HOME_ELO_ADVANTAGE = 55.0
 DEFAULT_ATTACK_POWER = 0.75
+MAX_GOALS = 8
 
-# Canonical team aliases to bridge naming differences across providers
 TEAM_ALIASES: Dict[str, str] = {
     "1fckoln": "koln",
     "fckoln": "koln",
@@ -148,6 +148,7 @@ LEAGUES: Dict[str, Dict[str, Any]] = {
     "UEFA Champions League": {"football_data": "CL", "odds": "soccer_uefa_champs_league", "lfa_league": "champions-league"},
     "UEFA Europa League": {"football_data": "EL", "odds": "soccer_uefa_europa_league", "lfa_league": "europa-league"},
 }
+
 
 # -----------------------------
 # Generic helpers
@@ -386,9 +387,12 @@ def _outcome_side(name: str, home: str, away: str) -> Optional[str]:
 
 def parse_global_odds(event: Optional[Dict[str, Any]], home: str, away: str) -> Dict[str, Any]:
     result: Dict[str, Any] = {
-        "h2h_best": {}, "h2h_market_probability": {},
-        "totals25_best": {}, "totals25_market_probability": {},
-        "bookmakers": 0, "last_update": None,
+        "h2h_best": {},
+        "h2h_market_probability": {},
+        "totals25_best": {},
+        "totals25_market_probability": {},
+        "bookmakers": 0,
+        "last_update": None,
     }
     if not event:
         return result
@@ -441,21 +445,22 @@ def build_value_bets(model: Dict[str, Any], odds: Dict[str, Any]) -> List[Dict[s
     p = model["probabilities"]
     rows: List[Dict[str, Any]] = []
     candidates = [
-        ("Home win", p["home_win"], odds["h2h_best"].get("home"), odds["h2h_market_probability"].get("home")),
-        ("Draw", p["draw"], odds["h2h_best"].get("draw"), odds["h2h_market_probability"].get("draw")),
-        ("Away win", p["away_win"], odds["h2h_best"].get("away"), odds["h2h_market_probability"].get("away")),
-        ("Over 2.5 goals", p["over25"], odds["totals25_best"].get("over"), odds["totals25_market_probability"].get("over")),
-        ("Under 2.5 goals", p["under25"], odds["totals25_best"].get("under"), odds["totals25_market_probability"].get("under")),
+        ("Home win", "home", p["home_win"], odds["h2h_best"].get("home"), odds["h2h_market_probability"].get("home")),
+        ("Draw", "draw", p["draw"], odds["h2h_best"].get("draw"), odds["h2h_market_probability"].get("draw")),
+        ("Away win", "away", p["away_win"], odds["h2h_best"].get("away"), odds["h2h_market_probability"].get("away")),
+        ("Over 2.5 goals", "over25", p["over25"], odds["totals25_best"].get("over"), odds["totals25_market_probability"].get("over")),
+        ("Under 2.5 goals", "under25", p["under25"], odds["totals25_best"].get("under"), odds["totals25_market_probability"].get("under")),
     ]
-    for label, model_probability, best_odds, market_probability in candidates:
+    for label, key, model_probability, best_odds, market_probability in candidates:
         if best_odds is None or best_odds <= 1:
             continue
         rows.append({
             "Market": label,
+            "key": key,
             "Best odds": best_odds,
             "Model probability": model_probability,
             "No-vig market probability": market_probability,
-            "Edge": model_probability - market_probability if market_probability is not None else None,
+            "Edge": (model_probability - market_probability) if market_probability is not None else None,
             "Expected value": model_probability * best_odds - 1.0,
         })
     return rows
@@ -539,819 +544,744 @@ def fetch_live_football_team_news(
     fixtures_payload, fixture_err = live_football_get(
         api_key,
         endpoints=("fixtures", "matches", "events"),
-        params={"date": kickoff_date, "league": league_slug},
+        params={"league": league_slug, "date": kickoff_date},
     )
     if fixture_err:
-        result["errors"].append(f"Fixture lookup: {fixture_err}")
-        return result
+        result["errors"].append(f"Fixtures lookup: {fixture_err}")
 
-    candidates = _extract_items(fixtures_payload, ("fixtures", "matches", "response", "events"))
-    matched: Optional[Dict[str, Any]] = None
-    for item in candidates:
-        h_cand = (
+    matched_fixture: Dict[str, Any] = {}
+    for item in _extract_items(fixtures_payload, ("fixtures", "matches", "events", "results")):
+        f_home = (
             item.get("home_team")
-            or item.get("homeTeam")
-            or (item.get("teams", {}).get("home", {}).get("name") if isinstance(item.get("teams"), dict) else None)
             or item.get("home")
+            or (item.get("teams", {}).get("home", {}).get("name") if isinstance(item.get("teams"), dict) else None)
         )
-        a_cand = (
+        f_away = (
             item.get("away_team")
-            or item.get("awayTeam")
-            or (item.get("teams", {}).get("away", {}).get("name") if isinstance(item.get("teams"), dict) else None)
             or item.get("away")
+            or (item.get("teams", {}).get("away", {}).get("name") if isinstance(item.get("teams"), dict) else None)
         )
-        if isinstance(h_cand, dict):
-            h_cand = h_cand.get("name")
-        if isinstance(a_cand, dict):
-            a_cand = a_cand.get("name")
-        if same_team(home_name, h_cand) and same_team(away_name, a_cand):
-            matched = item
+        if same_team(home_name, f_home) and same_team(away_name, f_away):
+            matched_fixture = item
             break
 
-    if not matched:
-        result["errors"].append("Matching fixture not found in Live Football API for this date.")
-        return result
-
-    result["fixture"] = matched
-    match_id = matched.get("id") or matched.get("match_id") or matched.get("fixture_id")
+    result["fixture"] = matched_fixture
+    match_id = (
+        matched_fixture.get("id")
+        or matched_fixture.get("match_id")
+        or matched_fixture.get("fixture_id")
+    )
     result["match_id"] = match_id
 
-    lookup_params: Dict[str, Any] = {"date": kickoff_date, "league": league_slug}
-    if match_id:
-        lookup_params["match_id"] = match_id
-        lookup_params["fixture_id"] = match_id
-        lookup_params["id"] = match_id
+    detail_params: Dict[str, Any] = {"league": league_slug, "date": kickoff_date}
+    if match_id is not None:
+        detail_params["match_id"] = match_id
+        detail_params["id"] = match_id
 
-    inj_payload, inj_err = live_football_get(api_key, ("injuries", "match/injuries", "fixture/injuries"), lookup_params)
+    inj_payload, inj_err = live_football_get(
+        api_key,
+        endpoints=("injuries", "match/injuries", "fixture/injuries"),
+        params=detail_params,
+    )
     if inj_err:
-        result["errors"].append(f"injuries: {inj_err}")
+        result["errors"].append(f"Injuries: {inj_err}")
     else:
-        result["injuries"] = _extract_items(inj_payload, ("injuries", "response", "missing"))
+        result["injuries"] = _extract_items(inj_payload, ("injuries", "sidelined", "absences"))
 
-    lineup_payload, lineup_err = live_football_get(api_key, ("lineups", "match/lineups", "fixture/lineups"), lookup_params)
+    lineup_payload, lineup_err = live_football_get(
+        api_key,
+        endpoints=("lineups", "match/lineups", "fixture/lineups"),
+        params=detail_params,
+    )
     if lineup_err:
-        result["errors"].append(f"lineups: {lineup_err}")
+        result["errors"].append(f"Lineups: {lineup_err}")
     else:
-        result["lineups"] = _extract_items(lineup_payload, ("lineups", "response", "teams"))
+        result["lineups"] = _extract_items(lineup_payload, ("lineups", "lineup", "starting_xi"))
 
-    stats_payload, stats_err = live_football_get(api_key, ("statistics", "match/statistics", "fixture/statistics"), lookup_params)
-    if not stats_err and stats_payload:
-        result["statistics"] = _extract_items(stats_payload, ("statistics", "response", "stats"))
+    stats_payload, stats_err = live_football_get(
+        api_key,
+        endpoints=("statistics", "stats", "match/statistics", "fixture/statistics"),
+        params=detail_params,
+    )
+    if stats_err:
+        result["errors"].append(f"Statistics: {stats_err}")
+    else:
+        result["statistics"] = _extract_items(stats_payload, ("statistics", "stats"))
 
     return result
 
 
-def summarize_team_news(bundle: Dict[str, Any], home_name: str, away_name: str) -> Dict[str, Any]:
-    summary: Dict[str, Any] = {
-        "fixture_id": bundle.get("match_id"),
-        "home_injuries": [],
-        "away_injuries": [],
-        "home_lineup_confirmed": False,
-        "away_lineup_confirmed": False,
-        "home_starters": None,
-        "away_starters": None,
-        "statistics_available": False,
-        "home_xg": None,
-        "away_xg": None,
-        "home_shots_on_target": None,
-        "away_shots_on_target": None,
+def summarize_team_news(team_news: Dict[str, Any], home_name: str, away_name: str) -> Dict[str, Any]:
+    home_injuries: List[str] = []
+    away_injuries: List[str] = []
+    other_injuries: List[str] = []
+
+    for row in team_news.get("injuries", []):
+        player = (
+            row.get("player_name")
+            or row.get("player")
+            or (row.get("player", {}).get("name") if isinstance(row.get("player"), dict) else None)
+            or "Unknown Player"
+        )
+        reason = row.get("reason") or row.get("type") or row.get("status") or "Injured/Out"
+        t_name = (
+            row.get("team_name")
+            or row.get("team")
+            or (row.get("team", {}).get("name") if isinstance(row.get("team"), dict) else "")
+        )
+        label = f"{player} ({reason})"
+        if same_team(t_name, home_name):
+            home_injuries.append(label)
+        elif same_team(t_name, away_name):
+            away_injuries.append(label)
+        else:
+            other_injuries.append(f"{t_name}: {label}".strip(": "))
+
+    home_lineup: List[str] = []
+    away_lineup: List[str] = []
+    home_formation: Optional[str] = None
+    away_formation: Optional[str] = None
+
+    for row in team_news.get("lineups", []):
+        t_name = (
+            row.get("team_name")
+            or row.get("team")
+            or (row.get("team", {}).get("name") if isinstance(row.get("team"), dict) else "")
+        )
+        formation = row.get("formation") or row.get("system")
+        players_raw = row.get("startXI") or row.get("starting_xi") or row.get("players") or row.get("lineup") or []
+        names: List[str] = []
+        if isinstance(players_raw, list):
+            for p in players_raw:
+                if isinstance(p, dict):
+                    p_obj = p.get("player") if isinstance(p.get("player"), dict) else p
+                    p_name = p_obj.get("name") or p_obj.get("player_name")
+                    if p_name:
+                        names.append(str(p_name))
+                elif isinstance(p, str) and p.strip():
+                    names.append(p.strip())
+        elif isinstance(players_raw, str) and players_raw.strip():
+            names = [x.strip() for x in players_raw.split(",") if x.strip()]
+
+        if same_team(t_name, home_name):
+            home_formation = formation or home_formation
+            home_lineup.extend(names)
+        elif same_team(t_name, away_name):
+            away_formation = formation or away_formation
+            away_lineup.extend(names)
+
+    has_data = bool(
+        home_injuries or away_injuries or other_injuries or home_lineup or away_lineup or team_news.get("fixture")
+    )
+    return {
+        "has_data": has_data,
+        "home_injuries": home_injuries,
+        "away_injuries": away_injuries,
+        "other_injuries": other_injuries,
+        "home_lineup": home_lineup,
+        "away_lineup": away_lineup,
+        "home_formation": home_formation,
+        "away_formation": away_formation,
     }
 
-    for item in bundle.get("injuries", []):
-        player = item.get("player_name") or (item.get("player", {}).get("name") if isinstance(item.get("player"), dict) else None) or item.get("name") or "Unknown player"
-        reason = item.get("reason") or item.get("status") or item.get("type") or "Unavailable"
-        team_label = item.get("team_name") or item.get("team") or (item.get("team", {}).get("name") if isinstance(item.get("team"), dict) else "")
-        side = str(item.get("side") or item.get("team_side") or "").lower()
-        entry = f"{player} ({reason})"
-        if side in {"home", "h"} or same_team(team_label, home_name):
-            summary["home_injuries"].append(entry)
-        elif side in {"away", "a"} or same_team(team_label, away_name):
-            summary["away_injuries"].append(entry)
-
-    for lineup in bundle.get("lineups", []):
-        team_label = lineup.get("team_name") or lineup.get("team") or (lineup.get("team", {}).get("name") if isinstance(lineup.get("team"), dict) else "")
-        side = str(lineup.get("side") or lineup.get("team_side") or "").lower()
-        starters = lineup.get("startXI") or lineup.get("starting_xi") or lineup.get("starters") or lineup.get("lineup") or []
-        count = len(starters) if isinstance(starters, list) and starters else None
-        if side in {"home", "h"} or same_team(team_label, home_name):
-            summary["home_lineup_confirmed"] = bool(count)
-            summary["home_starters"] = count
-        elif side in {"away", "a"} or same_team(team_label, away_name):
-            summary["away_lineup_confirmed"] = bool(count)
-            summary["away_starters"] = count
-
-    for stat in bundle.get("statistics", []):
-        key = re.sub(r"[^a-z]", "", str(stat.get("type") or stat.get("name") or "").lower())
-        if key in {"expectedgoals", "xg"}:
-            summary["home_xg"] = safe_float(stat.get("home"))
-            summary["away_xg"] = safe_float(stat.get("away"))
-            summary["statistics_available"] = True
-        elif key in {"shotsongoal", "shotsontarget"}:
-            summary["home_shots_on_target"] = safe_float(stat.get("home"))
-            summary["away_shots_on_target"] = safe_float(stat.get("away"))
-            summary["statistics_available"] = True
-
-    return summary
-
 
 # -----------------------------
-# Rating and goal probability model
+# Model: Elo + Venue xG + Dixon-Coles
 # -----------------------------
 
 
-def valid_finished_score(match: Dict[str, Any]) -> Optional[Tuple[int, int]]:
-    score = match.get("score", {}).get("fullTime", {})
-    home_goals, away_goals = safe_float(score.get("home")), safe_float(score.get("away"))
-    if home_goals is None or away_goals is None:
-        return None
-    return int(home_goals), int(away_goals)
+def _dixon_coles_tau(x: int, y: int, lam_x: float, lam_y: float, rho: float) -> float:
+    if x == 0 and y == 0:
+        return max(0.05, 1.0 - lam_x * lam_y * rho)
+    if x == 0 and y == 1:
+        return max(0.05, 1.0 + lam_x * rho)
+    if x == 1 and y == 0:
+        return max(0.05, 1.0 + lam_y * rho)
+    if x == 1 and y == 1:
+        return max(0.05, 1.0 - rho)
+    return 1.0
 
 
-def build_team_context(
+def build_ratings_and_xg_stats(
     finished_matches: List[Dict[str, Any]],
-    standings: Dict[str, Dict[str, Any]],
+    attack_power: float = DEFAULT_ATTACK_POWER,
 ) -> Dict[str, Any]:
-    matches = []
-    for match in finished_matches:
-        score = valid_finished_score(match)
-        home = match.get("homeTeam", {}).get("name")
-        away = match.get("awayTeam", {}).get("name")
-        dt = parse_datetime(match.get("utcDate"))
-        if score and home and away and dt:
-            matches.append((dt, match, home, away, score[0], score[1]))
-    matches.sort(key=lambda row: row[0])
-
-    team_history: Dict[str, List[Dict[str, Any]]] = {}
-    team_names: Dict[str, str] = {}
     elo: Dict[str, float] = {}
-    sum_home = sum_away = 0.0
-    league_count = 0
+    last_played: Dict[str, datetime] = {}
 
-    for dt, match, home_name, away_name, hg, ag in matches:
-        hk, ak = normalize_team(home_name), normalize_team(away_name)
-        team_names[hk], team_names[ak] = home_name, away_name
-        home_elo, away_elo = elo.get(hk, 1500.0), elo.get(ak, 1500.0)
-        expected_home = 1.0 / (1.0 + 10.0 ** ((away_elo - home_elo - HOME_ELO_ADVANTAGE) / 400.0))
-        actual_home = 1.0 if hg > ag else 0.5 if hg == ag else 0.0
-        margin = abs(hg - ag)
-        k_factor = 20.0 * min(1.8, 1.0 + math.log1p(margin) * 0.25)
-        delta = k_factor * (actual_home - expected_home)
-        elo[hk], elo[ak] = home_elo + delta, away_elo - delta
+    home_gf: Dict[str, List[float]] = {}
+    home_ga: Dict[str, List[float]] = {}
+    away_gf: Dict[str, List[float]] = {}
+    away_ga: Dict[str, List[float]] = {}
+    all_home_goals: List[float] = []
+    all_away_goals: List[float] = []
 
-        team_history.setdefault(hk, []).append({"date": dt, "gf": hg, "ga": ag, "home": True, "points": 3 if hg > ag else 1 if hg == ag else 0})
-        team_history.setdefault(ak, []).append({"date": dt, "gf": ag, "ga": hg, "home": False, "points": 3 if ag > hg else 1 if ag == hg else 0})
-        sum_home += hg
-        sum_away += ag
-        league_count += 1
+    sorted_matches = sorted(finished_matches, key=lambda m: m.get("utcDate", ""))
+    for m in sorted_matches:
+        h_raw = m.get("homeTeam", {}).get("name")
+        a_raw = m.get("awayTeam", {}).get("name")
+        h_key, a_key = normalize_team(h_raw), normalize_team(a_raw)
+        ft = (m.get("score") or {}).get("fullTime") or {}
+        hg, ag = ft.get("home"), ft.get("away")
+        if not h_key or not a_key or hg is None or ag is None:
+            continue
 
-    base_home = sum_home / league_count if league_count else 1.48
-    base_away = sum_away / league_count if league_count else 1.15
-    profiles: Dict[str, Dict[str, Any]] = {}
-    for key, games in team_history.items():
-        recent = games[-10:]
-        home_games = [x for x in recent if x["home"]][-6:]
-        away_games = [x for x in recent if not x["home"]][-6:]
-        standings_row = standings.get(key, {})
-        profiles[key] = {
-            "name": team_names.get(key, key),
-            "elo": elo.get(key, 1500.0),
-            "recent": recent,
-            "home_games": home_games,
-            "away_games": away_games,
-            "recent_points": sum(x["points"] for x in recent),
-            "recent_played": len(recent),
-            "last_match": max((x["date"] for x in games), default=None),
-            "standing": standings_row,
-        }
-    for key, row in standings.items():
-        profiles.setdefault(key, {
-            "name": row.get("name", key), "elo": 1500.0, "recent": [],
-            "home_games": [], "away_games": [], "recent_points": 0,
-            "recent_played": 0, "last_match": None, "standing": row,
-        })
+        hg_f, ag_f = float(hg), float(ag)
+        elo.setdefault(h_key, 1500.0)
+        elo.setdefault(a_key, 1500.0)
+
+        h_elo = elo[h_key]
+        a_elo = elo[a_key]
+        exp_h = 1.0 / (1.0 + 10.0 ** ((a_elo - (h_elo + HOME_ELO_ADVANTAGE)) / 400.0))
+        exp_a = 1.0 - exp_h
+
+        if hg_f > ag_f:
+            act_h, act_a = 1.0, 0.0
+        elif hg_f < ag_f:
+            act_h, act_a = 0.0, 1.0
+        else:
+            act_h, act_a = 0.5, 0.5
+
+        goal_diff_mult = math.log(abs(hg_f - ag_f) + 1.0) + 1.0
+        k_factor = 24.0 * goal_diff_mult
+        elo[h_key] = h_elo + k_factor * (act_h - exp_h)
+        elo[a_key] = a_elo + k_factor * (act_a - exp_a)
+
+        dt = parse_datetime(m.get("utcDate"))
+        if dt:
+            last_played[h_key] = dt
+            last_played[a_key] = dt
+
+        home_gf.setdefault(h_key, []).append(hg_f)
+        home_ga.setdefault(h_key, []).append(ag_f)
+        away_gf.setdefault(a_key, []).append(ag_f)
+        away_ga.setdefault(a_key, []).append(hg_f)
+        all_home_goals.append(hg_f)
+        all_away_goals.append(ag_f)
+
+    league_home_avg = float(np.mean(all_home_goals)) if all_home_goals else 1.50
+    league_away_avg = float(np.mean(all_away_goals)) if all_away_goals else 1.18
+
     return {
-        "teams": profiles,
-        "league_baseline": {"home_goals": max(0.7, base_home), "away_goals": max(0.6, base_away), "matches": league_count},
-        "standings": standings,
-        "finished_count": league_count,
+        "elo": elo,
+        "last_played": last_played,
+        "home_gf": home_gf,
+        "home_ga": home_ga,
+        "away_gf": away_gf,
+        "away_ga": away_ga,
+        "league_home_avg": max(0.6, league_home_avg),
+        "league_away_avg": max(0.5, league_away_avg),
+        "attack_power": attack_power,
     }
 
 
-def _venue_rate(games: List[Dict[str, Any]], field: str, prior: float, prior_n: float = 4.0) -> float:
-    values = [safe_float(g.get(field)) for g in games]
-    values = [x for x in values if x is not None and x >= 0]
-    return (sum(values) + prior * prior_n) / (len(values) + prior_n)
-
-
-def poisson_pmf(lam: float, goals: int) -> float:
-    return math.exp(-lam) * lam ** goals / math.factorial(goals)
-
-
-def dixon_coles_matrix(home_lambda: float, away_lambda: float, rho: float = DIXON_COLES_RHO, max_goals: int = 10) -> np.ndarray:
-    matrix = np.array([
-        [poisson_pmf(home_lambda, h) * poisson_pmf(away_lambda, a) for a in range(max_goals + 1)]
-        for h in range(max_goals + 1)
-    ], dtype=float)
-    matrix[0, 0] *= max(0.05, 1.0 - home_lambda * away_lambda * rho)
-    matrix[0, 1] *= max(0.05, 1.0 + home_lambda * rho)
-    matrix[1, 0] *= max(0.05, 1.0 + away_lambda * rho)
-    matrix[1, 1] *= max(0.05, 1.0 - rho)
-    total = float(matrix.sum())
-    if total <= 0 or not np.isfinite(total):
-        raise ValueError("Invalid Dixon-Coles probability matrix")
-    return matrix / total
-
-
-def calculate_probabilities(matrix: np.ndarray) -> Dict[str, Any]:
-    size = matrix.shape[0]
-    home_win = float(sum(matrix[h, a] for h in range(size) for a in range(size) if h > a))
-    draw = float(sum(matrix[h, a] for h in range(size) for a in range(size) if h == a))
-    away_win = float(sum(matrix[h, a] for h in range(size) for a in range(size) if h < a))
-
-    home_gd_2plus = float(sum(matrix[h, a] for h in range(size) for a in range(size) if (h - a) >= 2))
-    home_gd_3plus = float(sum(matrix[h, a] for h in range(size) for a in range(size) if (h - a) >= 3))
-    away_gd_2plus = float(sum(matrix[h, a] for h in range(size) for a in range(size) if (a - h) >= 2))
-    away_gd_3plus = float(sum(matrix[h, a] for h in range(size) for a in range(size) if (a - h) >= 3))
-    any_gd_2plus = float(sum(matrix[h, a] for h in range(size) for a in range(size) if abs(h - a) >= 2))
-    expected_gd = float(sum((h - a) * matrix[h, a] for h in range(size) for a in range(size)))
-
-    total_probs = {
-        total: float(sum(matrix[h, total - h] for h in range(size) if 0 <= total - h < size))
-        for total in range(2 * size - 1)
-    }
-    over15 = float(sum(p for goals, p in total_probs.items() if goals >= 2))
-    over25 = float(sum(p for goals, p in total_probs.items() if goals >= 3))
-    over35 = float(sum(p for goals, p in total_probs.items() if goals >= 4))
-    over45 = float(sum(p for goals, p in total_probs.items() if goals >= 5))
-    home_scores = float(sum(matrix[h, a] for h in range(1, size) for a in range(size)))
-    away_scores = float(sum(matrix[h, a] for h in range(size) for a in range(1, size)))
-    btts_yes = float(sum(matrix[h, a] for h in range(1, size) for a in range(1, size)))
-    return {
-        "home_win": home_win,
-        "draw": draw,
-        "away_win": away_win,
-        "home_gd_2plus": home_gd_2plus,
-        "home_gd_3plus": home_gd_3plus,
-        "away_gd_2plus": away_gd_2plus,
-        "away_gd_3plus": away_gd_3plus,
-        "any_gd_2plus": any_gd_2plus,
-        "expected_gd": expected_gd,
-        "over15": over15,
-        "over25": over25,
-        "over35": over35,
-        "over45": over45,
-        "under25": 1.0 - over25,
-        "home_scores_1plus": home_scores,
-        "away_scores_1plus": away_scores,
-        "btts_yes": btts_yes,
-        "btts_no": 1.0 - btts_yes,
-        "total_probs": total_probs,
-    }
-
-
-def _get_profile(context: Dict[str, Any], team_name: str) -> Dict[str, Any]:
-    key = normalize_team(team_name)
-    found = context.get("teams", {}).get(key)
-    if found:
-        return found
-    for profile_key, profile in context.get("teams", {}).items():
-        if same_team(team_name, profile.get("name", profile_key)):
-            return profile
-    return {"name": team_name, "elo": 1500.0, "recent": [], "home_games": [], "away_games": [], "recent_points": 0, "recent_played": 0, "last_match": None, "standing": {}}
+def _team_venue_rate(values: List[float], fallback: float, window: int = 10) -> float:
+    if not values:
+        return fallback
+    recent = values[-window:]
+    weights = np.linspace(0.6, 1.0, len(recent))
+    return float(np.average(recent, weights=weights))
 
 
 def predict_match(
-    match: Dict[str, Any],
-    league_context: Dict[str, Any],
+    home_name: str,
+    away_name: str,
+    kickoff_dt: Optional[datetime],
+    ratings_data: Dict[str, Any],
     *,
-    manual_context: Optional[Dict[str, float]] = None,
-    team_news: Optional[Dict[str, Any]] = None,
-    parsed_odds: Optional[Dict[str, Any]] = None,
-    odds_weight: float = 0.25,
-    attack_power: float = DEFAULT_ATTACK_POWER,
+    home_tactical_adj: float = 0.0,
+    away_tactical_adj: float = 0.0,
+    odds_blend_weight: float = 0.0,
+    odds_parsed: Optional[Dict[str, Any]] = None,
+    injury_penalty_home: float = 0.0,
+    injury_penalty_away: float = 0.0,
 ) -> Dict[str, Any]:
-    home_name = match.get("homeTeam", {}).get("name", "Home")
-    away_name = match.get("awayTeam", {}).get("name", "Away")
-    home = _get_profile(league_context, home_name)
-    away = _get_profile(league_context, away_name)
-    baseline = league_context.get("league_baseline", {"home_goals": 1.48, "away_goals": 1.15})
-    base_home = clamp(float(baseline.get("home_goals", 1.48)), 0.70, 2.50)
-    base_away = clamp(float(baseline.get("away_goals", 1.15)), 0.60, 2.20)
+    h_key, a_key = normalize_team(home_name), normalize_team(away_name)
+    elo_map = ratings_data["elo"]
+    last_played = ratings_data["last_played"]
+    h_elo = elo_map.get(h_key, 1500.0)
+    a_elo = elo_map.get(a_key, 1500.0)
 
-    home_attack = _venue_rate(home.get("home_games", []), "gf", base_home)
-    home_conceded = _venue_rate(home.get("home_games", []), "ga", base_away)
-    away_attack = _venue_rate(away.get("away_games", []), "gf", base_away)
-    away_conceded = _venue_rate(away.get("away_games", []), "ga", base_home)
+    league_h_avg = ratings_data["league_home_avg"]
+    league_a_avg = ratings_data["league_away_avg"]
+    atk_pow = ratings_data.get("attack_power", DEFAULT_ATTACK_POWER)
 
-    # Apply configurable attacking power (default 0.75) so attacking strength differences stand out more clearly
-    pwr = clamp(float(attack_power), 0.40, 1.10)
-    home_lambda = base_home * (((home_attack / base_home) ** pwr) * ((away_conceded / base_home) ** pwr)) ** 0.5
-    away_lambda = base_away * (((away_attack / base_away) ** pwr) * ((home_conceded / base_away) ** pwr)) ** 0.5
+    h_att_rate = _team_venue_rate(ratings_data["home_gf"].get(h_key, []), league_h_avg)
+    h_def_rate = _team_venue_rate(ratings_data["home_ga"].get(h_key, []), league_a_avg)
+    a_att_rate = _team_venue_rate(ratings_data["away_gf"].get(a_key, []), league_a_avg)
+    a_def_rate = _team_venue_rate(ratings_data["away_ga"].get(a_key, []), league_h_avg)
 
-    elo_difference = float(home.get("elo", 1500.0)) - float(away.get("elo", 1500.0))
-    elo_shift = clamp(elo_difference / 1800.0, -0.28, 0.28)
-    home_lambda *= math.exp(elo_shift)
-    away_lambda *= math.exp(-elo_shift * 0.80)
+    h_att_idx = clamp((h_att_rate / league_h_avg) ** atk_pow, 0.55, 1.65)
+    a_def_idx = clamp((a_def_rate / league_h_avg) ** atk_pow, 0.55, 1.65)
+    a_att_idx = clamp((a_att_rate / league_a_avg) ** atk_pow, 0.55, 1.65)
+    h_def_idx = clamp((h_def_rate / league_a_avg) ** atk_pow, 0.55, 1.65)
 
-    kickoff = parse_datetime(match.get("utcDate")) or utc_now()
-    rest_days: Dict[str, Optional[int]] = {}
-    rest_factor: Dict[str, float] = {}
-    for side, profile in (("home", home), ("away", away)):
-        last_match = profile.get("last_match")
-        days = max(0, (kickoff.date() - last_match.date()).days) if last_match else None
-        rest_days[side] = days
-        rest_factor[side] = 0.92 if days is not None and days <= 3 else 0.97 if days is not None and days <= 5 else 1.0
-    home_lambda *= rest_factor["home"]
-    away_lambda *= rest_factor["away"]
+    elo_diff = (h_elo + HOME_ELO_ADVANTAGE) - a_elo
+    elo_h_factor = clamp(1.0 + elo_diff / 1800.0, 0.72, 1.38)
+    elo_a_factor = clamp(1.0 - elo_diff / 1800.0, 0.72, 1.38)
 
-    manual = manual_context or {}
-    home_delta = 0.018 * (manual.get("home_motivation", 0.0) - manual.get("away_motivation", 0.0))
-    home_delta += 0.015 * (manual.get("home_tactical", 0.0) - manual.get("away_tactical", 0.0))
-    home_lambda *= math.exp(clamp(home_delta, -0.14, 0.14))
-    away_lambda *= math.exp(clamp(-home_delta * 0.70, -0.12, 0.12))
+    rest_days_h: Optional[float] = None
+    rest_days_a: Optional[float] = None
+    rest_mult_h = 1.0
+    rest_mult_a = 1.0
+    if kickoff_dt:
+        if h_key in last_played:
+            rest_days_h = (kickoff_dt - last_played[h_key]).total_seconds() / 86400.0
+            if rest_days_h < 3.5:
+                rest_mult_h = 0.93
+        if a_key in last_played:
+            rest_days_a = (kickoff_dt - last_played[a_key]).total_seconds() / 86400.0
+            if rest_days_a < 3.5:
+                rest_mult_a = 0.93
 
-    news = team_news or {}
-    home_injuries = len(news.get("home_injuries", []))
-    away_injuries = len(news.get("away_injuries", []))
-    home_lineup_ok = bool(news.get("home_lineup_confirmed"))
-    away_lineup_ok = bool(news.get("away_lineup_confirmed"))
+    tac_mult_h = math.exp(home_tactical_adj * 0.08)
+    tac_mult_a = math.exp(away_tactical_adj * 0.08)
+    inj_mult_h = clamp(1.0 - injury_penalty_home, 0.65, 1.0)
+    inj_mult_a = clamp(1.0 - injury_penalty_away, 0.65, 1.0)
 
-    home_lineup_mod = 0.015 if home_lineup_ok else -0.01 if news else 0.0
-    away_lineup_mod = 0.015 if away_lineup_ok else -0.01 if news else 0.0
-
-    home_lambda *= math.exp(clamp(-0.020 * home_injuries + home_lineup_mod, -0.14, 0.03))
-    away_lambda *= math.exp(clamp(-0.020 * away_injuries + away_lineup_mod, -0.14, 0.03))
-
-    odds_used = False
-    mkt_h2h = (parsed_odds or {}).get("h2h_market_probability") or {}
-    mkt_tot = (parsed_odds or {}).get("totals25_market_probability") or {}
-    w = clamp(float(odds_weight), 0.0, 0.60)
-    if w > 0 and all(k in mkt_h2h for k in ("home", "draw", "away")):
-        odds_used = True
-        mkt_home = clamp(float(mkt_h2h["home"]), 0.03, 0.92)
-        mkt_away = clamp(float(mkt_h2h["away"]), 0.03, 0.92)
-        ratio = clamp(mkt_home / max(0.03, mkt_away), 0.25, 4.0)
-        home_lambda *= math.exp(w * 0.28 * math.log(ratio))
-        away_lambda *= math.exp(-w * 0.28 * math.log(ratio))
-        if "over" in mkt_tot and "under" in mkt_tot:
-            total_tilt = clamp((float(mkt_tot["over"]) - 0.50) * 0.40 * w, -0.10, 0.10)
-            home_lambda *= math.exp(total_tilt)
-            away_lambda *= math.exp(total_tilt)
-
-    home_lambda = clamp(home_lambda, 0.20, 4.80)
-    away_lambda = clamp(away_lambda, 0.15, 4.50)
-
-    matrix = dixon_coles_matrix(home_lambda, away_lambda)
-
-    # Top 3 most likely exact scores ranked by probability
-    flat_indices = np.argsort(matrix.ravel())[::-1][:3]
-    top_scores: List[Tuple[Tuple[int, int], float]] = [
-        (tuple(int(x) for x in np.unravel_index(int(idx), matrix.shape)), float(matrix.ravel()[int(idx)]))
-        for idx in flat_indices
-    ]
-    best_score, best_score_prob = top_scores[0]
-    second_score, second_score_prob = top_scores[1]
-
-    probs = calculate_probabilities(matrix)
-
-    blended_1x2 = {
-        "home_win": probs["home_win"],
-        "draw": probs["draw"],
-        "away_win": probs["away_win"],
-    }
-    if odds_used:
-        bh = (1.0 - w) * probs["home_win"] + w * float(mkt_h2h["home"])
-        bd = (1.0 - w) * probs["draw"] + w * float(mkt_h2h["draw"])
-        ba = (1.0 - w) * probs["away_win"] + w * float(mkt_h2h["away"])
-        s = bh + bd + ba
-        if s > 0:
-            blended_1x2 = {"home_win": bh / s, "draw": bd / s, "away_win": ba / s}
-
-    top_outcome = max(blended_1x2["home_win"], blended_1x2["draw"], blended_1x2["away_win"])
-    played_mean = (home.get("recent_played", 0) + away.get("recent_played", 0)) / 2
-    quality = clamp(
-        0.20
-        + min(0.40, played_mean / 22.0)
-        + (0.15 if home.get("standing") else 0.0)
-        + (0.15 if away.get("standing") else 0.0)
-        + (0.05 if odds_used else 0.0)
-        + (0.05 if news else 0.0),
-        0.10,
-        1.0,
+    lam_home = clamp(
+        league_h_avg * h_att_idx * a_def_idx * elo_h_factor * rest_mult_h * tac_mult_h * inj_mult_h,
+        0.25,
+        4.80,
     )
+    lam_away = clamp(
+        league_a_avg * a_att_idx * h_def_idx * elo_a_factor * rest_mult_a * tac_mult_a * inj_mult_a,
+        0.20,
+        4.50,
+    )
+
+    # Dixon-Coles score matrix
+    matrix = np.zeros((MAX_GOALS, MAX_GOALS), dtype=float)
+    pmf_h = [math.exp(-lam_home) * (lam_home ** i) / math.factorial(i) for i in range(MAX_GOALS)]
+    pmf_a = [math.exp(-lam_away) * (lam_away ** j) / math.factorial(j) for j in range(MAX_GOALS)]
+
+    for i in range(MAX_GOALS):
+        for j in range(MAX_GOALS):
+            tau = _dixon_coles_tau(i, j, lam_home, lam_away, DIXON_COLES_RHO)
+            matrix[i, j] = pmf_h[i] * pmf_a[j] * tau
+
+    total_mass = float(np.sum(matrix))
+    if total_mass > 0:
+        matrix /= total_mass
+
+    home_win = float(np.sum(np.tril(matrix, -1)))
+    draw = float(np.sum(np.diag(matrix)))
+    away_win = float(np.sum(np.triu(matrix, 1)))
+
+    over25 = 0.0
+    under25 = 0.0
+    home_2plus_goals = 0.0
+    away_2plus_goals = 0.0
+    score_list: List[Tuple[str, float]] = []
+
+    for i in range(MAX_GOALS):
+        for j in range(MAX_GOALS):
+            prob = float(matrix[i, j])
+            score_list.append((f"{i}-{j}", prob))
+            if i + j >= 3:
+                over25 += prob
+            else:
+                under25 += prob
+            if i >= 2:
+                home_2plus_goals += prob
+            if j >= 2:
+                away_2plus_goals += prob
+
+    score_list.sort(key=lambda x: x[1], reverse=True)
+
+    # Optional blend with no-vig market probabilities
+    mkt_h2h = (odds_parsed or {}).get("h2h_market_probability") or {}
+    if odds_blend_weight > 0 and all(k in mkt_h2h for k in ("home", "draw", "away")):
+        w = clamp(odds_blend_weight, 0.0, 0.85)
+        home_win = (1.0 - w) * home_win + w * float(mkt_h2h["home"])
+        draw = (1.0 - w) * draw + w * float(mkt_h2h["draw"])
+        away_win = (1.0 - w) * away_win + w * float(mkt_h2h["away"])
+        s = home_win + draw + away_win
+        home_win, draw, away_win = home_win / s, draw / s, away_win / s
+
+    mkt_tot = (odds_parsed or {}).get("totals25_market_probability") or {}
+    if odds_blend_weight > 0 and "over" in mkt_tot and "under" in mkt_tot:
+        w = clamp(odds_blend_weight, 0.0, 0.85)
+        over25 = (1.0 - w) * over25 + w * float(mkt_tot["over"])
+        under25 = (1.0 - w) * under25 + w * float(mkt_tot["under"])
+        ts = over25 + under25
+        over25, under25 = over25 / ts, under25 / ts
+
+    expected_gd = lam_home - lam_away
+    expected_total_goals = lam_home + lam_away
 
     return {
-        "home_name": home_name,
-        "away_name": away_name,
-        "home_lambda": home_lambda,
-        "away_lambda": away_lambda,
-        "expected_total_goals": home_lambda + away_lambda,
-        "best_score": best_score,
-        "best_score_probability": best_score_prob,
-        "second_score": second_score,
-        "second_score_probability": second_score_prob,
-        "top_scores": top_scores,
-        "matrix": matrix,
-        "probabilities": probs,
-        "blended_1x2": blended_1x2,
-        "odds_used": odds_used,
-        "attack_power": pwr,
-        "home_elo": float(home.get("elo", 1500.0)),
-        "away_elo": float(away.get("elo", 1500.0)),
-        "elo_difference": elo_difference,
-        "home_attack_index": home_attack / base_home,
-        "away_attack_index": away_attack / base_away,
-        "home_rest_days": rest_days["home"],
-        "away_rest_days": rest_days["away"],
-        "home_injury_count": home_injuries,
-        "away_injury_count": away_injuries,
-        "home_lineup_confirmed": home_lineup_ok,
-        "away_lineup_confirmed": away_lineup_ok,
-        "top_outcome_probability": top_outcome,
-        "data_quality": quality,
-        "xg_source": f"league-relative goals-for/against proxy (attack power {pwr:.2f}) + context/odds",
-        "model_version": MODEL_VERSION,
+        "home_elo": h_elo,
+        "away_elo": a_elo,
+        "lam_home": lam_home,
+        "lam_away": lam_away,
+        "expected_gd": expected_gd,
+        "expected_total_goals": expected_total_goals,
+        "rest_days_h": rest_days_h,
+        "rest_days_a": rest_days_a,
+        "top_scores": score_list[:5],
+        "probabilities": {
+            "home_win": home_win,
+            "draw": draw,
+            "away_win": away_win,
+            "over25": over25,
+            "under25": under25,
+            "home_2plus_goals": home_2plus_goals,
+            "away_2plus_goals": away_2plus_goals,
+        },
     }
 
 
 # -----------------------------
-# Rendering
+# Burmese Detailed Analysis Engine
 # -----------------------------
 
 
-def render_value_finder(model: Dict[str, Any], odds: Dict[str, Any]) -> None:
-    with st.expander("Value Bet Finder — compare model probabilities with global odds", expanded=False):
-        rows = build_value_bets(model, odds)
-        if not rows:
-            st.info("No matching h2h or 2.5 totals odds are available for this fixture.")
-            return
-        table = pd.DataFrame(rows)
-        for column in ("Model probability", "No-vig market probability"):
-            table[column] = table[column].map(lambda x: "—" if pd.isna(x) else f"{x * 100:.1f}%")
-        table["Edge"] = table["Edge"].map(lambda x: "—" if pd.isna(x) else f"{x * 100:+.1f} pp")
-        table["Expected value"] = table["Expected value"].map(lambda x: f"{x * 100:+.1f}%")
-        table["Best odds"] = table["Best odds"].map(lambda x: f"{x:.2f}")
-        st.dataframe(table, hide_index=True, use_container_width=True)
-        candidates = [row for row in rows if row["Expected value"] > 0 and row["Edge"] is not None and row["Edge"] > 0]
-        if candidates:
-            best = max(candidates, key=lambda row: row["Expected value"])
-            st.success(f"Positive model-vs-price signal: {best['Market']} | EV {best['Expected value'] * 100:+.1f}% (not a guarantee).")
+def build_detailed_burmese_analysis(
+    home_name: str,
+    away_name: str,
+    model: Dict[str, Any],
+    odds_parsed: Dict[str, Any],
+    value_bets: List[Dict[str, Any]],
+    team_news_summary: Dict[str, Any],
+    odds_fetched: bool,
+    live_fetched: bool,
+) -> str:
+    p = model["probabilities"]
+    gd = model["expected_gd"]
+    lam_h = model["lam_home"]
+    lam_a = model["lam_away"]
+
+    vb_by_key = {row["key"]: row for row in value_bets}
+
+    # Evaluate candidate picks across Home, Away, Over 2.5, Under 2.5
+    candidates_meta = [
+        ("home", f"အိမ်ကွင်းအသင်း ({home_name})", p["home_win"]),
+        ("away", f"အဝေးကွင်းအသင်း ({away_name})", p["away_win"]),
+        ("over25", "ဂိုးပေါင်းအပေါ် (Over 2.5 goals)", p["over25"]),
+        ("under25", "ဂိုးပေါင်းအောက် (Under 2.5 goals)", p["under25"]),
+    ]
+
+    def _score_candidate(key: str, prob: float) -> float:
+        vb = vb_by_key.get(key)
+        score = prob * 100.0
+        if vb:
+            ev = vb.get("Expected value") or 0.0
+            edge = vb.get("Edge") or 0.0
+            if ev > 0:
+                score += ev * 45.0 + max(0.0, edge) * 60.0
+            elif ev < -0.05:
+                score += ev * 25.0
+        return score
+
+    best_key, best_label, best_prob = max(
+        candidates_meta,
+        key=lambda item: _score_candidate(item[0], item[2]),
+    )
+    best_vb = vb_by_key.get(best_key)
+
+    lines: List[str] = ["### အသေးစိတ် သုံးသပ်ချက်", ""]
+
+    # 1. Best Overall Pick (Goals & Value focus like image 1)
+    best_line = f"၁။ **အရွေးချယ်သင့်ဆုံး - {best_label}:**"
+    lines.append(best_line)
+
+    detail_1 = f"ရွေးချယ်မှု၏ Model ဖြစ်နိုင်ခြေမှာ **{best_prob * 100:.1f}%** အထိ ရှိနေပြီး ခန့်မှန်းဂိုးစုစုပေါင်းမှာ **{lam_h + lam_a:.2f} ဂိုး** (အိမ်ကွင်း **{lam_h:.2f}** / အဝေးကွင်း **{lam_a:.2f}**) ဖြစ်ပါသည်။"
+    if odds_fetched and best_vb:
+        odds_val = best_vb["Best odds"]
+        ev_pct = (best_vb["Expected value"] or 0.0) * 100.0
+        edge_pp = (best_vb["Edge"] or 0.0) * 100.0
+        mkt_prob = best_vb.get("No-vig market probability")
+        mkt_str = f" (No-vig ဈေးကွက် {mkt_prob * 100:.1f}%)" if mkt_prob is not None else ""
+        detail_1 += f" အကောင်းဆုံး ပေါက်ကြေးမှာ **{odds_val:.2f}** ရှိနေပါတယ်။"
+        lines.append(f"  * {detail_1}")
+        ev_sign = "+" if ev_pct >= 0 else ""
+        edge_sign = "+" if edge_pp >= 0 else ""
+        lines.append(
+            f"  * Value Bet Finder အရ Model နှင့် ဈေးကွက်ကွာဟချက် (**Edge {edge_sign}{edge_pp:.1f} pp**{mkt_str}) ရှိပြီး "
+            f"**Expected Value ({ev_sign}{ev_pct:.1f}%)** ဖြစ်သောကြောင့် နှိုင်းယှဉ်ရွေးချယ်မှုများထဲတွင် **Value** အကိုက်ညီဆုံး ဖြစ်ပါသည်။"
+        )
+    else:
+        lines.append(f"  * {detail_1}")
+        if not odds_fetched:
+            lines.append("  * Odds API မခေါ်ရသေးသဖြင့် ပေါက်ကြေးနှင့် EV တွက်ချက်မှု မပါဝင်သေးပါ (Odds API Fetch လုပ်ပါက Value Bet နှိုင်းယှဉ်ချက် ထည့်ပေးပါမည်)။")
+
+    lines.append("")
+
+    # 2. Team Selection: Home vs Away (like image 2)
+    home_2p = p["home_2plus_goals"] * 100.0
+    away_2p = p["away_2plus_goals"] * 100.0
+    gd_sign = "+" if gd >= 0 else ""
+    fav_team = f"အိမ်ကွင်းအသင်း ({home_name})" if p["home_win"] >= p["away_win"] else f"အဝေးကွင်းအသင်း ({away_name})"
+    fav_prob = max(p["home_win"], p["away_win"]) * 100.0
+
+    lines.append(f"၂။ **အသင်းရွေးချယ်မှု - အိမ်ကွင်း ({home_name}) vs အဝေးကွင်း ({away_name}):**")
+    lines.append(
+        f"  * အသင်းဘက်က ရွေးချယ်မည်ဆိုလျှင် **{fav_team}** က နိုင်ခြေ **{fav_prob:.1f}%** (အိမ်ကွင်း **{p['home_win']*100:.1f}%** / သရေ **{p['draw']*100:.1f}%** / အဝေးကွင်း **{p['away_win']*100:.1f}%**) ရှိပြီး "
+        f"ခန့်မှန်းဂိုးကွာခြားချက် (**Expected Goal Difference**) ကလည်း **{gd_sign}{gd:.2f} ဂိုး** ရှိပါသည်။"
+    )
+    lines.append(
+        f"  * ထို့အပြင် **{home_name}** က ၂ ဂိုးပြတ်နိုင်ခြေ **{home_2p:.1f}%** ရှိပြီး **{away_name}** က ၂ ဂိုးပြတ်နိုင်ခြေ **{away_2p:.1f}%** ရှိသဖြင့် "
+        f"နှစ်သင်း၏ တိုက်စစ်/ခံစစ် ဟန်ချက်ကို ရှင်းရှင်းလင်းလင်း နှိုင်းယှဉ်နိုင်ပါသည်။"
+    )
+
+    if odds_fetched and value_bets:
+        h_vb = vb_by_key.get("home")
+        a_vb = vb_by_key.get("away")
+        vb_notes: List[str] = []
+        if h_vb:
+            vb_notes.append(
+                f"အိမ်ကွင်း Odds {h_vb['Best odds']:.2f} / EV {(h_vb['Expected value'] or 0)*100:+.1f}%"
+            )
+        if a_vb:
+            vb_notes.append(
+                f"အဝေးကွင်း Odds {a_vb['Best odds']:.2f} / EV {(a_vb['Expected value'] or 0)*100:+.1f}%"
+            )
+        if vb_notes:
+            lines.append(f"  * **Value Bet Finder (1X2):** {' | '.join(vb_notes)} ဖြစ်ပါသည်။")
+
+    lines.append("")
+
+    # 3. Over 2.5 vs Under 2.5 Comparison
+    lines.append("၃။ **ဂိုးပေါင်းရွေးချယ်မှု - ဂိုးပေါင်းအပေါ် (Over 2.5) vs ဂိုးပေါင်းအောက် (Under 2.5):**")
+    over_note = f"ဂိုးပေါင်းအပေါ် (Over 2.5) ဖြစ်နိုင်ခြေ **{p['over25']*100:.1f}%**"
+    under_note = f"ဂိုးပေါင်းအောက် (Under 2.5) ဖြစ်နိုင်ခြေ **{p['under25']*100:.1f}%**"
+    if odds_fetched:
+        o_vb = vb_by_key.get("over25")
+        u_vb = vb_by_key.get("under25")
+        if o_vb:
+            over_note += f" (Best Odds {o_vb['Best odds']:.2f}, EV {(o_vb['Expected value'] or 0)*100:+.1f}%)"
+        if u_vb:
+            under_note += f" (Best Odds {u_vb['Best odds']:.2f}, EV {(u_vb['Expected value'] or 0)*100:+.1f}%)"
+    lines.append(f"  * {over_note} နှင့် {under_note} ရှိပြီး မျှော်မှန်းဂိုးစုစုပေါင်းမှာ **{lam_h + lam_a:.2f} ဂိုး** ဖြစ်ပါသည်။")
+
+    lines.append("")
+
+    # 4. Live Football API: Lineups & Injury List
+    lines.append("၄။ **Lineup နှင့် Injury List သုံးသပ်ချက် (Live Football API):**")
+    if live_fetched and team_news_summary.get("has_data"):
+        h_inj = team_news_summary.get("home_injuries") or []
+        a_inj = team_news_summary.get("away_injuries") or []
+        h_lu = team_news_summary.get("home_lineup") or []
+        a_lu = team_news_summary.get("away_lineup") or []
+        h_form = team_news_summary.get("home_formation")
+        a_form = team_news_summary.get("away_formation")
+
+        h_inj_txt = ", ".join(h_inj) if h_inj else "ဒဏ်ရာ/ပွဲပယ် စာရင်း မတွေ့ရှိပါ"
+        a_inj_txt = ", ".join(a_inj) if a_inj else "ဒဏ်ရာ/ပွဲပယ် စာရင်း မတွေ့ရှိပါ"
+        lines.append(f"  * **ဒဏ်ရာ/ပွဲပယ်စာရင်း (Injuries):** {home_name} — {h_inj_txt} | {away_name} — {a_inj_txt}။")
+
+        if h_lu or a_lu or h_form or a_form:
+            h_lu_txt = f"({h_form}) " + ", ".join(h_lu[:11]) if h_lu else (h_form or "Lineup မထွက်သေးပါ")
+            a_lu_txt = f"({a_form}) " + ", ".join(a_lu[:11]) if a_lu else (a_form or "Lineup မထွက်သေးပါ")
+            lines.append(f"  * **လူစာရင်း (Lineups):** {home_name} — {h_lu_txt} | {away_name} — {a_lu_txt}။")
         else:
-            st.caption("No positive model-vs-market edge was found at the returned best prices.")
-        st.caption("Market probabilities are normalized across each bookmaker's outcomes before averaging. EV uses the best listed decimal price and the model probability; it is not a profit guarantee.")
+            lines.append("  * **လူစာရင်း (Lineups):** ပွဲမစမီ Starting XI စာရင်း မထွက်ရှိသေးပါ (သို့မဟုတ် Provider ဘက်မှ မပေးသေးပါ)။")
+    elif live_fetched:
+        lines.append("  * Live Football API ကို Fetch လုပ်ခဲ့သော်လည်း ဤပွဲအတွက် Lineup သို့မဟုတ် Injury ဒေတာ မတွေ့ရှိသေးပါ။")
+    else:
+        lines.append("  * Live Football API ကို Fetch မလုပ်ရသေးပါ။ ပွဲမတိုင်မီ Lineup နှင့် Injury စာရင်းများကို ကြည့်ရန် **Fetch Live Football API** ကို နှိပ်ပါ။")
+
+    lines.append("")
+    lines.append("*(မှတ်ချက် - ဤကိန်းဂဏန်းများသည် သင်္ချာမော်ဒယ် ခန့်မှန်းချက်များသာ ဖြစ်ပြီး ရာနှုန်းပြည့် သေချာမှု မဟုတ်ပါ။)*")
+    return "\n".join(lines)
 
 
-def render_fixture_card(
-    match: Dict[str, Any],
-    league_name: str,
-    league_context: Dict[str, Any],
-    odds_key: str,
-    odds_sport_key: str,
-    regions: str,
-    odds_weight: float,
-    attack_power: float,
-    lfa_key: str,
-    lfa_league: str,
-    preloaded_odds_events: Optional[List[Dict[str, Any]]] = None,
-) -> Dict[str, Any]:
+# -----------------------------
+# Streamlit UI
+# -----------------------------
+
+
+def main() -> None:
+    st.title("⚽ Football Prediction Dashboard V8.5")
+    st.caption(f"Model: `{MODEL_VERSION}` • Elo + Venue xG + Dixon-Coles + Odds Value Finder + Live Team News")
+
+    with st.sidebar:
+        st.header("🔑 API Keys")
+        fd_key = st.text_input("football-data.org API Key", value=safe_secret("FOOTBALL_DATA_API_KEY"), type="password")
+        odds_key = st.text_input("The Odds API Key", value=safe_secret("ODDS_API_KEY"), type="password")
+        lfa_key = st.text_input("Live Football API Key", value=safe_secret("LIVE_FOOTBALL_API_KEY"), type="password")
+
+        st.header("🏆 Competition & Window")
+        league_name = st.selectbox("League", list(LEAGUES.keys()), index=0)
+        days_ahead = st.slider("Upcoming window (days)", min_value=1, max_value=14, value=7)
+        days_back = st.slider("Historical lookback (days)", min_value=60, max_value=365, value=210)
+        odds_regions = st.text_input("Odds regions", value="uk,eu,us")
+
+        st.header("⚙️ Model & Adjustments")
+        attack_power = st.slider("Attacking power exponent", 0.40, 1.10, DEFAULT_ATTACK_POWER, 0.05)
+        odds_blend = st.slider("Blend with no-vig market prob", 0.0, 0.80, 0.0, 0.05)
+        home_tac = st.slider("Home tactical/motivation adj", -3.0, 3.0, 0.0, 0.5)
+        away_tac = st.slider("Away tactical/motivation adj", -3.0, 3.0, 0.0, 0.5)
+        inj_pen_h = st.slider("Home injury impact penalty", 0.0, 0.35, 0.0, 0.02)
+        inj_pen_a = st.slider("Away injury impact penalty", 0.0, 0.35, 0.0, 0.02)
+
+    league_cfg = LEAGUES[league_name]
+    comp_code = league_cfg["football_data"]
+    sport_key = league_cfg["odds"]
+    lfa_slug = league_cfg["lfa_league"]
+
+    d_from, d_to, win_start, win_end = fixture_window(days_ahead)
+    hist_from, hist_to = finished_window(days_back)
+
+    fixtures_raw, fix_err = fetch_fixtures(comp_code, fd_key, d_from, d_to)
+    finished_raw, fin_err = fetch_finished_matches(comp_code, fd_key, hist_from, hist_to)
+    standings, std_err = fetch_standings(comp_code, fd_key)
+
+    if fix_err:
+        st.error(f"Fixtures error: {fix_err}")
+    if fin_err:
+        st.warning(f"Finished matches warning: {fin_err}")
+    if std_err:
+        st.info(f"Standings info: {std_err}")
+
+    upcoming = upcoming_only(fixtures_raw, win_start, win_end)
+    if not upcoming:
+        st.info("Selected window တွင် SCHEDULED / TIMED ပွဲစဉ်များ မတွေ့ရှိပါ။")
+        return
+
+    fixture_labels: List[str] = []
+    fixture_map: Dict[str, Dict[str, Any]] = {}
+    for m in upcoming:
+        h_n = m.get("homeTeam", {}).get("name", "Home")
+        a_n = m.get("awayTeam", {}).get("name", "Away")
+        dt_str = local_datetime(m.get("utcDate"))
+        lbl = f"{h_n} vs {a_n} ({dt_str})"
+        fixture_labels.append(lbl)
+        fixture_map[lbl] = m
+
+    selected_label = st.selectbox("Select Match", fixture_labels)
+    match = fixture_map[selected_label]
     home_name = match.get("homeTeam", {}).get("name", "Home")
     away_name = match.get("awayTeam", {}).get("name", "Away")
-    match_id = str(match.get("id", f"{home_name}-{away_name}"))
-    odds_state_key = f"odds_fetch_{match_id}_{odds_sport_key}_{regions}"
-    lfa_state_key = f"lfa_news_{match_id}"
+    kickoff_dt = parse_datetime(match.get("utcDate"))
+    kickoff_date_str = kickoff_dt.astimezone(LOCAL_TZ).strftime("%Y-%m-%d") if kickoff_dt else utc_now().date().isoformat()
 
-    with st.expander(f"⚽ {home_name} vs {away_name} | {local_datetime(match.get('utcDate'))}", expanded=False):
-        st.markdown(f"### {home_name}  **vs**  {away_name}")
-        st.caption(f"{league_name} | Kickoff {local_datetime(match.get('utcDate'))} | {MODEL_VERSION}")
+    # Session state for on-demand API fetches
+    odds_state_key = f"odds_fetched_{comp_code}"
+    live_state_key = f"live_fetched_{comp_code}_{normalize_team(home_name)}_{normalize_team(away_name)}_{kickoff_date_str}"
 
-        b1, b2 = st.columns(2)
-        with b1:
-            fetch_odds_clicked = st.button(
-                "Fetch Odds API",
-                key=f"btn_odds_{match_id}",
-                disabled=not bool(odds_key),
-            )
-        with b2:
-            fetch_lfa_clicked = st.button(
-                "Fetch Live Football (Lineup/Injury)",
-                key=f"btn_lfa_{match_id}",
-                disabled=not bool(lfa_key),
-            )
+    st.session_state.setdefault(odds_state_key, False)
+    st.session_state.setdefault(live_state_key, False)
 
-        if fetch_odds_clicked:
-            with st.spinner("Fetching Odds API data…"):
-                ev_list, od_err, rem = fetch_global_odds(odds_sport_key, odds_key, regions)
-                st.session_state[odds_state_key] = {
-                    "events": ev_list,
-                    "error": od_err,
-                    "remaining": rem,
-                }
+    col_btn1, col_btn2, col_btn3 = st.columns([1, 1, 2])
+    with col_btn1:
+        if st.button("💹 Fetch Odds API", use_container_width=True):
+            st.session_state[odds_state_key] = True
+    with col_btn2:
+        if st.button("🩺 Fetch Live Football API", use_container_width=True):
+            st.session_state[live_state_key] = True
+    with col_btn3:
+        st.caption(f"Kickoff: **{local_datetime(match.get('utcDate'))}** | Standings teams loaded: **{len(standings)}**")
 
-        if fetch_lfa_clicked:
-            kickoff_date = (parse_datetime(match.get("utcDate")) or utc_now()).date().isoformat()
-            with st.spinner("Fetching Live Football injuries, lineups & stats…"):
-                st.session_state[lfa_state_key] = fetch_live_football_team_news(
-                    lfa_key, lfa_league, kickoff_date, home_name, away_name
-                )
-
-        odds_bundle = st.session_state.get(odds_state_key)
-        if odds_bundle is not None:
-            odds_events = odds_bundle.get("events", [])
-            if odds_bundle.get("error"):
-                st.warning(f"Odds API: {odds_bundle['error']}")
-            if odds_bundle.get("remaining") is not None:
-                st.caption(f"The Odds API requests remaining: {odds_bundle['remaining']}")
-        elif preloaded_odds_events is not None:
-            odds_events = preloaded_odds_events
+    odds_parsed: Dict[str, Any] = {
+        "h2h_best": {},
+        "h2h_market_probability": {},
+        "totals25_best": {},
+        "totals25_market_probability": {},
+        "bookmakers": 0,
+        "last_update": None,
+    }
+    odds_fetched = bool(st.session_state.get(odds_state_key))
+    if odds_fetched:
+        odds_events, odds_err, remaining_req = fetch_global_odds(sport_key, odds_key, odds_regions)
+        if odds_err:
+            st.warning(f"Odds API: {odds_err}")
         else:
-            odds_events = []
-            st.caption("Odds API: Click 'Fetch Odds API' to load market prices and blend into prediction.")
+            ev = match_odds_event(home_name, away_name, odds_events)
+            odds_parsed = parse_global_odds(ev, home_name, away_name)
+            if remaining_req is not None:
+                st.caption(f"Odds API requests remaining: `{remaining_req}` | Bookmakers: `{odds_parsed['bookmakers']}`")
 
-        odds_event = match_odds_event(home_name, away_name, odds_events)
-        odds = parse_global_odds(odds_event, home_name, away_name)
-
-        lfa_bundle = st.session_state.get(lfa_state_key, {})
-        summary = summarize_team_news(lfa_bundle, home_name, away_name) if lfa_bundle else {}
-        if lfa_bundle:
-            for err in lfa_bundle.get("errors", []):
-                st.warning(f"Live Football API: {err}")
-            if summary:
-                st.write({
-                    "Live Football match ID": summary["fixture_id"],
-                    f"{home_name} injuries": summary["home_injuries"] or "No reported entries / unavailable",
-                    f"{away_name} injuries": summary["away_injuries"] or "No reported entries / unavailable",
-                    f"{home_name} lineup confirmed": summary["home_lineup_confirmed"],
-                    f"{away_name} lineup confirmed": summary["away_lineup_confirmed"],
-                })
-                if summary.get("statistics_available"):
-                    st.caption(
-                        f"Fixture stats: {home_name} xG={summary['home_xg']} / SoT={summary['home_shots_on_target']}; "
-                        f"{away_name} xG={summary['away_xg']} / SoT={summary['away_shots_on_target']}."
-                    )
-
-        with st.expander("Manual tactical and motivation inputs", expanded=False):
-            st.caption("Analyst inputs: zero means neutral.")
-            c1, c2, c3, c4 = st.columns(4)
-            with c1:
-                home_motivation = st.slider("Home motivation", -2.0, 2.0, 0.0, 0.25, key=f"mot_h_{match_id}")
-            with c2:
-                away_motivation = st.slider("Away motivation", -2.0, 2.0, 0.0, 0.25, key=f"mot_a_{match_id}")
-            with c3:
-                home_tactical = st.slider("Home tactical adjustment", -2.0, 2.0, 0.0, 0.25, key=f"tac_h_{match_id}")
-            with c4:
-                away_tactical = st.slider("Away tactical adjustment", -2.0, 2.0, 0.0, 0.25, key=f"tac_a_{match_id}")
-
-        manual_context = {
-            "home_motivation": home_motivation,
-            "away_motivation": away_motivation,
-            "home_tactical": home_tactical,
-            "away_tactical": away_tactical,
-        }
-        prediction = predict_match(
-            match,
-            league_context,
-            manual_context=manual_context,
-            team_news=summary,
-            parsed_odds=odds if odds_event else None,
-            odds_weight=odds_weight,
-            attack_power=attack_power,
-        )
-        probs = prediction["probabilities"]
-        b1x2 = prediction["blended_1x2"]
-        top_scores = prediction["top_scores"]
-
-        st.markdown("#### Dashboard prediction — Top 2 Most Likely Scores")
-        sc1, sc2 = st.columns(2)
-        with sc1:
-            s1_h, s1_a = top_scores[0][0]
-            st.metric(
-                label="#1 Most Likely Score",
-                value=f"{s1_h} – {s1_a}",
-                delta=f"{top_scores[0][1] * 100:.1f}% probability",
-            )
-        with sc2:
-            s2_h, s2_a = top_scores[1][0]
-            st.metric(
-                label="#2 Most Likely Score",
-                value=f"{s2_h} – {s2_a}",
-                delta=f"{top_scores[1][1] * 100:.1f}% probability",
-            )
-
-        top3_line = "  |  ".join(
-            f"**#{idx} {h}–{a}** ({p * 100:.1f}%)"
-            for idx, ((h, a), p) in enumerate(top_scores, 1)
-        )
-        st.markdown(f"**Top 3 Exact Scores:** {top3_line}")
-
-        st.caption(
-            f"1X2 ({'Odds+Model blended' if prediction['odds_used'] else 'Model'}): "
-            f"Home {b1x2['home_win']*100:.1f}% | Draw {b1x2['draw']*100:.1f}% | Away {b1x2['away_win']*100:.1f}% | Over 2.5: {probs['over25']*100:.1f}%"
-        )
-
-        st.markdown("#### Goal Difference (ဂိုးပြတ်နိုင်ခြေ)")
-        gd_df = pd.DataFrame([
-            {"Goal Diff Market": "Home win by 2+ goals (GD >= +2)", "Probability": f"{probs['home_gd_2plus']*100:.1f}%"},
-            {"Goal Diff Market": "Home win by 3+ goals (GD >= +3)", "Probability": f"{probs['home_gd_3plus']*100:.1f}%"},
-            {"Goal Diff Market": "Away win by 2+ goals (GD <= -2)", "Probability": f"{probs['away_gd_2plus']*100:.1f}%"},
-            {"Goal Diff Market": "Away win by 3+ goals (GD <= -3)", "Probability": f"{probs['away_gd_3plus']*100:.1f}%"},
-            {"Goal Diff Market": "Any 2+ goal margin (|GD| >= 2)", "Probability": f"{probs['any_gd_2plus']*100:.1f}%"},
-            {"Goal Diff Market": "Expected Goal Difference (Home - Away)", "Probability": f"{probs['expected_gd']:+.2f} goals"},
-        ])
-        st.dataframe(gd_df, hide_index=True, use_container_width=True)
-
-        with st.expander("Model components and data quality", expanded=False):
-            st.write(f"Expected goals: home {prediction['home_lambda']:.2f}, away {prediction['away_lambda']:.2f} (Total {prediction['expected_total_goals']:.2f}) | Attacking power: {prediction['attack_power']:.2f}")
-            st.write(f"Elo: home {prediction['home_elo']:.0f}, away {prediction['away_elo']:.0f}; gap {prediction['elo_difference']:+.0f}.")
-            st.write(f"Recent rest days: home {prediction['home_rest_days'] if prediction['home_rest_days'] is not None else 'unknown'}, away {prediction['away_rest_days'] if prediction['away_rest_days'] is not None else 'unknown'}.")
-            st.write(f"Injuries: home {prediction['home_injury_count']}, away {prediction['away_injury_count']} | Lineup confirmed: home={prediction['home_lineup_confirmed']}, away={prediction['away_lineup_confirmed']}.")
-            st.write(f"Odds blended into prediction: {'Yes' if prediction['odds_used'] else 'No (fetch odds first)'} | Data quality: {prediction['data_quality']*100:.0f}%.")
-
-        if odds_event:
-            st.caption(f"Global odds: {odds['bookmakers']} bookmakers | last update: {odds['last_update'] or 'not provided'}")
-            render_value_finder(prediction, odds)
-        elif odds_bundle is not None:
-            st.info("No matching global odds were returned for this fixture.")
-        return prediction
-
-    cached_odds = st.session_state.get(odds_state_key, {})
-    cached_lfa = st.session_state.get(lfa_state_key, {})
-    ev_list = cached_odds.get("events", preloaded_odds_events or [])
-    ev_match = match_odds_event(home_name, away_name, ev_list)
-    parsed_ev = parse_global_odds(ev_match, home_name, away_name)
-    lfa_sum = summarize_team_news(cached_lfa, home_name, away_name) if cached_lfa else {}
-    return predict_match(
-        match,
-        league_context,
-        team_news=lfa_sum,
-        parsed_odds=parsed_ev if ev_match else None,
-        odds_weight=odds_weight,
-        attack_power=attack_power,
-    )
-
-
-def make_league_context(league_name: str, football_key: str, days_back: int) -> Tuple[Dict[str, Any], List[str]]:
-    league_code = LEAGUES[league_name]["football_data"]
-    start, end = finished_window(days_back)
-    results, result_error = fetch_finished_matches(league_code, football_key, start, end)
-    standings, standings_error = fetch_standings(league_code, football_key)
-    context = build_team_context(results, standings)
-    errors = [err for err in (result_error, standings_error) if err]
-    return context, errors
-
-
-def render_selected_league(
-    league_name: str,
-    football_key: str,
-    odds_key: str,
-    lfa_key: str,
-    regions: str,
-    odds_weight: float,
-    attack_power: float,
-    days_back: int,
-) -> None:
-    cfg = LEAGUES[league_name]
-    date_from, date_to, start, end = fixture_window(7)
-    fixtures_raw, fixtures_error = fetch_fixtures(cfg["football_data"], football_key, date_from, date_to)
-    fixtures = upcoming_only(fixtures_raw, start, end)
-    context, context_errors = make_league_context(league_name, football_key, days_back)
-
-    st.subheader(f"{league_name} — upcoming fixtures")
-    for err in context_errors:
-        st.warning(err)
-    if fixtures_error:
-        st.warning(fixtures_error)
-    if not fixtures:
-        st.info("No scheduled matches in the next 7 days, or football-data.org did not return fixture access for this competition.")
-        return
-    st.success(f"{len(fixtures)} fixture(s) found. Odds & Live Football calls run on demand per match.")
-    for match in fixtures:
-        render_fixture_card(
-            match,
-            league_name,
-            context,
-            odds_key,
-            cfg["odds"],
-            regions,
-            odds_weight,
-            attack_power,
+    live_fetched = bool(st.session_state.get(live_state_key))
+    team_news_raw: Dict[str, Any] = {"injuries": [], "lineups": [], "statistics": [], "errors": []}
+    team_news_summary: Dict[str, Any] = {"has_data": False}
+    if live_fetched:
+        team_news_raw = fetch_live_football_team_news(
             lfa_key,
-            cfg["lfa_league"],
-            preloaded_odds_events=None,
+            lfa_slug,
+            kickoff_date_str,
+            home_name,
+            away_name,
         )
+        team_news_summary = summarize_team_news(team_news_raw, home_name, away_name)
+        for err_msg in team_news_raw.get("errors", []):
+            st.caption(f"Live Football API note: {err_msg}")
 
-
-def render_top10(
-    football_key: str,
-    odds_key: str,
-    lfa_key: str,
-    regions: str,
-    odds_weight: float,
-    attack_power: float,
-    days_back: int,
-) -> None:
-    st.subheader("Daily Best Prediction Matches — Top 10 (Auto Odds Fetch)")
-    st.caption("Opening Top 10 automatically fetches Odds API for leagues present in the upcoming window.")
-    date_from, date_to, start, end = fixture_window(7)
-    entries: List[Dict[str, Any]] = []
-    errors: List[str] = []
-    active_leagues: Dict[str, Dict[str, Any]] = {}
-
-    for league_name, cfg in LEAGUES.items():
-        raw, fixture_error = fetch_fixtures(cfg["football_data"], football_key, date_from, date_to)
-        fixtures = upcoming_only(raw, start, end)
-        if fixture_error:
-            errors.append(f"{league_name}: {fixture_error}")
-        if not fixtures:
-            continue
-        active_leagues[league_name] = cfg
-        context, context_errors = make_league_context(league_name, football_key, days_back)
-        errors.extend(f"{league_name}: {err}" for err in context_errors)
-        for match in fixtures:
-            prediction = predict_match(match, context, attack_power=attack_power)
-            top_s = prediction["top_scores"]
-            entries.append({
-                "Match": f"{match.get('homeTeam', {}).get('name')} vs {match.get('awayTeam', {}).get('name')}",
-                "League": league_name,
-                "Kickoff (MMT)": local_datetime(match.get("utcDate")),
-                "#1 Score": f"{top_s[0][0][0]}–{top_s[0][0][1]} ({top_s[0][1]*100:.1f}%)",
-                "#2 Score": f"{top_s[1][0][0]}–{top_s[1][0][1]} ({top_s[1][1]*100:.1f}%)",
-                "#3 Score": f"{top_s[2][0][0]}–{top_s[2][0][1]} ({top_s[2][1]*100:.1f}%)",
-                "_rank": prediction["top_outcome_probability"] * (0.75 + 0.25 * prediction["data_quality"]),
-                "_fixture": match,
-                "_context": context,
-            })
-
-    for err in errors:
-        st.warning(err)
-    if not entries:
-        st.info("No upcoming fixtures were returned. Check provider keys, plan access, or fixture availability.")
-        return
-
-    odds_by_league: Dict[str, List[Dict[str, Any]]] = {}
-    if odds_key:
-        for lg_name, cfg in active_leagues.items():
-            ev_list, od_err, rem = fetch_global_odds(cfg["odds"], odds_key, regions)
-            odds_by_league[lg_name] = ev_list
-            if od_err:
-                st.caption(f"{lg_name} Odds: {od_err}")
-            elif rem is not None:
-                st.caption(f"{lg_name} Odds remaining quota: {rem}")
-
-    entries.sort(key=lambda row: row["_rank"], reverse=True)
-    top = entries[:10]
-    table = pd.DataFrame([{k: v for k, v in row.items() if not k.startswith("_")} for row in top])
-    st.dataframe(table, hide_index=True, use_container_width=True)
-
-    for rank, row in enumerate(top, 1):
-        st.markdown(f"#### #{rank} {row['Match']} — {row['League']}")
-        cfg = LEAGUES[row["League"]]
-        render_fixture_card(
-            row["_fixture"],
-            row["League"],
-            row["_context"],
-            odds_key,
-            cfg["odds"],
-            regions,
-            odds_weight,
-            attack_power,
-            lfa_key,
-            cfg["lfa_league"],
-            preloaded_odds_events=odds_by_league.get(row["League"], []),
-        )
-
-
-# -----------------------------
-# Main application
-# -----------------------------
-
-st.title("⚽ Professional Football Prediction Dashboard V8.5")
-st.markdown("Attacking Power 0.75 + Top 2 & Top 3 Exact Scores + On-demand Odds & Live Football API + Goal Difference")
-
-with st.sidebar:
-    st.header("API connection settings")
-    football_key = st.text_input("Football-data.org API token", value=safe_secret("FOOTBALL_DATA_API_KEY"), type="password")
-    odds_key = st.text_input("The Odds API key", value=safe_secret("THE_ODDS_API_KEY"), type="password")
-    lfa_key = st.text_input("Live Football API key", value=safe_secret("LIVE_FOOTBALL_API_KEY"), type="password")
-    regions_choice = st.multiselect("Global odds regions", ["eu", "uk", "us", "au"], default=["eu"])
-    odds_weight = st.slider("Odds weight in prediction", min_value=0.0, max_value=0.50, value=0.25, step=0.05)
-    attack_power = st.slider("Attacking power weight", min_value=0.50, max_value=1.00, value=DEFAULT_ATTACK_POWER, step=0.05)
-    days_back = st.slider("Recent match history used", min_value=60, max_value=300, value=210, step=30)
-    nav = st.radio("Navigation", ["Selected league", "Daily Best Top 10", "About the model"])
-
-regions = ",".join(regions_choice) if regions_choice else "eu"
-
-if nav == "Selected league":
-    selected_league = st.sidebar.selectbox("League", list(LEAGUES.keys()))
-    render_selected_league(selected_league, football_key, odds_key, lfa_key, regions, odds_weight, attack_power, days_back)
-elif nav == "Daily Best Top 10":
-    render_top10(football_key, odds_key, lfa_key, regions, odds_weight, attack_power, days_back)
-else:
-    st.subheader("Model layers and provider limitations")
-    st.markdown(
-        """
-- **Attacking power (0.75 default):** Amplifies venue-specific goal-rate differentials compared to standard square-root damping so high-scoring or dominant matchups separate more clearly.
-- **Top 2 & Top 3 Exact Scores:** Shows the #1 and #2 most likely exact scores with probabilities alongside the full Top 3 score breakdown.
-- **On-demand buttons:** Odds API and Live Football API buttons fetch data only when clicked in Selected League mode; Daily Best Top 10 auto-fetches Odds API.
-- **Goal Difference:** Displays probabilities for 2+ and 3+ goal margins for home and away teams alongside expected goal difference.
-        """
+    ratings_data = build_ratings_and_xg_stats(finished_raw, attack_power=attack_power)
+    model = predict_match(
+        home_name,
+        away_name,
+        kickoff_dt,
+        ratings_data,
+        home_tactical_adj=home_tac,
+        away_tactical_adj=away_tac,
+        odds_blend_weight=odds_blend,
+        odds_parsed=odds_parsed if odds_fetched else None,
+        injury_penalty_home=inj_pen_h,
+        injury_penalty_away=inj_pen_a,
     )
+    value_bets = build_value_bets(model, odds_parsed) if odds_fetched else []
+
+    # Top KPIs
+    p = model["probabilities"]
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric(f"{home_name} Win", f"{p['home_win']*100:.1f}%", f"Elo {model['home_elo']:.0f}")
+    m2.metric("Draw", f"{p['draw']*100:.1f}%")
+    m3.metric(f"{away_name} Win", f"{p['away_win']*100:.1f}%", f"Elo {model['away_elo']:.0f}")
+    m4.metric("Over 2.5 Goals", f"{p['over25']*100:.1f}%", f"xG {model['expected_total_goals']:.2f}")
+    m5.metric("Under 2.5 Goals", f"{p['under25']*100:.1f}%", f"Exp GD {model['expected_gd']:+.2f}")
+
+    # Detailed Burmese Analysis
+    analysis_md = build_detailed_burmese_analysis(
+        home_name=home_name,
+        away_name=away_name,
+        model=model,
+        odds_parsed=odds_parsed,
+        value_bets=value_bets,
+        team_news_summary=team_news_summary,
+        odds_fetched=odds_fetched,
+        live_fetched=live_fetched,
+    )
+    st.markdown(analysis_md)
+
+    st.divider()
+
+    # Supporting tables: Value Bet Finder + Top Scores + Team News
+    c_left, c_right = st.columns(2)
+    with c_left:
+        st.subheader("🎯 Value Bet Finder")
+        if odds_fetched and value_bets:
+            df_vb = pd.DataFrame(value_bets).drop(columns=["key"])
+            for col in ("Model probability", "No-vig market probability", "Edge", "Expected value"):
+                df_vb[col] = df_vb[col].apply(lambda v: f"{v*100:+.1f}%" if pd.notna(v) else "—")
+            df_vb["Best odds"] = df_vb["Best odds"].apply(lambda v: f"{v:.2f}")
+            st.dataframe(df_vb, use_container_width=True, hide_index=True)
+        else:
+            st.info("Value Bet table ကြည့်ရန် **Fetch Odds API** ကို နှိပ်ပါ။")
+
+        st.subheader("🔢 Top Exact Scores (Dixon-Coles)")
+        df_scores = pd.DataFrame(
+            [{"Score": sc, "Probability": f"{pr*100:.1f}%"} for sc, pr in model["top_scores"]]
+        )
+        st.dataframe(df_scores, use_container_width=True, hide_index=True)
+
+    with c_right:
+        st.subheader("🩺 Lineups & Injury List")
+        if live_fetched and team_news_summary.get("has_data"):
+            st.markdown(f"**{home_name} Injuries:** {', '.join(team_news_summary['home_injuries']) or 'None'}")
+            st.markdown(f"**{away_name} Injuries:** {', '.join(team_news_summary['away_injuries']) or 'None'}")
+            st.markdown(
+                f"**{home_name} Lineup ({team_news_summary.get('home_formation') or '—'}):** "
+                f"{', '.join(team_news_summary['home_lineup']) or 'Not available'}"
+            )
+            st.markdown(
+                f"**{away_name} Lineup ({team_news_summary.get('away_formation') or '—'}):** "
+                f"{', '.join(team_news_summary['away_lineup']) or 'Not available'}"
+            )
+        else:
+            st.info("Lineup နှင့် Injury စာရင်း ကြည့်ရန် **Fetch Live Football API** ကို နှိပ်ပါ။")
+
+
+if __name__ == "__main__":
+    main()
