@@ -16,6 +16,7 @@ Model:
 
 import math
 import re
+import time
 import unicodedata
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -474,6 +475,7 @@ def live_football_get(
     api_key: str,
     endpoint: str,
     params: Optional[Dict[str, Any]] = None,
+    retries_on_503: int = 1,
 ) -> Tuple[Optional[Any], Optional[str]]:
     if not api_key:
         return None, "Live Football API key is not configured."
@@ -483,21 +485,28 @@ def live_football_get(
     last_error = "No response from Live Football API."
 
     for base in LIVE_FOOTBALL_API_BASES:
-        payload, err, _ = http_json(
-            f"{base}/{clean_ep}",
-            headers={"Accept": "application/json"},
-            params=query_params,
-        )
-        if not err and payload is not None:
-            if isinstance(payload, dict) and payload.get("success") is False:
-                last_error = str(payload.get("message") or payload.get("error") or "API returned success=false")
+        attempts = 0
+        while True:
+            payload, err, _ = http_json(
+                f"{base}/{clean_ep}",
+                headers={"Accept": "application/json"},
+                params=query_params,
+            )
+            if not err and payload is not None:
+                if isinstance(payload, dict) and payload.get("success") is False:
+                    last_error = str(payload.get("message") or payload.get("error") or "API returned success=false")
+                    break
+                if isinstance(payload, dict) and payload.get("error"):
+                    last_error = str(payload["error"])
+                    break
+                return payload, None
+            if err:
+                last_error = err
+            if err and "503" in err and attempts < retries_on_503:
+                attempts += 1
+                time.sleep(1.0)
                 continue
-            if isinstance(payload, dict) and payload.get("error"):
-                last_error = str(payload["error"])
-                continue
-            return payload, None
-        if err:
-            last_error = err
+            break
     return None, last_error
 
 
@@ -568,51 +577,62 @@ def _find_match_id(
     home_name: str,
     away_name: str,
 ) -> Tuple[Optional[str], Dict[str, Any], Optional[str]]:
-    home_team_id = _resolve_lfa_team_id(api_key, league_id, home_name)
-    if not home_team_id:
-        return None, {}, "Could not determine team_id for home team."
+    # Primary: Home team ID; Fallback: Away team ID (useful when one team's endpoint returns 503)
+    candidate_team_ids: List[str] = []
+    for tid in (
+        _resolve_lfa_team_id(api_key, league_id, home_name),
+        _resolve_lfa_team_id(api_key, league_id, away_name),
+    ):
+        if tid and tid not in candidate_team_ids:
+            candidate_team_ids.append(tid)
 
-    payload, err = live_football_get(
-        api_key,
-        "team_matches",
-        params={"team_id": home_team_id},
-    )
-    if err:
-        return None, {}, err
+    if not candidate_team_ids:
+        return None, {}, "Could not determine team_id for home or away team."
 
-    data = _unwrap_data(payload)
-    matches = data.get("matches")
-    if not isinstance(matches, list):
-        return None, {}, None
-
-    # Pass 1: exact match on both teams and kickoff date
-    for m in matches:
-        if not isinstance(m, dict):
+    last_err: Optional[str] = None
+    for team_id in candidate_team_ids:
+        payload, err = live_football_get(
+            api_key,
+            "team_matches",
+            params={"team_id": team_id},
+        )
+        if err:
+            last_err = err
             continue
-        m_date = str(m.get("date") or "")[:10]
-        h_obj = m.get("home") if isinstance(m.get("home"), dict) else {}
-        a_obj = m.get("away") if isinstance(m.get("away"), dict) else {}
-        h_name = h_obj.get("name") or m.get("home_name") or ""
-        a_name = a_obj.get("name") or m.get("away_name") or ""
-        if same_team(home_name, h_name) and same_team(away_name, a_name):
-            mid = m.get("id") or m.get("match_id")
-            if mid and (not kickoff_date or m_date == kickoff_date):
-                return str(mid), m, None
 
-    # Pass 2: fallback match on both teams in case of UTC/local date boundary shift
-    for m in matches:
-        if not isinstance(m, dict):
+        data = _unwrap_data(payload)
+        matches = data.get("matches")
+        if not isinstance(matches, list):
             continue
-        h_obj = m.get("home") if isinstance(m.get("home"), dict) else {}
-        a_obj = m.get("away") if isinstance(m.get("away"), dict) else {}
-        h_name = h_obj.get("name") or m.get("home_name") or ""
-        a_name = a_obj.get("name") or m.get("away_name") or ""
-        if same_team(home_name, h_name) and same_team(away_name, a_name):
-            mid = m.get("id") or m.get("match_id")
-            if mid:
-                return str(mid), m, None
 
-    return None, {}, None
+        # Pass 1: exact match on both teams and kickoff date
+        for m in matches:
+            if not isinstance(m, dict):
+                continue
+            m_date = str(m.get("date") or "")[:10]
+            h_obj = m.get("home") if isinstance(m.get("home"), dict) else {}
+            a_obj = m.get("away") if isinstance(m.get("away"), dict) else {}
+            h_name = h_obj.get("name") or m.get("home_name") or ""
+            a_name = a_obj.get("name") or m.get("away_name") or ""
+            if same_team(home_name, h_name) and same_team(away_name, a_name):
+                mid = m.get("id") or m.get("match_id")
+                if mid and (not kickoff_date or m_date == kickoff_date):
+                    return str(mid), m, None
+
+        # Pass 2: fallback match on both teams in case of UTC/local date boundary shift
+        for m in matches:
+            if not isinstance(m, dict):
+                continue
+            h_obj = m.get("home") if isinstance(m.get("home"), dict) else {}
+            a_obj = m.get("away") if isinstance(m.get("away"), dict) else {}
+            h_name = h_obj.get("name") or m.get("home_name") or ""
+            a_name = a_obj.get("name") or m.get("away_name") or ""
+            if same_team(home_name, h_name) and same_team(away_name, a_name):
+                mid = m.get("id") or m.get("match_id")
+                if mid:
+                    return str(mid), m, None
+
+    return None, {}, last_err
 
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -638,9 +658,9 @@ def fetch_live_football_team_news(
     match_id, fixture_obj, match_err = _find_match_id(
         api_key, league_id, kickoff_date, home_name, away_name
     )
-    if match_err:
-        result["errors"].append(f"Team matches: {match_err}")
     if not match_id:
+        if match_err:
+            result["errors"].append(f"Team matches: {match_err}")
         result["errors"].append("Match ID not found on Live Football API for this fixture.")
         return result
 
