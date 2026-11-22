@@ -517,7 +517,7 @@ def _extract_items(payload: Any, keys: Tuple[str, ...]) -> List[Dict[str, Any]]:
             for k in keys:
                 val = data.get(k)
                 if isinstance(val, list):
-                    return [x for x in val if isinstance(x, dict)]
+                    return [x for x in val if isinstance(val, dict)]
     return []
 
 
@@ -850,7 +850,6 @@ def predict_match(
         4.50,
     )
 
-    # Dixon-Coles score matrix
     matrix = np.zeros((MAX_GOALS, MAX_GOALS), dtype=float)
     pmf_h = [math.exp(-lam_home) * (lam_home ** i) / math.factorial(i) for i in range(MAX_GOALS)]
     pmf_a = [math.exp(-lam_away) * (lam_away ** j) / math.factorial(j) for j in range(MAX_GOALS)]
@@ -889,7 +888,6 @@ def predict_match(
 
     score_list.sort(key=lambda x: x[1], reverse=True)
 
-    # Optional blend with no-vig market probabilities
     mkt_h2h = (odds_parsed or {}).get("h2h_market_probability") or {}
     if odds_blend_weight > 0 and all(k in mkt_h2h for k in ("home", "draw", "away")):
         w = clamp(odds_blend_weight, 0.0, 0.85)
@@ -937,6 +935,18 @@ def predict_match(
 # -----------------------------
 
 
+def _pick_score(prob: float, vb: Optional[Dict[str, Any]], odds_fetched: bool) -> float:
+    score = prob * 100.0
+    if odds_fetched and vb:
+        ev = vb.get("Expected value") or 0.0
+        edge = vb.get("Edge") or 0.0
+        if ev > 0:
+            score += ev * 45.0 + max(0.0, edge) * 60.0
+        elif ev < -0.05:
+            score += ev * 25.0
+    return score
+
+
 def build_detailed_burmese_analysis(
     home_name: str,
     away_name: str,
@@ -951,109 +961,121 @@ def build_detailed_burmese_analysis(
     gd = model["expected_gd"]
     lam_h = model["lam_home"]
     lam_a = model["lam_away"]
+    total_xg = lam_h + lam_a
 
     vb_by_key = {row["key"]: row for row in value_bets}
 
-    # Evaluate candidate picks across Home, Away, Over 2.5, Under 2.5
-    candidates_meta = [
-        ("home", f"အိမ်ကွင်းအသင်း ({home_name})", p["home_win"]),
-        ("away", f"အဝေးကွင်းအသင်း ({away_name})", p["away_win"]),
-        ("over25", "ဂိုးပေါင်းအပေါ် (Over 2.5 goals)", p["over25"]),
-        ("under25", "ဂိုးပေါင်းအောက် (Under 2.5 goals)", p["under25"]),
+    # Best team pick (Home vs Away)
+    home_score = _pick_score(p["home_win"], vb_by_key.get("home"), odds_fetched)
+    away_score = _pick_score(p["away_win"], vb_by_key.get("away"), odds_fetched)
+    if home_score >= away_score:
+        best_team_label = f"အိမ်ကွင်းအသင်း ({home_name})"
+        best_team_prob = p["home_win"]
+        best_team_vb = vb_by_key.get("home")
+    else:
+        best_team_label = f"အဝေးကွင်းအသင်း ({away_name})"
+        best_team_prob = p["away_win"]
+        best_team_vb = vb_by_key.get("away")
+
+    # Best totals pick (Over 2.5 vs Under 2.5)
+    over_score = _pick_score(p["over25"], vb_by_key.get("over25"), odds_fetched)
+    under_score = _pick_score(p["under25"], vb_by_key.get("under25"), odds_fetched)
+    if over_score >= under_score:
+        best_ou_label = "ဂိုးပေါင်းအပေါ် (Over 2.5 goals)"
+        best_ou_prob = p["over25"]
+        best_ou_vb = vb_by_key.get("over25")
+    else:
+        best_ou_label = "ဂိုးပေါင်းအောက် (Under 2.5 goals)"
+        best_ou_prob = p["under25"]
+        best_ou_vb = vb_by_key.get("under25")
+
+    # Overall best pick across all 4 options
+    overall_options = [
+        (best_team_label, best_team_prob, best_team_vb, home_score if home_score >= away_score else away_score),
+        (best_ou_label, best_ou_prob, best_ou_vb, max(over_score, under_score)),
     ]
-
-    def _score_candidate(key: str, prob: float) -> float:
-        vb = vb_by_key.get(key)
-        score = prob * 100.0
-        if vb:
-            ev = vb.get("Expected value") or 0.0
-            edge = vb.get("Edge") or 0.0
-            if ev > 0:
-                score += ev * 45.0 + max(0.0, edge) * 60.0
-            elif ev < -0.05:
-                score += ev * 25.0
-        return score
-
-    best_key, best_label, best_prob = max(
-        candidates_meta,
-        key=lambda item: _score_candidate(item[0], item[2]),
-    )
-    best_vb = vb_by_key.get(best_key)
+    best_overall_label, best_overall_prob, best_overall_vb, _ = max(overall_options, key=lambda x: x[3])
 
     lines: List[str] = ["### အသေးစိတ် သုံးသပ်ချက်", ""]
 
-    # 1. Best Overall Pick (Goals & Value focus like image 1)
-    best_line = f"၁။ **အရွေးချယ်သင့်ဆုံး - {best_label}:**"
-    lines.append(best_line)
-
-    detail_1 = f"ရွေးချယ်မှု၏ Model ဖြစ်နိုင်ခြေမှာ **{best_prob * 100:.1f}%** အထိ ရှိနေပြီး ခန့်မှန်းဂိုးစုစုပေါင်းမှာ **{lam_h + lam_a:.2f} ဂိုး** (အိမ်ကွင်း **{lam_h:.2f}** / အဝေးကွင်း **{lam_a:.2f}**) ဖြစ်ပါသည်။"
-    if odds_fetched and best_vb:
-        odds_val = best_vb["Best odds"]
-        ev_pct = (best_vb["Expected value"] or 0.0) * 100.0
-        edge_pp = (best_vb["Edge"] or 0.0) * 100.0
-        mkt_prob = best_vb.get("No-vig market probability")
-        mkt_str = f" (No-vig ဈေးကွက် {mkt_prob * 100:.1f}%)" if mkt_prob is not None else ""
-        detail_1 += f" အကောင်းဆုံး ပေါက်ကြေးမှာ **{odds_val:.2f}** ရှိနေပါတယ်။"
-        lines.append(f"  * {detail_1}")
-        ev_sign = "+" if ev_pct >= 0 else ""
-        edge_sign = "+" if edge_pp >= 0 else ""
+    # 1. Overall Best Pick summary
+    lines.append(f"၁။ **အရွေးချယ်သင့်ဆုံး - {best_overall_label}:**")
+    d1 = (
+        f"ရွေးချယ်မှု၏ Model ဖြစ်နိုင်ခြေမှာ **{best_overall_prob * 100:.1f}%** အထိ ရှိနေပြီး "
+        f"ခန့်မှန်းဂိုးစုစုပေါင်းမှာ **{total_xg:.2f} ဂိုး** (အိမ်ကွင်း **{lam_h:.2f}** / အဝေးကွင်း **{lam_a:.2f}**) ဖြစ်ပါသည်။"
+    )
+    if odds_fetched and best_overall_vb:
+        ov_odds = best_overall_vb["Best odds"]
+        ov_ev = (best_overall_vb["Expected value"] or 0.0) * 100.0
+        ov_edge = (best_overall_vb["Edge"] or 0.0) * 100.0
+        mkt_p = best_overall_vb.get("No-vig market probability")
+        mkt_txt = f" (No-vig ဈေးကွက် {mkt_p * 100:.1f}%)" if mkt_p is not None else ""
+        lines.append(f"  * {d1} အကောင်းဆုံး ပေါက်ကြေးမှာ **{ov_odds:.2f}** ရှိနေပါတယ်။")
         lines.append(
-            f"  * Value Bet Finder အရ Model နှင့် ဈေးကွက်ကွာဟချက် (**Edge {edge_sign}{edge_pp:.1f} pp**{mkt_str}) ရှိပြီး "
-            f"**Expected Value ({ev_sign}{ev_pct:.1f}%)** ဖြစ်သောကြောင့် နှိုင်းယှဉ်ရွေးချယ်မှုများထဲတွင် **Value** အကိုက်ညီဆုံး ဖြစ်ပါသည်။"
+            f"  * Value Bet Finder အရ Model နှင့် ဈေးကွက်ကွာဟချက် (**Edge {ov_edge:+.1f} pp**{mkt_txt}) ရှိပြီး "
+            f"**Expected Value ({ov_ev:+.1f}%)** ဖြစ်သောကြောင့် ရွေးချယ်မှုများထဲတွင် **Value** အကိုက်ညီဆုံး ဖြစ်ပါသည်။"
         )
     else:
-        lines.append(f"  * {detail_1}")
+        lines.append(f"  * {d1}")
         if not odds_fetched:
-            lines.append("  * Odds API မခေါ်ရသေးသဖြင့် ပေါက်ကြေးနှင့် EV တွက်ချက်မှု မပါဝင်သေးပါ (Odds API Fetch လုပ်ပါက Value Bet နှိုင်းယှဉ်ချက် ထည့်ပေးပါမည်)။")
+            lines.append("  * Odds API မခေါ်ရသေးသဖြင့် Value Bet (Odds / Edge / EV) တွက်ချက်မှု မပါဝင်သေးပါ။")
 
     lines.append("")
 
-    # 2. Team Selection: Home vs Away (like image 2)
+    # 2. Team Selection: Home vs Away + Dedicated Bottom Note (Single Best Pick)
     home_2p = p["home_2plus_goals"] * 100.0
     away_2p = p["away_2plus_goals"] * 100.0
-    gd_sign = "+" if gd >= 0 else ""
-    fav_team = f"အိမ်ကွင်းအသင်း ({home_name})" if p["home_win"] >= p["away_win"] else f"အဝေးကွင်းအသင်း ({away_name})"
-    fav_prob = max(p["home_win"], p["away_win"]) * 100.0
-
     lines.append(f"၂။ **အသင်းရွေးချယ်မှု - အိမ်ကွင်း ({home_name}) vs အဝေးကွင်း ({away_name}):**")
     lines.append(
-        f"  * အသင်းဘက်က ရွေးချယ်မည်ဆိုလျှင် **{fav_team}** က နိုင်ခြေ **{fav_prob:.1f}%** (အိမ်ကွင်း **{p['home_win']*100:.1f}%** / သရေ **{p['draw']*100:.1f}%** / အဝေးကွင်း **{p['away_win']*100:.1f}%**) ရှိပြီး "
-        f"ခန့်မှန်းဂိုးကွာခြားချက် (**Expected Goal Difference**) ကလည်း **{gd_sign}{gd:.2f} ဂိုး** ရှိပါသည်။"
+        f"  * အသင်းဘက်က နှိုင်းယှဉ်ကြည့်လျှင် အိမ်ကွင်း ({home_name}) နိုင်ခြေ **{p['home_win']*100:.1f}%**၊ "
+        f"သရေ **{p['draw']*100:.1f}%**၊ အဝေးကွင်း ({away_name}) နိုင်ခြေ **{p['away_win']*100:.1f}%** ရှိပြီး "
+        f"ခန့်မှန်းဂိုးကွာခြားချက် (**Expected Goal Difference**) ကလည်း **{gd:+.2f} ဂိုး** ဖြစ်ပါသည်။"
     )
     lines.append(
-        f"  * ထို့အပြင် **{home_name}** က ၂ ဂိုးပြတ်နိုင်ခြေ **{home_2p:.1f}%** ရှိပြီး **{away_name}** က ၂ ဂိုးပြတ်နိုင်ခြေ **{away_2p:.1f}%** ရှိသဖြင့် "
-        f"နှစ်သင်း၏ တိုက်စစ်/ခံစစ် ဟန်ချက်ကို ရှင်းရှင်းလင်းလင်း နှိုင်းယှဉ်နိုင်ပါသည်။"
+        f"  * ထို့အပြင် {home_name} က ၂ ဂိုးပြတ်နိုင်ခြေ **{home_2p:.1f}%** ရှိပြီး {away_name} က ၂ ဂိုးပြတ်နိုင်ခြေ **{away_2p:.1f}%** ရှိသဖြင့် "
+        f"နှစ်သင်း၏ တိုက်စစ်/ခံစစ် ဟန်ချက်ကို နှိုင်းယှဉ်နိုင်ပါသည်။"
     )
 
-    if odds_fetched and value_bets:
-        h_vb = vb_by_key.get("home")
-        a_vb = vb_by_key.get("away")
-        vb_notes: List[str] = []
+    h_vb = vb_by_key.get("home")
+    a_vb = vb_by_key.get("away")
+    if odds_fetched and (h_vb or a_vb):
+        vb_parts: List[str] = []
         if h_vb:
-            vb_notes.append(
-                f"အိမ်ကွင်း Odds {h_vb['Best odds']:.2f} / EV {(h_vb['Expected value'] or 0)*100:+.1f}%"
-            )
+            vb_parts.append(f"အိမ်ကွင်း Odds {h_vb['Best odds']:.2f} / EV {(h_vb['Expected value'] or 0)*100:+.1f}%")
         if a_vb:
-            vb_notes.append(
-                f"အဝေးကွင်း Odds {a_vb['Best odds']:.2f} / EV {(a_vb['Expected value'] or 0)*100:+.1f}%"
-            )
-        if vb_notes:
-            lines.append(f"  * **Value Bet Finder (1X2):** {' | '.join(vb_notes)} ဖြစ်ပါသည်။")
+            vb_parts.append(f"အဝေးကွင်း Odds {a_vb['Best odds']:.2f} / EV {(a_vb['Expected value'] or 0)*100:+.1f}%")
+        lines.append(f"  * **Value Bet Finder (1X2):** {' | '.join(vb_parts)} ဖြစ်ပါသည်။")
+
+    team_note_extra = ""
+    if odds_fetched and best_team_vb:
+        team_note_extra = f" (Odds {best_team_vb['Best odds']:.2f}, EV {(best_team_vb['Expected value'] or 0)*100:+.1f}%)"
+    lines.append(
+        f"  * **အသင်းရွေးချယ်မှု အောက်ခြေမှတ်ချက် — ရွေးချယ်လို့ အကောင်းဆုံးမှာ {best_team_label} "
+        f"(Model {best_team_prob*100:.1f}%{team_note_extra}) ဖြစ်ပါသည်။**"
+    )
 
     lines.append("")
 
-    # 3. Over 2.5 vs Under 2.5 Comparison
+    # 3. Totals Selection: Over 2.5 vs Under 2.5 + Dedicated Bottom Note (Single Best Pick)
     lines.append("၃။ **ဂိုးပေါင်းရွေးချယ်မှု - ဂိုးပေါင်းအပေါ် (Over 2.5) vs ဂိုးပေါင်းအောက် (Under 2.5):**")
-    over_note = f"ဂိုးပေါင်းအပေါ် (Over 2.5) ဖြစ်နိုင်ခြေ **{p['over25']*100:.1f}%**"
-    under_note = f"ဂိုးပေါင်းအောက် (Under 2.5) ဖြစ်နိုင်ခြေ **{p['under25']*100:.1f}%**"
+    over_txt = f"ဂိုးပေါင်းအပေါ် (Over 2.5) ဖြစ်နိုင်ခြေ **{p['over25']*100:.1f}%**"
+    under_txt = f"ဂိုးပေါင်းအောက် (Under 2.5) ဖြစ်နိုင်ခြေ **{p['under25']*100:.1f}%**"
     if odds_fetched:
         o_vb = vb_by_key.get("over25")
         u_vb = vb_by_key.get("under25")
         if o_vb:
-            over_note += f" (Best Odds {o_vb['Best odds']:.2f}, EV {(o_vb['Expected value'] or 0)*100:+.1f}%)"
+            over_txt += f" (Best Odds {o_vb['Best odds']:.2f}, EV {(o_vb['Expected value'] or 0)*100:+.1f}%)"
         if u_vb:
-            under_note += f" (Best Odds {u_vb['Best odds']:.2f}, EV {(u_vb['Expected value'] or 0)*100:+.1f}%)"
-    lines.append(f"  * {over_note} နှင့် {under_note} ရှိပြီး မျှော်မှန်းဂိုးစုစုပေါင်းမှာ **{lam_h + lam_a:.2f} ဂိုး** ဖြစ်ပါသည်။")
+            under_txt += f" (Best Odds {u_vb['Best odds']:.2f}, EV {(u_vb['Expected value'] or 0)*100:+.1f}%)"
+    lines.append(f"  * {over_txt} နှင့် {under_txt} ရှိပြီး မျှော်မှန်းဂိုးစုစုပေါင်းမှာ **{total_xg:.2f} ဂိုး** ဖြစ်ပါသည်။")
+
+    ou_note_extra = ""
+    if odds_fetched and best_ou_vb:
+        ou_note_extra = f" (Odds {best_ou_vb['Best odds']:.2f}, EV {(best_ou_vb['Expected value'] or 0)*100:+.1f}%)"
+    lines.append(
+        f"  * **ဂိုးပေါင်းရွေးချယ်မှု အောက်ခြေမှတ်ချက် — ရွေးချယ်လို့ အကောင်းဆုံးမှာ {best_ou_label} "
+        f"(Model {best_ou_prob*100:.1f}%{ou_note_extra}) ဖြစ်ပါသည်။**"
+    )
 
     lines.append("")
 
@@ -1157,7 +1179,6 @@ def main() -> None:
     kickoff_dt = parse_datetime(match.get("utcDate"))
     kickoff_date_str = kickoff_dt.astimezone(LOCAL_TZ).strftime("%Y-%m-%d") if kickoff_dt else utc_now().date().isoformat()
 
-    # Session state for on-demand API fetches
     odds_state_key = f"odds_fetched_{comp_code}"
     live_state_key = f"live_fetched_{comp_code}_{normalize_team(home_name)}_{normalize_team(away_name)}_{kickoff_date_str}"
 
@@ -1223,7 +1244,6 @@ def main() -> None:
     )
     value_bets = build_value_bets(model, odds_parsed) if odds_fetched else []
 
-    # Top KPIs
     p = model["probabilities"]
     m1, m2, m3, m4, m5 = st.columns(5)
     m1.metric(f"{home_name} Win", f"{p['home_win']*100:.1f}%", f"Elo {model['home_elo']:.0f}")
@@ -1232,7 +1252,6 @@ def main() -> None:
     m4.metric("Over 2.5 Goals", f"{p['over25']*100:.1f}%", f"xG {model['expected_total_goals']:.2f}")
     m5.metric("Under 2.5 Goals", f"{p['under25']*100:.1f}%", f"Exp GD {model['expected_gd']:+.2f}")
 
-    # Detailed Burmese Analysis
     analysis_md = build_detailed_burmese_analysis(
         home_name=home_name,
         away_name=away_name,
@@ -1247,7 +1266,6 @@ def main() -> None:
 
     st.divider()
 
-    # Supporting tables: Value Bet Finder + Top Scores + Team News
     c_left, c_right = st.columns(2)
     with c_left:
         st.subheader("🎯 Value Bet Finder")
