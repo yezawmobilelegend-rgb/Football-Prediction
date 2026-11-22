@@ -39,7 +39,6 @@ FOOTBALL_DATA_BASE = "https://api.football-data.org/v4"
 ODDS_API_BASE = "https://api.the-odds-api.com/v4"
 LIVE_FOOTBALL_API_BASES = [
     "https://live-football-api.com/api/v1",
-    "https://api.live-football-api.com/v1",
 ]
 REQUEST_TIMEOUT = 18
 MODEL_VERSION = "elo-dixon-coles-v8.5"
@@ -140,13 +139,13 @@ TEAM_ALIASES: Dict[str, str] = {
 }
 
 LEAGUES: Dict[str, Dict[str, Any]] = {
-    "England Premier League": {"football_data": "PL", "odds": "soccer_epl", "lfa_league": "premier-league"},
-    "Spain LaLiga": {"football_data": "PD", "odds": "soccer_spain_la_liga", "lfa_league": "la-liga"},
-    "Germany Bundesliga": {"football_data": "BL1", "odds": "soccer_germany_bundesliga", "lfa_league": "bundesliga"},
-    "Italy Serie A": {"football_data": "SA", "odds": "soccer_italy_serie_a", "lfa_league": "serie-a"},
-    "France Ligue 1": {"football_data": "FL1", "odds": "soccer_france_ligue_one", "lfa_league": "ligue-1"},
-    "UEFA Champions League": {"football_data": "CL", "odds": "soccer_uefa_champs_league", "lfa_league": "champions-league"},
-    "UEFA Europa League": {"football_data": "EL", "odds": "soccer_uefa_europa_league", "lfa_league": "europa-league"},
+    "England Premier League": {"football_data": "PL", "odds": "soccer_epl", "lfa_league": "lfa-premier-league"},
+    "Spain LaLiga": {"football_data": "PD", "odds": "soccer_spain_la_liga", "lfa_league": "lfa-la-liga"},
+    "Germany Bundesliga": {"football_data": "BL1", "odds": "soccer_germany_bundesliga", "lfa_league": "lfa-bundesliga"},
+    "Italy Serie A": {"football_data": "SA", "odds": "soccer_italy_serie_a", "lfa_league": "lfa-serie-a"},
+    "France Ligue 1": {"football_data": "FL1", "odds": "soccer_france_ligue_one", "lfa_league": "lfa-ligue-1"},
+    "UEFA Champions League": {"football_data": "CL", "odds": "soccer_uefa_champs_league", "lfa_league": "lfa-champions-league"},
+    "UEFA Europa League": {"football_data": "EL", "odds": "soccer_uefa_europa_league", "lfa_league": "lfa-europa-league"},
 }
 
 
@@ -473,58 +472,153 @@ def build_value_bets(model: Dict[str, Any], odds: Dict[str, Any]) -> List[Dict[s
 
 def live_football_get(
     api_key: str,
-    endpoints: Iterable[str],
+    endpoint: str,
     params: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[Any], Optional[str]]:
     if not api_key:
         return None, "Live Football API key is not configured."
     query_params = dict(params or {})
     query_params["api_key"] = api_key
+    clean_ep = endpoint.lstrip("/")
     last_error = "No response from Live Football API."
 
     for base in LIVE_FOOTBALL_API_BASES:
-        for ep in endpoints:
-            clean_ep = ep.lstrip("/")
-            payload, err, _ = http_json(
-                f"{base}/{clean_ep}",
-                headers={"Accept": "application/json"},
-                params=query_params,
-            )
-            if not err and payload is not None:
-                if isinstance(payload, dict) and payload.get("error"):
-                    last_error = str(payload["error"])
-                    continue
-                return payload, None
-            if err:
-                last_error = err
+        payload, err, _ = http_json(
+            f"{base}/{clean_ep}",
+            headers={"Accept": "application/json"},
+            params=query_params,
+        )
+        if not err and payload is not None:
+            if isinstance(payload, dict) and payload.get("success") is False:
+                last_error = str(payload.get("message") or payload.get("error") or "API returned success=false")
+                continue
+            if isinstance(payload, dict) and payload.get("error"):
+                last_error = str(payload["error"])
+                continue
+            return payload, None
+        if err:
+            last_error = err
     return None, last_error
 
 
-def _extract_items(payload: Any, keys: Tuple[str, ...]) -> List[Dict[str, Any]]:
-    if isinstance(payload, list):
-        return [x for x in payload if isinstance(x, dict)]
+def _unwrap_data(payload: Any) -> Dict[str, Any]:
     if isinstance(payload, dict):
-        for k in keys:
-            val = payload.get(k)
-            if isinstance(val, list):
-                return [x for x in val if isinstance(x, dict)]
-            if isinstance(val, dict):
-                return [val]
-        data = payload.get("data")
-        if isinstance(data, list):
-            return [x for x in data if isinstance(x, dict)]
-        if isinstance(data, dict):
-            for k in keys:
-                val = data.get(k)
-                if isinstance(val, list):
-                    return [x for x in val if isinstance(val, dict)]
-    return []
+        inner = payload.get("data")
+        if isinstance(inner, dict):
+            return inner
+        return payload
+    return {}
+
+
+def _guess_lfa_team_id(team_name: str) -> str:
+    norm = normalize_team(team_name)
+    slug = re.sub(r"[^a-z0-9]+", "-", norm).strip("-")
+    return f"lfa-{slug}" if slug else ""
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_lfa_team_id_map(api_key: str, league_id: str) -> Dict[str, str]:
+    """Return {normalized_team_name: lfa_team_id} from /league_standings."""
+    mapping: Dict[str, str] = {}
+    if not api_key or not league_id:
+        return mapping
+
+    payload, err = live_football_get(api_key, "league_standings", params={"league_id": league_id})
+    if err or not isinstance(payload, dict):
+        return mapping
+
+    data = _unwrap_data(payload)
+    blocks = data.get("standings")
+    if not isinstance(blocks, list):
+        return mapping
+
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        table = block.get("table")
+        if not isinstance(table, list):
+            continue
+        for row in table:
+            if not isinstance(row, dict):
+                continue
+            team = row.get("team") if isinstance(row.get("team"), dict) else {}
+            t_id = team.get("id")
+            t_name = team.get("name")
+            if t_id and t_name:
+                mapping[normalize_team(t_name)] = str(t_id)
+
+    return mapping
+
+
+def _resolve_lfa_team_id(api_key: str, league_id: str, team_name: str) -> str:
+    id_map = fetch_lfa_team_id_map(api_key, league_id)
+    norm = normalize_team(team_name)
+    if norm in id_map:
+        return id_map[norm]
+    for k, v in id_map.items():
+        if same_team(team_name, k):
+            return v
+    return _guess_lfa_team_id(team_name)
+
+
+def _find_match_id(
+    api_key: str,
+    league_id: str,
+    kickoff_date: str,
+    home_name: str,
+    away_name: str,
+) -> Tuple[Optional[str], Dict[str, Any], Optional[str]]:
+    home_team_id = _resolve_lfa_team_id(api_key, league_id, home_name)
+    if not home_team_id:
+        return None, {}, "Could not determine team_id for home team."
+
+    payload, err = live_football_get(
+        api_key,
+        "team_matches",
+        params={"team_id": home_team_id},
+    )
+    if err:
+        return None, {}, err
+
+    data = _unwrap_data(payload)
+    matches = data.get("matches")
+    if not isinstance(matches, list):
+        return None, {}, None
+
+    # Pass 1: exact match on both teams and kickoff date
+    for m in matches:
+        if not isinstance(m, dict):
+            continue
+        m_date = str(m.get("date") or "")[:10]
+        h_obj = m.get("home") if isinstance(m.get("home"), dict) else {}
+        a_obj = m.get("away") if isinstance(m.get("away"), dict) else {}
+        h_name = h_obj.get("name") or m.get("home_name") or ""
+        a_name = a_obj.get("name") or m.get("away_name") or ""
+        if same_team(home_name, h_name) and same_team(away_name, a_name):
+            mid = m.get("id") or m.get("match_id")
+            if mid and (not kickoff_date or m_date == kickoff_date):
+                return str(mid), m, None
+
+    # Pass 2: fallback match on both teams in case of UTC/local date boundary shift
+    for m in matches:
+        if not isinstance(m, dict):
+            continue
+        h_obj = m.get("home") if isinstance(m.get("home"), dict) else {}
+        a_obj = m.get("away") if isinstance(m.get("away"), dict) else {}
+        h_name = h_obj.get("name") or m.get("home_name") or ""
+        a_name = a_obj.get("name") or m.get("away_name") or ""
+        if same_team(home_name, h_name) and same_team(away_name, a_name):
+            mid = m.get("id") or m.get("match_id")
+            if mid:
+                return str(mid), m, None
+
+    return None, {}, None
 
 
 @st.cache_data(ttl=900, show_spinner=False)
 def fetch_live_football_team_news(
     api_key: str,
-    league_slug: str,
+    league_id: str,
     kickoff_date: str,
     home_name: str,
     away_name: str,
@@ -532,83 +626,63 @@ def fetch_live_football_team_news(
     result: Dict[str, Any] = {
         "match_id": None,
         "fixture": {},
-        "injuries": [],
-        "lineups": [],
-        "statistics": [],
+        "injuries": {"home": [], "away": []},
+        "lineups": {},
+        "statistics": {},
         "errors": [],
     }
     if not api_key:
         result["errors"].append("Live Football API key is not configured.")
         return result
 
-    fixtures_payload, fixture_err = live_football_get(
-        api_key,
-        endpoints=("fixtures", "matches", "events"),
-        params={"league": league_slug, "date": kickoff_date},
+    match_id, fixture_obj, match_err = _find_match_id(
+        api_key, league_id, kickoff_date, home_name, away_name
     )
-    if fixture_err:
-        result["errors"].append(f"Fixtures lookup: {fixture_err}")
+    if match_err:
+        result["errors"].append(f"Team matches: {match_err}")
+    if not match_id:
+        result["errors"].append("Match ID not found on Live Football API for this fixture.")
+        return result
 
-    matched_fixture: Dict[str, Any] = {}
-    for item in _extract_items(fixtures_payload, ("fixtures", "matches", "events", "results")):
-        f_home = (
-            item.get("home_team")
-            or item.get("home")
-            or (item.get("teams", {}).get("home", {}).get("name") if isinstance(item.get("teams"), dict) else None)
-        )
-        f_away = (
-            item.get("away_team")
-            or item.get("away")
-            or (item.get("teams", {}).get("away", {}).get("name") if isinstance(item.get("teams"), dict) else None)
-        )
-        if same_team(home_name, f_home) and same_team(away_name, f_away):
-            matched_fixture = item
-            break
-
-    result["fixture"] = matched_fixture
-    match_id = (
-        matched_fixture.get("id")
-        or matched_fixture.get("match_id")
-        or matched_fixture.get("fixture_id")
-    )
     result["match_id"] = match_id
+    result["fixture"] = fixture_obj
 
-    detail_params: Dict[str, Any] = {"league": league_slug, "date": kickoff_date}
-    if match_id is not None:
-        detail_params["match_id"] = match_id
-        detail_params["id"] = match_id
-
-    inj_payload, inj_err = live_football_get(
-        api_key,
-        endpoints=("injuries", "match/injuries", "fixture/injuries"),
-        params=detail_params,
-    )
+    inj_payload, inj_err = live_football_get(api_key, "injuries", params={"match_id": match_id})
     if inj_err:
         result["errors"].append(f"Injuries: {inj_err}")
     else:
-        result["injuries"] = _extract_items(inj_payload, ("injuries", "sidelined", "absences"))
+        inj_data = _unwrap_data(inj_payload).get("injuries", {})
+        if isinstance(inj_data, dict):
+            result["injuries"] = {
+                "home": inj_data.get("home") if isinstance(inj_data.get("home"), list) else [],
+                "away": inj_data.get("away") if isinstance(inj_data.get("away"), list) else [],
+            }
 
-    lineup_payload, lineup_err = live_football_get(
-        api_key,
-        endpoints=("lineups", "match/lineups", "fixture/lineups"),
-        params=detail_params,
-    )
-    if lineup_err:
-        result["errors"].append(f"Lineups: {lineup_err}")
+    line_payload, line_err = live_football_get(api_key, "lineups", params={"match_id": match_id})
+    if line_err:
+        result["errors"].append(f"Lineups: {line_err}")
     else:
-        result["lineups"] = _extract_items(lineup_payload, ("lineups", "lineup", "starting_xi"))
-
-    stats_payload, stats_err = live_football_get(
-        api_key,
-        endpoints=("statistics", "stats", "match/statistics", "fixture/statistics"),
-        params=detail_params,
-    )
-    if stats_err:
-        result["errors"].append(f"Statistics: {stats_err}")
-    else:
-        result["statistics"] = _extract_items(stats_payload, ("statistics", "stats"))
+        line_data = _unwrap_data(line_payload)
+        if isinstance(line_data, dict) and line_data:
+            result["lineups"] = line_data
 
     return result
+
+
+def _extract_player_names(items: Any) -> List[str]:
+    names: List[str] = []
+    if isinstance(items, list):
+        for p in items:
+            if isinstance(p, dict):
+                p_obj = p.get("player") if isinstance(p.get("player"), dict) else p
+                p_name = p_obj.get("name") or p_obj.get("player_name")
+                if p_name:
+                    names.append(str(p_name))
+            elif isinstance(p, str) and p.strip():
+                names.append(p.strip())
+    elif isinstance(items, str) and items.strip():
+        names = [x.strip() for x in items.split(",") if x.strip()]
+    return names
 
 
 def summarize_team_news(team_news: Dict[str, Any], home_name: str, away_name: str) -> Dict[str, Any]:
@@ -616,59 +690,64 @@ def summarize_team_news(team_news: Dict[str, Any], home_name: str, away_name: st
     away_injuries: List[str] = []
     other_injuries: List[str] = []
 
-    for row in team_news.get("injuries", []):
-        player = (
-            row.get("player_name")
-            or row.get("player")
-            or (row.get("player", {}).get("name") if isinstance(row.get("player"), dict) else None)
-            or "Unknown Player"
-        )
-        reason = row.get("reason") or row.get("type") or row.get("status") or "Injured/Out"
-        t_name = (
-            row.get("team_name")
-            or row.get("team")
-            or (row.get("team", {}).get("name") if isinstance(row.get("team"), dict) else "")
-        )
-        label = f"{player} ({reason})"
-        if same_team(t_name, home_name):
-            home_injuries.append(label)
-        elif same_team(t_name, away_name):
-            away_injuries.append(label)
-        else:
-            other_injuries.append(f"{t_name}: {label}".strip(": "))
+    inj_raw = team_news.get("injuries")
+    if isinstance(inj_raw, dict):
+        for side_key, target_list in (("home", home_injuries), ("away", away_injuries)):
+            for row in inj_raw.get(side_key) or []:
+                if not isinstance(row, dict):
+                    continue
+                player = (
+                    row.get("player_name")
+                    or row.get("name")
+                    or (row.get("player", {}).get("name") if isinstance(row.get("player"), dict) else None)
+                    or "Unknown Player"
+                )
+                reason = row.get("status") or row.get("reason") or row.get("type") or "Injured/Out"
+                target_list.append(f"{player} ({reason})")
+    elif isinstance(inj_raw, list):
+        for row in inj_raw:
+            if not isinstance(row, dict):
+                continue
+            player = row.get("player_name") or row.get("name") or "Unknown Player"
+            reason = row.get("status") or row.get("reason") or row.get("type") or "Injured/Out"
+            t_name = row.get("team_name") or row.get("team") or ""
+            label = f"{player} ({reason})"
+            if same_team(t_name, home_name):
+                home_injuries.append(label)
+            elif same_team(t_name, away_name):
+                away_injuries.append(label)
+            else:
+                other_injuries.append(f"{t_name}: {label}".strip(": "))
 
+    lineups_raw = team_news.get("lineups") or {}
     home_lineup: List[str] = []
     away_lineup: List[str] = []
     home_formation: Optional[str] = None
     away_formation: Optional[str] = None
 
-    for row in team_news.get("lineups", []):
-        t_name = (
-            row.get("team_name")
-            or row.get("team")
-            or (row.get("team", {}).get("name") if isinstance(row.get("team"), dict) else "")
-        )
-        formation = row.get("formation") or row.get("system")
-        players_raw = row.get("startXI") or row.get("starting_xi") or row.get("players") or row.get("lineup") or []
-        names: List[str] = []
-        if isinstance(players_raw, list):
-            for p in players_raw:
-                if isinstance(p, dict):
-                    p_obj = p.get("player") if isinstance(p.get("player"), dict) else p
-                    p_name = p_obj.get("name") or p_obj.get("player_name")
-                    if p_name:
-                        names.append(str(p_name))
-                elif isinstance(p, str) and p.strip():
-                    names.append(p.strip())
-        elif isinstance(players_raw, str) and players_raw.strip():
-            names = [x.strip() for x in players_raw.split(",") if x.strip()]
+    if isinstance(lineups_raw, dict):
+        form_obj = lineups_raw.get("formation")
+        if isinstance(form_obj, dict):
+            home_formation = str(form_obj.get("home")) if form_obj.get("home") is not None else None
+            away_formation = str(form_obj.get("away")) if form_obj.get("away") is not None else None
+        elif form_obj is not None:
+            home_formation = str(form_obj)
 
-        if same_team(t_name, home_name):
-            home_formation = formation or home_formation
-            home_lineup.extend(names)
-        elif same_team(t_name, away_name):
-            away_formation = formation or away_formation
-            away_lineup.extend(names)
+        h_side = lineups_raw.get("home")
+        if isinstance(h_side, dict):
+            home_lineup = _extract_player_names(h_side.get("starting") or h_side.get("startXI") or h_side.get("lineup"))
+            if not home_formation and h_side.get("formation"):
+                home_formation = str(h_side.get("formation"))
+        elif isinstance(h_side, list):
+            home_lineup = _extract_player_names(h_side)
+
+        a_side = lineups_raw.get("away")
+        if isinstance(a_side, dict):
+            away_lineup = _extract_player_names(a_side.get("starting") or a_side.get("startXI") or a_side.get("lineup"))
+            if not away_formation and a_side.get("formation"):
+                away_formation = str(a_side.get("formation"))
+        elif isinstance(a_side, list):
+            away_lineup = _extract_player_names(a_side)
 
     has_data = bool(
         home_injuries or away_injuries or other_injuries or home_lineup or away_lineup or team_news.get("fixture")
@@ -965,7 +1044,6 @@ def build_detailed_burmese_analysis(
 
     vb_by_key = {row["key"]: row for row in value_bets}
 
-    # Best team pick (Home vs Away)
     home_score = _pick_score(p["home_win"], vb_by_key.get("home"), odds_fetched)
     away_score = _pick_score(p["away_win"], vb_by_key.get("away"), odds_fetched)
     if home_score >= away_score:
@@ -977,7 +1055,6 @@ def build_detailed_burmese_analysis(
         best_team_prob = p["away_win"]
         best_team_vb = vb_by_key.get("away")
 
-    # Best totals pick (Over 2.5 vs Under 2.5)
     over_score = _pick_score(p["over25"], vb_by_key.get("over25"), odds_fetched)
     under_score = _pick_score(p["under25"], vb_by_key.get("under25"), odds_fetched)
     if over_score >= under_score:
@@ -989,7 +1066,6 @@ def build_detailed_burmese_analysis(
         best_ou_prob = p["under25"]
         best_ou_vb = vb_by_key.get("under25")
 
-    # Overall best pick across all 4 options
     overall_options = [
         (best_team_label, best_team_prob, best_team_vb, home_score if home_score >= away_score else away_score),
         (best_ou_label, best_ou_prob, best_ou_vb, max(over_score, under_score)),
@@ -998,7 +1074,6 @@ def build_detailed_burmese_analysis(
 
     lines: List[str] = ["### အသေးစိတ် သုံးသပ်ချက်", ""]
 
-    # 1. Overall Best Pick summary
     lines.append(f"၁။ **အရွေးချယ်သင့်ဆုံး - {best_overall_label}:**")
     d1 = (
         f"ရွေးချယ်မှု၏ Model ဖြစ်နိုင်ခြေမှာ **{best_overall_prob * 100:.1f}%** အထိ ရှိနေပြီး "
@@ -1022,7 +1097,6 @@ def build_detailed_burmese_analysis(
 
     lines.append("")
 
-    # 2. Team Selection: Home vs Away + Dedicated Bottom Note (Single Best Pick)
     home_2p = p["home_2plus_goals"] * 100.0
     away_2p = p["away_2plus_goals"] * 100.0
     lines.append(f"၂။ **အသင်းရွေးချယ်မှု - အိမ်ကွင်း ({home_name}) vs အဝေးကွင်း ({away_name}):**")
@@ -1056,7 +1130,6 @@ def build_detailed_burmese_analysis(
 
     lines.append("")
 
-    # 3. Totals Selection: Over 2.5 vs Under 2.5 + Dedicated Bottom Note (Single Best Pick)
     lines.append("၃။ **ဂိုးပေါင်းရွေးချယ်မှု - ဂိုးပေါင်းအပေါ် (Over 2.5) vs ဂိုးပေါင်းအောက် (Under 2.5):**")
     over_txt = f"ဂိုးပေါင်းအပေါ် (Over 2.5) ဖြစ်နိုင်ခြေ **{p['over25']*100:.1f}%**"
     under_txt = f"ဂိုးပေါင်းအောက် (Under 2.5) ဖြစ်နိုင်ခြေ **{p['under25']*100:.1f}%**"
@@ -1079,7 +1152,6 @@ def build_detailed_burmese_analysis(
 
     lines.append("")
 
-    # 4. Live Football API: Lineups & Injury List
     lines.append("၄။ **Lineup နှင့် Injury List သုံးသပ်ချက် (Live Football API):**")
     if live_fetched and team_news_summary.get("has_data"):
         h_inj = team_news_summary.get("home_injuries") or []
@@ -1141,7 +1213,7 @@ def main() -> None:
     league_cfg = LEAGUES[league_name]
     comp_code = league_cfg["football_data"]
     sport_key = league_cfg["odds"]
-    lfa_slug = league_cfg["lfa_league"]
+    lfa_league_id = league_cfg["lfa_league"]
 
     d_from, d_to, win_start, win_end = fixture_window(days_ahead)
     hist_from, hist_to = finished_window(days_back)
@@ -1215,12 +1287,17 @@ def main() -> None:
                 st.caption(f"Odds API requests remaining: `{remaining_req}` | Bookmakers: `{odds_parsed['bookmakers']}`")
 
     live_fetched = bool(st.session_state.get(live_state_key))
-    team_news_raw: Dict[str, Any] = {"injuries": [], "lineups": [], "statistics": [], "errors": []}
+    team_news_raw: Dict[str, Any] = {
+        "injuries": {"home": [], "away": []},
+        "lineups": {},
+        "statistics": {},
+        "errors": [],
+    }
     team_news_summary: Dict[str, Any] = {"has_data": False}
     if live_fetched:
         team_news_raw = fetch_live_football_team_news(
             lfa_key,
-            lfa_slug,
+            lfa_league_id,
             kickoff_date_str,
             home_name,
             away_name,
