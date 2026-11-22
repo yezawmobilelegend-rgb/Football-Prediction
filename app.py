@@ -41,7 +41,7 @@ ODDS_API_BASE = "https://api.the-odds-api.com/v4"
 LIVE_FOOTBALL_API_BASES = [
     "https://live-football-api.com/api/v1",
 ]
-REQUEST_TIMEOUT = 18
+REQUEST_TIMEOUT = 30
 MODEL_VERSION = "elo-dixon-coles-v8.5"
 DIXON_COLES_RHO = -0.04
 HOME_ELO_ADVANTAGE = 55.0
@@ -475,7 +475,7 @@ def live_football_get(
     api_key: str,
     endpoint: str,
     params: Optional[Dict[str, Any]] = None,
-    retries_on_503: int = 1,
+    retries_on_503: int = 0,
 ) -> Tuple[Optional[Any], Optional[str]]:
     if not api_key:
         return None, "Live Football API key is not configured."
@@ -532,7 +532,12 @@ def fetch_lfa_team_id_map(api_key: str, league_id: str) -> Dict[str, str]:
     if not api_key or not league_id:
         return mapping
 
-    payload, err = live_football_get(api_key, "league_standings", params={"league_id": league_id})
+    payload, err = live_football_get(
+        api_key,
+        "league_standings",
+        params={"league_id": league_id},
+        retries_on_503=0,
+    )
     if err or not isinstance(payload, dict):
         return mapping
 
@@ -577,7 +582,7 @@ def _find_match_id(
     home_name: str,
     away_name: str,
 ) -> Tuple[Optional[str], Dict[str, Any], Optional[str]]:
-    # Primary: Home team ID; Fallback: Away team ID (useful when one team's endpoint returns 503)
+    # Primary: Home team ID; Fallback: Away team ID (useful when one team's endpoint returns 503 or times out)
     candidate_team_ids: List[str] = []
     for tid in (
         _resolve_lfa_team_id(api_key, league_id, home_name),
@@ -595,6 +600,7 @@ def _find_match_id(
             api_key,
             "team_matches",
             params={"team_id": team_id},
+            retries_on_503=0,
         )
         if err:
             last_err = err
@@ -667,7 +673,12 @@ def fetch_live_football_team_news(
     result["match_id"] = match_id
     result["fixture"] = fixture_obj
 
-    inj_payload, inj_err = live_football_get(api_key, "injuries", params={"match_id": match_id})
+    inj_payload, inj_err = live_football_get(
+        api_key,
+        "injuries",
+        params={"match_id": match_id},
+        retries_on_503=0,
+    )
     if inj_err:
         result["errors"].append(f"Injuries: {inj_err}")
     else:
@@ -678,7 +689,12 @@ def fetch_live_football_team_news(
                 "away": inj_data.get("away") if isinstance(inj_data.get("away"), list) else [],
             }
 
-    line_payload, line_err = live_football_get(api_key, "lineups", params={"match_id": match_id})
+    line_payload, line_err = live_football_get(
+        api_key,
+        "lineups",
+        params={"match_id": match_id},
+        retries_on_503=0,
+    )
     if line_err:
         result["errors"].append(f"Lineups: {line_err}")
     else:
